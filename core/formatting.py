@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import re
+
 from .engines import Candidate, is_avatar_hit
 from .extract import is_avatar_image, is_forum_page
 from .tasks import SearchOutcome, SearchTask
 
 AI_FLAG_THRESHOLD = 0.75
+
+# B 站视频号：BV 开头加一串大小写字母数字，例如 BV16m4y1E7Tf。
+_BV_RE = re.compile(r"^BV[0-9A-Za-z]{8,}$")
 
 
 def _ai_line(ai: dict | None) -> str:
@@ -41,7 +46,10 @@ def _identity_lines(candidate: Candidate) -> list[str]:
         label = "📄 标题" if is_forum_page(candidate.url) else "👤 名字"
         lines.append(f"{label}：{candidate.name}")
     if candidate.handle:
-        lines.append(f"🆔 账号：{candidate.handle}")
+        # B 站的 BV 号是「视频号」，不是账号。写成「账号：BV1xx…」会让人以为
+        # 有这么一个用户，去搜还搜不到——它跟 UID 一样只是定位用的编号。
+        label = "🎬 视频号" if _BV_RE.match(candidate.handle.strip()) else "🆔 账号"
+        lines.append(f"{label}：{candidate.handle}")
     if candidate.url:
         lines.append(f"🔗 {candidate.url}")
     return lines

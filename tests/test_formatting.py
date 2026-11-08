@@ -1030,5 +1030,32 @@ class SamePersonTest(unittest.TestCase):
         self.assertNotIn("个号是同一个人", text)
 
 
+class BilibiliVideoIdTest(unittest.TestCase):
+    """B 站的 BV 号是视频号，不是账号。"""
+
+    @staticmethod
+    def _make(handle: str) -> SearchOutcome:
+        best = Candidate(
+            engine="baidu",
+            url="https://www.bilibili.com/video/BV16m4y1E7Tf",
+            title="【ASMR/Cosplay】湊阿库娅",
+            platform="B站",
+            handle=handle,
+            status="vision",
+            note="视觉复核：同一个人（指纹距离 26，超过阈值 8）",
+        )
+        return SearchOutcome(status="ok", best=best, candidates=[best])
+
+    def test_bv_is_labelled_video_id(self) -> None:
+        text = formatting._best_block(self._make("BV16m4y1E7Tf"))
+        self.assertIn("🎬 视频号：BV16m4y1E7Tf", text)
+        self.assertNotIn("🆔 账号：BV", text)
+
+    def test_real_account_keeps_account_label(self) -> None:
+        text = formatting._best_block(self._make("@some_user"))
+        self.assertIn("🆔 账号：@some_user", text)
+        self.assertNotIn("视频号", text)
+
+
 if __name__ == "__main__":
     unittest.main()
