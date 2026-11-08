@@ -2538,12 +2538,19 @@ class ImageSearcherPlugin(MaiBotPlugin):
             return best
         hit = await self._media_lookup(handle, upload)
         if hit:
+            # 翻到的那条是拿原图逐张比过指纹才命中的（_media_lookup 只在
+            # distance <= hash_threshold 时返回），这里已经是「同一张图」而不是
+            # 「同一个人」的猜测：状态必须跟着升成 match，否则外面还会按视觉结论
+            # 写「没找到同一张图」「不是指纹比对」，跟这条标注的指纹距离自相矛盾。
+            distance = int(hit.get("distance") or 0)
             best.url = str(hit.get("url") or best.url)
+            best.distance = distance
+            best.status = "match"
             best.note = (
-                f"视觉复核：同一个人；翻 @{handle} 自己的帖子找到原帖"
-                f"（指纹距离 {hit.get('distance')}）"
+                f"指纹一致（距离 {distance}）：视觉认人后翻 @{handle} 的带图帖子，"
+                "找到这张"
             )
-            self._vlog("视觉主页换成原帖：%s → %s", handle, best.url)
+            self._vlog("视觉主页换成原帖：%s → %s（距离 %s）", handle, best.url, distance)
             return best
         best.status = "suspect"
         best.note = f"视觉复核：疑似同一个人，但没在 @{handle} 最近的带图帖里翻到这张，仅供参考"

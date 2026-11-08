@@ -51,7 +51,7 @@ core/maibot_compat.py  能力返回值解包
 
 - 页面类型统一走 `core/extract.py::x_page_kind()`，别在各处自己写正则。非帖子页即使指纹达标也只给 `suspect`，备注写清「这是 X 的回复列表页／账号主页」。`_pick_best()` 的「X 优先」同样只对帖子页生效。
 - **引用帖要换成原帖**：fxtwitter 的 `quote` 字段直接给出被引用那条的地址与作者。帖子自己没配图（`media` 为空）且有 quote 时，图只能来自被引用那条，`_follow_quote()` 会把结论换成原帖并注明「原文是 @xxx 的引用帖」。实测 YuMIkAnime 引用了 @qyuuuz 的图吐槽，被当成作者发了出去；那种「自己配了图」的引用帖不要动。
-- **视觉落在账号主页时先翻帖再定档**：`_settle_vision_handle()` 用 `_media_lookup()` 翻这个号自己的带图帖（`/media` 不含转发）逐张比指纹，命中就换成那条帖子；一条都没中就降成 `suspect` 并把计数补进 `vision["downgraded"]`。实测 s-20261105-1537 挑中 `x.com/realpakbupati`（69 粉的印尼号），理由是「同款发饰、发尾蓝白渐变」，可那张图是粉发白裙、跟原图的银紫发护士服毫无关系——主页上什么图都有，撑不起「这张是她发的」。
+- **视觉落在账号主页时先翻帖再定档**：`_settle_vision_handle()` 用 `_media_lookup()` 翻这个号自己的带图帖（`/media` 不含转发）逐张比指纹，命中就换成那条帖子，并且**把状态升成 `match`、距离写成命中那条的**——命中本身就意味着 `distance <= hash_threshold`，还留在 `vision` 会让结论写「没找到同一张图」「不是指纹比对」，跟旁边标注的「指纹距离 1」直接打架（实测 s-20261108-1241）；一条都没中就降成 `suspect` 并把计数补进 `vision["downgraded"]`。实测 s-20261105-1537 挑中 `x.com/realpakbupati`（69 粉的印尼号），理由是「同款发饰、发尾蓝白渐变」，可那张图是粉发白裙、跟原图的银紫发护士服毫无关系——主页上什么图都有，撑不起「这张是她发的」。
 
 **名字推断与付费线索必须先有锚点**：`_identity_texts()` 返回空（一条 `match` / `vision` 都没有）时，`_hunt_x_handle()` 与 `_hunt_paid()` 直接 `return None`。这时标题里的「名字」只是噪声词，实测抽中过 106 万粉的 `@nothing`（来自画师站标题「Nothing To Hide」）和 `@Design`。同理 `same_person.find_shared(anchors=)` 的分组必须含锚点，注释里要写明「只说明这几个号是同一个人，不表示他们就是这张图的作者」。
 
