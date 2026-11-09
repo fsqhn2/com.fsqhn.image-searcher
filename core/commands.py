@@ -10,6 +10,10 @@ MaiBot 传给指令匹配的是消息纯文本，带图的消息会带前置占�
 
 另外，图片段在纯文本里可能是空的，只剩一个前导空格（例如「图 + 麦麦寻人」这条
 消息的纯文本是「 麦麦寻人」，连 [image] 都没有）。因此开头还要允许任意空白。
+
+群里先 @机器人 再写指令时，纯文本还会多一截「@昵称」；这段 @ 不是方括号占位符，
+而 MaiBot 只在文本以 @ 开头时才帮忙剥掉它，前面压着引用占位符就剥不掉，
+所以前置段里也允许出现 @昵称。
 """
 
 from __future__ import annotations
@@ -26,7 +30,13 @@ def _bracket_placeholder(depth: int = 2) -> str:
     return placeholder
 
 
-PLACEHOLDER_PREFIX = r"(?:" + _bracket_placeholder() + r"\s*)*"
+# 群里 @机器人 再写指令时，纯文本前面会多出一截「@昵称」，例如
+# 「[回复了某人的消息: [image]] @盆地  盆地找鸡」。这段 @ 是普通文本不是方括号占位符，
+# 老写法把它当成多余内容，整条消息就匹配失败；而 MaiBot 只在文本以 @ 开头时才替我们
+# 剥掉指向本机器人的 @，前面压着引用占位符时剥不掉。所以前置段里也允许 @昵称。
+_MENTION_PREFIX = r"@[^\s@]+"
+
+PLACEHOLDER_PREFIX = r"(?:(?:" + _bracket_placeholder() + r"|" + _MENTION_PREFIX + r")\s*)*"
 
 # 指令参数里写在最前面的「重搜」：无视按图缓存，强制重新跑一遍引擎。
 FORCE_KEYWORDS = frozenset({"重搜", "重新搜", "刷新", "强制", "force", "fresh"})

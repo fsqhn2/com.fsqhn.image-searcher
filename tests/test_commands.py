@@ -63,6 +63,31 @@ class CommandPatternTest(unittest.TestCase):
         self.assertIsNotNone(match)
         self.assertEqual(match.groupdict()["task"], "s-20261103-0832-d7d9")
 
+    def test_with_bot_mention_after_quote(self) -> None:
+        """@机器人 再写指令：引用占位符后面压着「@盆地」，不能被当成多余内容。"""
+        text = "[回复了山上的小丘的消息: [image]] @盆地  麦麦寻人"
+        match = self.pattern.search(text)
+        self.assertIsNotNone(match)
+        self.assertIsNone(match.groupdict()["arg"])
+
+    def test_with_bot_mention_alone(self) -> None:
+        match = self.pattern.search("@盆地 麦麦寻人")
+        self.assertIsNotNone(match)
+        self.assertIsNone(match.groupdict()["arg"])
+
+    def test_with_bot_mention_and_argument(self) -> None:
+        match = self.pattern.search("@盆地  麦麦寻人 重搜")
+        self.assertIsNotNone(match)
+        self.assertEqual(match.groupdict()["arg"], "重搜")
+
+    def test_more_with_bot_mention(self) -> None:
+        match = self.more.search("[回复了某人的消息: [image]] @盆地 更多 s-20261103-0832-d7d9")
+        self.assertIsNotNone(match)
+        self.assertEqual(match.groupdict()["task"], "s-20261103-0832-d7d9")
+
+    def test_mention_without_command_does_not_match(self) -> None:
+        self.assertIsNone(self.pattern.search("@盆地 在吗"))
+
     def test_alias(self) -> None:
         self.assertIsNotNone(self.pattern.search("找鸡"))
 
