@@ -47,6 +47,8 @@ core/maibot_compat.py  能力返回值解包
 
 **视觉命中还要过闸门**：判定集中在 `core/vision.py` 的 `verdict_of()`，检查顺序有意义，别调换——先 `VERDICT_COMMERCE`（候选落在速卖通 / 阿里 / 淘宝 / 1688 / Amazon / eBay 这类电商站，只是同款衣服），再 `VERDICT_REPOST`（`reposts` / `likes` / `with_replies` 这类列表页，图是别人发的），再 `VERDICT_PLATFORM_ID`（handle 只是个平台编号：B 站的 `BV…` 视频号，或标题里抽出来的裸数字；`is_platform_id()` 判定），再 `VERDICT_UNTRACEABLE`（整条不可追踪：不是社交平台、也没有账号），最后 `VERDICT_NO_ACCOUNT`（落在抖音、小红书这类平台页面上，却解析不出发布者，点进去也确认不了是谁发的）。只有 `VERDICT_VISION` 能当结论，其余各档一律降级成 `suspect` 只进参考区，日志记 `降级=N`，说明文案在 `DOWNGRADE_NOTES`。降级后的 best 在结论里按「未找到」，但那条链接仍要给出（`_vision_pick_line()` 优先用被降级的 best 本身），不能把一条 BV 号或转发页摆成「找到了」。视觉命中发出去时，结论必须带免责声明，文案在 `core/formatting.py` 的 `_best_block()`。降级文案要**点名是哪个站**（`DOWNGRADE_NOTES` 里的 `{platform}`）：「那是 soundcloud.com 上的页面、不是作者主页」比「找不到可核对的账号」有用得多。结论里还要把模型给的理由原样列一句（`_vision_reason()`，截 80 字）——它常按「黑蕾丝、白短袜、室内」判成同一个人，理由里甚至会把发色写错，亮出来用户一眼就能看出这轮靠不靠谱。
 
+**图集站页面自带来源账号**：视觉挑中的落点在图集 / 搬运站（`core/gallery.py` 的 `GALLERY_HOSTS`：4play.to、v2ph、acgtang、beauty-draw、leakgallery 等）时，`_gallery_sources()` 会抓那一页 HTML，用 `parse_source_accounts()` 读出站方自己标的 IG / X 账号，写进 `vision["sources"]`，结论里单独一行「来自 … 页面标的来源」。要解决的是「视觉判定同一人、但页面不是作者主页」这类：页面本身没用，可它标的来源常常就是本人——实测 4play.to 的 meta 直接写了 `instagram.com/menruinyanko`，而插件原来只把这条降级就丢了。只认出现 3 次以上的账号（页脚、友链只出现一两次），保留路径（`/p/`、`/reel/`）不算，最多抓两页、14 秒上限，读不到就当没有。文案必须写「站方标注，未必是作者本人」——站方也会标错。同一单里「最接近的一条」也优先给这种页面（`_vision_pick_line()` 按 `page` 比对，忽略 utm 参数），因为一条盗图页的链接不如一个指向人的账号有用。
+
 **X 上只有 ``/<号>/status/<id>`` 能当结论**：转发页（`reposts` / `likes` / `with_replies`）、账号主页、引用帖都不行。链接里那个号也未必是作者：候选常是转发地址 `x.com/<转发者>/status/<id>`，`_apply_tweet_identity()` 里只要 `fxtwitter.Tweet.reposted_by` 非空，就把 `url`/`handle`/`name` 换成 `tweet.url`/`tweet.handle`/`tweet.name`，备注写「这条是 @A 转的帖子，原文在 @B」（s-20261109-2222-b5e6 把 @sssmnms 的图判给了转发者 @redwine278，图上水印就写着 @sssmnms）。`_follow_quotes()` 在去重和挑 best 之后、组装结果之前跑一遍候选列表，**只挑 status 为 `match`/`suspect` 的 X 帖子页**（mismatch 的图本来就不是这张，改了没意义；vision 只处理 best）：按 URL 去重、6 路并发、总预算 12 秒，超时就放弃。放去重之后是因为去重按「平台 + 账号」合并，先纠正会把同一原作者的几条帖子压成一条。`/2/status/<id>` 和 `/i/status/<id>` 两种返回都带 `reposted_by`。`with_replies` 和 `reposts` 是能自动补救的两种：指纹对上（距离 ≤ 阈值）时，`_resolve_x_list_page()` 按页面类型选路——回复页用 `from:<号> filter:replies` 翻回复、取 `replying_to.status` 当父帖逐个回查（`_reply_page_lookup()`）；转发页用 `from:<号> filter:retweets`，搜索返回的就是原帖（`_retweet_lookup()`，直接比媒体键，不用再查父帖）。媒体键（`fxtwitter.media_key()`）一致就换成那条原帖并升成 `match`；翻不到就还是 `suspect`。点赞页（`/likes`）没有对应语法，只能保持疑似。**节奏和止损**：每批 8 个请求、批间 `asyncio.sleep(0.5)`，403/429 立刻置 `state["throttled"]` 停手，预算 60 秒、最多 240 个父帖、单次任务最多试 2 条列表页。开始翻之前往会话发 `formatting.TRACE_PING_TEXT`（「已经找到蛛丝马迹了…大概还要 1 分钟（最多 2 分钟）」）。失败原因（`hit`/`throttled`/`empty`/`miss`/`timeout`）由 lookup 返回，`_resolve_x_list_page()` 拼成一句话带回 `_search()`，再经 `_grok_lookup(reply_hint=...)` 写进 `grok.build_prompt()` 的 `REPLY_BLOCK`，让 Grok 换成 `from:<号>` 再查一遍。
 
 - 页面类型统一走 `core/extract.py::x_page_kind()`，别在各处自己写正则。非帖子页即使指纹达标也只给 `suspect`，备注写清「这是 X 的回复列表页／账号主页」。`_pick_best()` 的「X 优先」同样只对帖子页生效。
@@ -204,7 +206,7 @@ SSRF 防护在 `core/httpclient.is_public_url()`：非公网 http(s) 一律拒�
 python -m unittest discover -s tests -v
 ```
 
-目前 425 项。新增引擎适配、改阈值、改指纹逻辑、改缓存或账号归一规则时补用例。改动 `_verify` / `_rank` / 取图链路后，用真实图跑一次端到端，确认「匹配 → 最佳匹配 → 带图」不断。
+目前 437 项。新增引擎适配、改阈值、改指纹逻辑、改缓存或账号归一规则时补用例。改动 `_verify` / `_rank` / 取图链路后，用真实图跑一次端到端，确认「匹配 → 最佳匹配 → 带图」不断。
 
 改完 `plugin.py` 必须重载验证：日志里应出现 `麦麦寻人已加载：… 上限=…` 与 `vX.Y.Z 加载成功`，且无 traceback。改源码会重启插件进程，内存里的任务表会重建。
 

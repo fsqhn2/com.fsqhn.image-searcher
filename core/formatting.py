@@ -226,6 +226,17 @@ def _vision_pick_line(outcome: SearchOutcome) -> str:
         if pick is not None:
             label = "视觉挑中的那条"
     if pick is None:
+        # 其次优先「页面自己标了来源账号」的那条：它至少还指向一个人，比一条
+        # 距离更近、但只是盗图页的链接有用。
+        sourced = {
+            _bare_url(str(item.get("page") or ""))
+            for item in (outcome.vision or {}).get("sources") or []
+            if isinstance(item, dict)
+        }
+        pick = next((item for item in picks if _bare_url(item.url) in sourced), None)
+        if pick is not None:
+            label = "页面标了来源的那条"
+    if pick is None:
         pick = min(picks, key=lambda item: item.distance if item.distance is not None else 999)
     where = pick.platform or pick.source or pick.engine
     gap = f"，指纹距离 {pick.distance}" if pick.distance is not None else ""
@@ -267,6 +278,7 @@ def _best_block(outcome: SearchOutcome, *, skip_grok: bool = False) -> str:
     watermark = _vision_watermark_line(outcome)
     if watermark:
         extra.append(watermark)
+    extra.extend(_gallery_source_lines(outcome))
     if not skip_grok:
         miss = _grok_miss_line(outcome)
         if miss:
@@ -284,18 +296,73 @@ def _vision_watermark_line(outcome: SearchOutcome) -> str:
 
     实测模型读小号白字水印会出错（@ste11ar021 读成 @butter021），所以文案里
     必须写明「模型识别，可能读错」；能确认到账号时附主页，让用户自己点开核对。
+
+    视觉和 Grok 读得不一样时两个都写出来：s-20261109-2341-5b5b 那单一个读成
+    ``X@Miharu``（一个无关老号）、一个读成 ``X@Moliuwu``，只亮一个反而会把人
+    引到错的主页去。
     """
     vision = outcome.vision or {}
+    grok = outcome.grok or {}
     text = str(vision.get("watermark") or "").strip()
-    if not text:
-        return ""
-    url = str(vision.get("watermark_url") or "").strip()
-    note = str(vision.get("watermark_note") or "").strip()
-    if url:
-        return f"🔎 图上水印：{text}（视觉模型识别，可能读错，可点开核对）：{url}"
-    if note:
-        return f"🔎 图上水印：{text}（视觉模型识别，可能读错；{note}）"
-    return f"🔎 图上水印：{text}（视觉模型识别，可能读错）"
+    other = str(grok.get("watermark") or "").strip()
+    disagree = bool(other) and _squash_handle(other) != _squash_handle(text)
+    lines: list[str] = []
+    if text:
+        url = str(vision.get("watermark_url") or "").strip()
+        note = str(vision.get("watermark_note") or "").strip()
+        if disagree:
+            # 两个模型读得不一样，连是哪个号都没定：这时候再附主页，用户点进去
+            # 只会看到一个无关账号，白白浪费时间。
+            lines.append(f"🔎 图上水印：{text}（视觉模型识别，可能读错，先别去认这个号）")
+        elif url:
+            lines.append(f"🔎 图上水印：{text}（视觉模型识别，可能读错，可点开核对）：{url}")
+        elif note:
+            lines.append(f"🔎 图上水印：{text}（视觉模型识别，可能读错；{note}）")
+        else:
+            lines.append(f"🔎 图上水印：{text}（视觉模型识别，可能读错）")
+    if disagree:
+        lines.append(f"🔎 Grok 读到的水印不一样：{other}（两个都是模型识别，别当结论）")
+    return "\n".join(lines)
+
+
+def _bare_url(url: str) -> str:
+    """比两条链接是不是同一页时用：去掉查询串（utm 参数经常不一样）。"""
+    return str(url or "").split("?", 1)[0].rstrip("/").lower()
+
+
+def _squash_handle(text: str) -> str:
+    """比水印是否同一个号时用：忽略 ``X@`` / ``IG@`` 前缀、@、空格和大小写。"""
+    value = re.sub(r"^[a-z]{1,3}@", "", str(text or "").strip().lower())
+    return re.sub(r"[^0-9a-z_]+", "", value)
+
+
+def _gallery_source_lines(outcome: SearchOutcome) -> list[str]:
+    """图集站页面上自己标的来源账号。
+
+    站点把别人的 IG / X 内容搬下来打包，页面不是作者主页，但站方通常写着来源
+    账号。这是「视觉判定同一人、落点却被降级」时唯一还能指向本人的线索：实测
+    4play.to 的 meta 直接给了 ``instagram.com/menruinyanko``。站方也会标错，
+    所以只当线索，必须让用户自己点开核对。
+    """
+    vision = outcome.vision or {}
+    raw = vision.get("sources")
+    if not isinstance(raw, list):
+        return []
+    lines: list[str] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        handle = str(item.get("handle") or "").strip()
+        url = str(item.get("url") or "").strip()
+        if not handle or not url:
+            continue
+        platform = str(item.get("platform") or "账号")
+        site = str(item.get("site") or "").strip()
+        where = f"来自 {site} 页面" if site else "图集站页面"
+        lines.append(f"🔎 {where}标的来源：{platform} @{handle}（站方标注，未必是作者本人）：{url}")
+    if lines:
+        lines.append("⚠️ 这几条是站方标的来源，点开核对一下再认人。")
+    return lines
 
 
 # 盗图/付费资源站：页面上标的账号多半是从标题或水印里抄来的，不是作者主页。

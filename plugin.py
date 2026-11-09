@@ -47,6 +47,7 @@ from .core.extract import (
     x_page_kind,
     x_title_name,
 )
+from .core.gallery import is_gallery_site, parse_source_accounts
 from .core.hashing import dhash, hamming, prepare_upload
 from .core.httpclient import HttpError, download_image_multi, fake_ip_networks, make_session
 from .core.keypool import KeyPool
@@ -1984,6 +1985,8 @@ class ImageSearcherPlugin(MaiBotPlugin):
             "model": "",
             "error": "",
             "elapsed": 0.0,
+            # 图集站页面上写的来源账号（站方标注，未必是作者本人）。
+            "sources": [],
         }
         if upload is None:
             info["error"] = "没有原图，无法复核"
@@ -2097,6 +2100,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
 
         info["reason"] = vision.reason_of(text)
         info["watermark"] = vision.watermark_of(text)
+        degraded: list[Candidate] = []
         for number in vision.parse_picks(text, len(images)):
             candidate = used[number - 1]
             if is_avatar_hit(candidate):
@@ -2126,10 +2130,14 @@ class ImageSearcherPlugin(MaiBotPlugin):
                     handle=candidate.handle or "空白",
                 )
                 info["downgraded"] += 1
+                degraded.append(candidate)
                 continue
             candidate.status = "vision"
             candidate.note = f"视觉复核：同一个人（{gap}）"
             info["picked"].append(candidate.image_url or candidate.url)
+
+        if degraded:
+            info["sources"] = await self._gallery_sources(degraded)
 
         self.ctx.logger.info(
             "视觉兜底：候选=%s 传入=%s 命中=%s 降级=%s 模型=%s 理由=%s%s",
@@ -2142,6 +2150,77 @@ class ImageSearcherPlugin(MaiBotPlugin):
             f" 错误={info['error']}" if info["error"] else "",
         )
         return info
+
+    _GALLERY_MAX_PAGES = 2
+
+    async def _gallery_sources(self, items: list[Candidate]) -> list[dict[str, Any]]:
+        """读图集站页面上自己标的来源账号。
+
+        视觉挑中的图常常落在 4play、v2ph 这类搬运站上：页面本身不是作者主页，
+        所以结论会把它降级。但站方通常写着来源账号——实测 4play 的 meta 直接给
+        了 ``instagram.com/menruinyanko``，那是整单唯一指向本人的线索。这里只
+        抓降级候选里的图集站页面，最多两页，读不到就当没有。
+        """
+        pool: list[Candidate] = []
+        seen: set[str] = set()
+        for item in items:
+            url = (item.url or "").strip()
+            if not url or url in seen or not is_gallery_site(url, item.platform):
+                continue
+            seen.add(url)
+            pool.append(item)
+            if len(pool) >= self._GALLERY_MAX_PAGES:
+                break
+        if not pool:
+            return []
+
+        results = await asyncio.gather(
+            *(self._page_source(item.url) for item in pool), return_exceptions=True
+        )
+        sources: list[dict[str, Any]] = []
+        for item, result in zip(pool, results):
+            if isinstance(result, BaseException) or not result:
+                continue
+            site = (item.url or "").split("://", 1)[-1].split("/", 1)[0].removeprefix("www.")
+            for account in result[:2]:
+                sources.append({**account, "site": site, "page": item.url})
+            self._vlog(
+                "图集站来源：%s → %s",
+                site,
+                "、".join(f"{a['platform']}@{a['handle']}" for a in result[:2]),
+            )
+        return sources
+
+    async def _page_source(self, url: str) -> list[dict[str, Any]]:
+        """抓一页 HTML，抽里面的来源账号。抓不到就返回空，不影响别的结论。"""
+
+        def fetch() -> str:
+            session = make_session(self._proxy())
+            try:
+                response = session.get(
+                    url,
+                    timeout=10,
+                    headers={
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/131.0 Safari/537.36"
+                        ),
+                        "Accept": "text/html,application/xhtml+xml",
+                    },
+                )
+                if response.status_code != 200:
+                    return ""
+                # 这类站的长尾推荐能到几百 KB，截断后仍然够统计账号出现次数。
+                return response.text[:400000]
+            finally:
+                session.close()
+
+        try:
+            html = await asyncio.wait_for(asyncio.to_thread(fetch), timeout=14)
+        except Exception:  # noqa: BLE001 - 页面读不到只少一条线索
+            return []
+        return parse_source_accounts(html, url)
 
     async def _grok_lookup(
         self, upload: bytes | None, candidates: list[Candidate] | None = None, reply_hint: str = ""

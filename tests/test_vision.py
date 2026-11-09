@@ -213,6 +213,102 @@ class WatermarkTest(unittest.TestCase):
         outcome.vision = {"watermark": ""}
         self.assertNotIn("图上水印", formatting._best_block(outcome))
 
+    def test_two_models_disagree_both_shown(self):
+        """两个模型读到不同的水印时都写出来：只亮一个会把人引到错的主页。"""
+        item = Candidate(
+            engine="lens",
+            url="https://soundcloud.com/herdin-rmx/x",
+            platform="soundcloud.com",
+            distance=26,
+            status="suspect",
+            note="视觉复核：疑似同一个人，但那是soundcloud.com上的页面、不是作者主页（指纹距离 26，超过阈值 8），仅供参考",
+        )
+        outcome = SearchOutcome(
+            status="not_found",
+            best=None,
+            candidates=[item],
+            vision={"ok": True, "checked": 16, "downgraded": 1, "watermark": "X@Miharu"},
+            grok={"tier": "none", "watermark": "X@Moliuwu", "reason": "未见原帖"},
+        )
+        text = formatting._best_block(outcome)
+        self.assertIn("X@Miharu", text)
+        self.assertIn("Grok 读到的水印不一样", text)
+        self.assertIn("X@Moliuwu", text)
+
+    def test_same_watermark_not_repeated(self):
+        outcome = SearchOutcome()
+        outcome.vision = {"watermark": "X@Miharu"}
+        outcome.grok = {"watermark": " @miharu "}
+        text = formatting._best_block(outcome)
+        self.assertNotIn("不一样", text)
+
+    def test_pick_prefers_page_with_source(self):
+        """同样被降级时，优先给「页面标了来源」的那条，而不是距离更近的盗图页。"""
+        sound = Candidate(
+            engine="yandex",
+            url="https://soundcloud.com/herdin-rmx/x",
+            platform="soundcloud.com",
+            distance=26,
+            status="suspect",
+            note="视觉复核：疑似同一个人，但那是soundcloud.com上的页面、不是作者主页（指纹距离 26，超过阈值 8），仅供参考",
+        )
+        sourced = Candidate(
+            engine="yandex",
+            url="https://4play.to/koleksi/235/1847?utm_medium=organic",
+            platform="4play.to",
+            distance=27,
+            status="suspect",
+            note="视觉复核：疑似同一个人，但那是4play.to上的页面、不是作者主页（指纹距离 27，超过阈值 8），仅供参考",
+        )
+        outcome = SearchOutcome(
+            status="not_found",
+            best=None,
+            candidates=[sound, sourced],
+            vision={
+                "ok": True,
+                "checked": 16,
+                "downgraded": 2,
+                "sources": [
+                    {
+                        "platform": "Instagram",
+                        "handle": "menruinyanko",
+                        "url": "https://instagram.com/menruinyanko",
+                        "site": "4play.to",
+                        "page": "https://4play.to/koleksi/235/1847",
+                    }
+                ],
+            },
+        )
+        text = formatting._best_block(outcome)
+        self.assertIn("页面标了来源的那条", text)
+        self.assertIn("https://4play.to/koleksi/235/1847?utm_medium=organic", text)
+
+    def test_gallery_source_line(self):
+        """图集站自己标了来源账号：要单独写一行，并说明是站方标注。"""
+        outcome = SearchOutcome(
+            status="not_found",
+            best=None,
+            candidates=[],
+            vision={
+                "ok": True,
+                "checked": 16,
+                "sources": [
+                    {
+                        "platform": "Instagram",
+                        "handle": "menruinyanko",
+                        "url": "https://instagram.com/menruinyanko",
+                        "site": "4play.to",
+                        "page": "https://4play.to/koleksi/235/1847",
+                        "count": 2322,
+                    }
+                ],
+            },
+        )
+        text = formatting._best_block(outcome)
+        self.assertIn("4play.to 页面标的来源", text)
+        self.assertIn("menruinyanko", text)
+        self.assertIn("未必是作者本人", text)
+
 
 class LeakSiteTest(unittest.TestCase):
     """落在盗图/资源站时要说明账号是抄来的，别当成作者。"""
