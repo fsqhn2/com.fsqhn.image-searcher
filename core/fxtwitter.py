@@ -183,19 +183,45 @@ def parse_profile(payload: dict | None) -> str:
     「被封」单独一档：它说明这个人真实存在，只是内容看不了了；当成「查不到」
     会把一条有效线索丢掉，当成「正常」又会让用户点进封号页。
     """
+    return parse_profile_info(payload).state
+
+
+@dataclass
+class Profile:
+    """账号核实结果。``user_id`` 是数字 ID，改名、封号都不会变。"""
+
+    state: str = PROFILE_UNKNOWN
+    user_id: str = ""
+    handle: str = ""
+    name: str = ""
+
+
+def parse_profile_info(payload: dict | None) -> Profile:
+    """解析账号信息，把数字 ID 一起带出来。
+
+    账号被封之后 handle 可能被释放、被改名，唯一还能对上人的就是这串数字 ID
+    （``https://x.com/i/user/<id>``）。实测 @Babybaobaoya 被封时返回里仍带
+    ``id``，所以被封的线索也要把 ID 写进结论，别只说一句「查不到」。
+    """
     if not isinstance(payload, dict):
-        return PROFILE_UNKNOWN
+        return Profile()
     user = payload.get("user")
     if isinstance(user, dict) and user.get("screen_name"):
-        return PROFILE_OK
+        return Profile(
+            state=PROFILE_OK,
+            user_id=str(user.get("id") or ""),
+            handle=str(user.get("screen_name") or ""),
+            name=str(user.get("name") or ""),
+        )
+    user_id = str(payload.get("id") or "")
     code = payload.get("code")
     reason = str(payload.get("reason") or "").lower()
     message = str(payload.get("message") or "").lower()
     if "suspend" in reason or "suspend" in message:
-        return PROFILE_SUSPENDED
+        return Profile(state=PROFILE_SUSPENDED, user_id=user_id)
     if code == 404:
-        return PROFILE_MISSING
-    return PROFILE_UNKNOWN
+        return Profile(state=PROFILE_MISSING, user_id=user_id)
+    return Profile(state=PROFILE_UNKNOWN, user_id=user_id)
 
 
 def parse_media_list(payload: dict | None) -> list[MediaPost]:

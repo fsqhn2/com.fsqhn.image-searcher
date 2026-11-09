@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from urllib.parse import urlparse
 
 from .engines import Candidate, is_avatar_hit
 from .extract import is_avatar_image, is_forum_page
@@ -50,6 +51,8 @@ def _identity_lines(candidate: Candidate) -> list[str]:
         # 有这么一个用户，去搜还搜不到——它跟 UID 一样只是定位用的编号。
         label = "🎬 视频号" if _BV_RE.match(candidate.handle.strip()) else "🆔 账号"
         lines.append(f"{label}：{candidate.handle}")
+    if candidate.account_note:
+        lines.append(candidate.account_note)
     if candidate.url:
         lines.append(f"🔗 {candidate.url}")
     return lines
@@ -285,6 +288,35 @@ def _vision_watermark_line(outcome: SearchOutcome) -> str:
     return f"🔎 图上水印：{text}（视觉模型识别，可能读错）"
 
 
+# 盗图/付费资源站：页面上标的账号多半是从标题或水印里抄来的，不是作者主页。
+# 只放实测见过的站，遇到新的再加——误标一个正经站点比漏标更糟。
+LEAK_SITES = (
+    "jxporn",
+    "lanrenbl",
+    "4khd",
+    "yuemeinv",
+)
+
+
+def leak_site_of(url: str = "", platform: str = "", name: str = "") -> str:
+    """命中盗图/资源站时返回展示用的站点名，没命中返回空串。"""
+    value = str(url or "")
+    host = urlparse(value).netloc.lower() if "://" in value else ""
+    blob = f"{host} {platform} {name}".lower()
+    for token in LEAK_SITES:
+        if token in blob:
+            return host or str(platform or token)
+    return ""
+
+
+def _leak_line(best) -> str:
+    """落在盗图站时点明，免得用户以为页面上的账号就是发布者。"""
+    site = leak_site_of(best.url, best.platform, best.name)
+    if not site:
+        return ""
+    return f"⚠️ 这条落在 {site} 上，那是盗图/资源站：页面上的账号是从标题里抄的，不是作者主页。"
+
+
 def _best_block_core(outcome: SearchOutcome, *, skip_grok: bool = False) -> str:
     best = outcome.best
     grok = outcome.grok or {}
@@ -392,6 +424,9 @@ def _best_block_core(outcome: SearchOutcome, *, skip_grok: bool = False) -> str:
             lines.append(f"共收到 {outcome.total_candidates} 条结果，见参考区。")
         return "\n".join(lines)
     lines = _identity_lines(best)
+    leak_line = _leak_line(best)
+    if leak_line:
+        lines.append(leak_line)
     if best.status == "vision":
         # 视觉判的是「同一个人」，不是同一张图，别让用户以为这就是那张原图。
         lines.insert(0, "🧠 没找到同一张图，但视觉复核认为是同一个人")

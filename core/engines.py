@@ -75,6 +75,9 @@ class Candidate:
     platform: str = ""
     name: str = ""
     handle: str = ""
+    # 账号本身的状态说明，只在结论里单独占一行。目前用来标「已被 X 封禁（用户 ID …）」：
+    # 塞进 note 会被渲染成「匹配：…」，看着像判定依据。
+    account_note: str = ""
     # 命中的是站点账号头像/图标，不是帖子原图。单独立字段：视觉复核对同一个候选
     # 降级时会改写 note，靠 note 前缀认头像会漏，挑参考图就会挑到 40×40 的头像。
     avatar: bool = False

@@ -334,6 +334,28 @@ class ProfileStateTest(unittest.TestCase):
         payload = {"code": 404, "message": "User is suspended", "reason": "suspended"}
         self.assertEqual(fxtwitter.parse_profile(payload), fxtwitter.PROFILE_SUSPENDED)
 
+    def test_suspended_keeps_user_id(self) -> None:
+        # 封号后 handle 可能被释放，数字 ID 是唯一还能对上人的标识。
+        payload = {
+            "code": 404,
+            "message": "User is suspended",
+            "reason": "suspended",
+            "id": "1659881252342861824",
+        }
+        profile = fxtwitter.parse_profile_info(payload)
+        self.assertEqual(profile.state, fxtwitter.PROFILE_SUSPENDED)
+        self.assertEqual(profile.user_id, "1659881252342861824")
+
+    def test_ok_keeps_user_id_and_name(self) -> None:
+        payload = {
+            "code": 200,
+            "user": {"id": "1325253093705969664", "screen_name": "wn40536699", "name": "葡獭"},
+        }
+        profile = fxtwitter.parse_profile_info(payload)
+        self.assertEqual(profile.state, fxtwitter.PROFILE_OK)
+        self.assertEqual(profile.user_id, "1325253093705969664")
+        self.assertEqual(profile.handle, "wn40536699")
+
     def test_missing(self) -> None:
         payload = {"code": 404, "message": "User not found", "reason": "not_found"}
         self.assertEqual(fxtwitter.parse_profile(payload), fxtwitter.PROFILE_MISSING)

@@ -211,6 +211,74 @@ class WatermarkTest(unittest.TestCase):
         self.assertNotIn("图上水印", formatting._best_block(outcome))
 
 
+class LeakSiteTest(unittest.TestCase):
+    """落在盗图/资源站时要说明账号是抄来的，别当成作者。"""
+
+    def test_leak_site_matches_host(self):
+        self.assertEqual(
+            formatting.leak_site_of("https://www.jxporn.net/351632.html", "jxporn.net"),
+            "www.jxporn.net",
+        )
+        self.assertEqual(formatting.leak_site_of("https://www.4khd.com/content/1", ""), "www.4khd.com")
+        self.assertEqual(formatting.leak_site_of("https://lanrenbl.net/6600078.html", ""), "lanrenbl.net")
+
+    def test_leak_site_ignores_normal_sites(self):
+        for url in ("https://x.com/sssmnms/status/1", "https://www.pixiv.net/artworks/1", "https://weibo.com/1"):
+            self.assertEqual(formatting.leak_site_of(url, ""), "", url)
+
+    def test_leak_line_shown_in_best_block(self):
+        best = Candidate(
+            engine="lens",
+            url="https://www.jxporn.net/351632.html",
+            platform="jxporn.net",
+            handle="@Babybaobaoya",
+            name="崽崽",
+            status="vision",
+        )
+        outcome = SearchOutcome(status="ok", best=best, candidates=[best])
+        text = formatting._best_block(outcome)
+        self.assertIn("盗图/资源站", text)
+        self.assertIn("不是作者主页", text)
+
+    def test_no_leak_line_for_x_post(self):
+        best = Candidate(
+            engine="lens",
+            url="https://x.com/sssmnms/status/1994540292142501924",
+            platform="X (Twitter)",
+            handle="@sssmnms",
+            status="match",
+            distance=1,
+        )
+        outcome = SearchOutcome(status="ok", best=best, candidates=[best])
+        self.assertNotIn("盗图/资源站", formatting._best_block(outcome))
+
+
+class AccountNoteTest(unittest.TestCase):
+    """结论账号被封时要把封前的数字 ID 一起写出来。"""
+
+    def test_suspended_note_shown(self):
+        best = Candidate(
+            engine="lens",
+            url="https://www.jxporn.net/351632.html",
+            platform="jxporn.net",
+            handle="@Babybaobaoya",
+            name="崽崽",
+            status="vision",
+        )
+        best.account_note = "⚠️ 该账号已被 X 封禁（用户 ID 1659881252342861824），主页已经打不开了。"
+        outcome = SearchOutcome(status="ok", best=best, candidates=[best])
+        text = formatting._best_block(outcome)
+        self.assertIn("已被 X 封禁", text)
+        self.assertIn("1659881252342861824", text)
+        # 单独占一行，别混进「匹配：」里当判定依据。
+        self.assertNotIn("匹配：⚠️", text)
+
+    def test_no_note_no_line(self):
+        best = Candidate(engine="x", url="https://x.com/a/status/1", platform="X (Twitter)", handle="@a")
+        outcome = SearchOutcome(status="ok", best=best, candidates=[best])
+        self.assertNotIn("封禁", formatting._best_block(outcome))
+
+
 class VisionDisplayTest(unittest.TestCase):
     """视觉命中的候选不能冒充「同一张图」，文案上必须区分开。"""
 

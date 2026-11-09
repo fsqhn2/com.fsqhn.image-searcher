@@ -1615,13 +1615,19 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 if vision_info and vision_info.get("watermark"):
                     handle = vision.handle_from_watermark(vision_info["watermark"])
                     if handle:
-                        state = await self._account_state(handle)
+                        profile = await self._account_profile(handle)
                         vision_info["watermark_handle"] = handle
-                        if state == fxtwitter.PROFILE_OK:
+                        if profile.state == fxtwitter.PROFILE_OK:
                             vision_info["watermark_url"] = f"https://x.com/{handle}"
-                        elif state == fxtwitter.PROFILE_SUSPENDED:
-                            vision_info["watermark_note"] = "该账号已被 X 封禁"
-                        self._vlog("水印账号核对：@%s 状态=%s", handle, state)
+                        elif profile.state == fxtwitter.PROFILE_SUSPENDED:
+                            suffix = f"（用户 ID {profile.user_id}）" if profile.user_id else ""
+                            vision_info["watermark_note"] = f"该账号已被 X 封禁{suffix}"
+                        self._vlog(
+                            "水印账号核对：@%s 状态=%s id=%s",
+                            handle,
+                            profile.state,
+                            profile.user_id or "-",
+                        )
                 if vision_info and vision_info.get("picked"):
                     ordered = dedupe_accounts(self._rank(candidates, names))
                     # 模型可能一次报好几格，取指纹距离最近的那条当结论——距离近说明
@@ -1641,6 +1647,8 @@ class ImageSearcherPlugin(MaiBotPlugin):
         # 引用帖不是原帖，转发的原帖也不属于转发者：指纹已经对上的 X 候选都换回
         # 原作者与那条帖子。只挑 match/suspect，mismatch 的图本来就不是这张。
         best = await self._follow_quotes(ordered, best)
+        # 结论里的账号核一下死活：被封的号 handle 会被释放，只剩数字 ID 能对上人。
+        best = await self._check_best_account(best, vision_info)
 
         self._vlog(
             "分流结果：路线=%s 原因=%s；匹配=%s 视觉=%s 疑似=%s 不符=%s 未验证=%s",
@@ -2272,12 +2280,13 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 # 只给主页时先确认这个号真的存在；查不到就整条丢掉，宁可报没找到，
                 # 也不要把模型编出来的名字当成线索发出去。被封的号单独说明：
                 # 人是真的，只是内容已经看不到。
-                state = await self._account_state(result.handle)
-                if state in {fxtwitter.PROFILE_MISSING, fxtwitter.PROFILE_SUSPENDED}:
+                profile = await self._account_profile(result.handle)
+                if profile.state in {fxtwitter.PROFILE_MISSING, fxtwitter.PROFILE_SUSPENDED}:
                     info["tier"] = "none"
                     info["handle"] = ""
-                    if state == fxtwitter.PROFILE_SUSPENDED:
-                        info["error"] = f"@{result.handle} 已被 X 封禁，看不到内容，已丢弃"
+                    if profile.state == fxtwitter.PROFILE_SUSPENDED:
+                        suffix = f"（用户 ID {profile.user_id}）" if profile.user_id else ""
+                        info["error"] = f"@{result.handle} 已被 X 封禁{suffix}，看不到内容，已丢弃"
                     else:
                         info["error"] = f"@{result.handle} 在 X 上查不到，已丢弃"
                     info["reason"] = info["error"]
@@ -2542,34 +2551,60 @@ class ImageSearcherPlugin(MaiBotPlugin):
             )
         return f"⚠️ 没法比对：{who} 这条帖子拉到了，但配图没取下来（{check.get('error') or '下载失败'}）。\n{link}"
 
-    async def _account_state(self, handle: str) -> str:
-        """查账号在 X 上的状态：ok / missing / suspended / unknown。
+    async def _account_profile(self, handle: str) -> fxtwitter.Profile:
+        """查账号在 X 上的状态与数字 ID：ok / missing / suspended / unknown。
 
         原来用 ``cdn.syndication.twimg.com/widgets/followbutton/info.json``，2026-11
         实测对任何号都返回空（连肯定存在的 @wn40536699 也是空），确认能力等于没有，
-        换成 fxtwitter 的 ``/2/profile/<号>``：它能区分「查无此号」和「被 X 封禁」。
+        换成 fxtwitter 的 ``/2/profile/<号>``：它能区分「查无此号」和「被 X 封禁」，
+        被封时还会带回数字 ID，那是唯一改不掉的身份标识。
         """
         url = fxtwitter.build_profile_url(handle)
         if not url:
-            return fxtwitter.PROFILE_UNKNOWN
+            return fxtwitter.Profile()
 
-        def fetch() -> str:
+        def fetch() -> fxtwitter.Profile:
             session = make_session(self.config.plugin.proxy)
             try:
                 response = session.get(url, timeout=15, headers={"Accept": "application/json"})
                 if response.status_code not in {200, 404}:
-                    return fxtwitter.PROFILE_UNKNOWN
+                    return fxtwitter.Profile()
                 try:
-                    return fxtwitter.parse_profile(response.json())
+                    return fxtwitter.parse_profile_info(response.json())
                 except Exception:  # noqa: BLE001 - 不是 JSON 就当作没查成
-                    return fxtwitter.PROFILE_UNKNOWN
+                    return fxtwitter.Profile()
             finally:
                 session.close()
 
         try:
             return await asyncio.wait_for(asyncio.to_thread(fetch), timeout=20)
         except Exception:  # noqa: BLE001 - 查不了就当没查成，不影响已经拿到的结论
-            return fxtwitter.PROFILE_UNKNOWN
+            return fxtwitter.Profile()
+
+    async def _check_best_account(
+        self, best: Candidate | None, vision_info: dict[str, Any] | None
+    ) -> Candidate | None:
+        """结论里挂着的账号如果已被 X 封禁，把封前的数字 ID 标出来。
+
+        封号之后 handle 会被释放、甚至被别人抢注，唯一还能对上人的就是数字 ID
+        （``https://x.com/i/user/<id>``）。每单最多多一次 profile 请求，只在结论
+        带 handle 时发；水印那条刚刚核过同一个号就不重复查了。纯数字 handle
+        多半是微博 UID / B 站 UID，不去 X 上白查一趟。
+        """
+        if best is None or not best.handle:
+            return best
+        handle = best.handle.strip().lstrip("@")
+        if not handle or handle.isdigit():
+            return best
+        seen = str((vision_info or {}).get("watermark_handle") or "")
+        if seen and seen.lower() == handle.lower():
+            return best
+        profile = await self._account_profile(handle)
+        if profile.state == fxtwitter.PROFILE_SUSPENDED:
+            suffix = f"（用户 ID {profile.user_id}）" if profile.user_id else ""
+            best.account_note = f"⚠️ 该账号已被 X 封禁{suffix}，主页已经打不开了。"
+            self._vlog("结论账号被封：@%s id=%s", handle, profile.user_id or "-")
+        return best
 
     # 翻账号自己的带图帖子时最多看这么多条。这个接口一次只给最近十几条，
     # 多了请求不出去；够不够用取决于图新不新，翻不到就老实说没有。
