@@ -1820,6 +1820,10 @@ class ImageSearcherPlugin(MaiBotPlugin):
 
         带编号却找不到时要说清楚：这是缓存过期，不是指令写错了，所以主动回一句。
         裸「更多」找不到就悄悄返回，交给正常聊天，免得群里每次说「更多」都蹦提示。
+
+        发送目标是**发指令的这个会话**，不是当初搜图的会话：在私聊里发「更多
+        s-2026…」时，结果要回到私聊，回群里等于把私聊里的动作广播出去
+        （实测 s-20261109-0835-c0d9 就是群里搜、私聊要更多、结果又落到群里）。
         """
         if self._tasks is None:
             return False, "插件尚未初始化", 0
@@ -1835,12 +1839,12 @@ class ImageSearcherPlugin(MaiBotPlugin):
             if task.status != "done" or task.outcome is None:
                 await self.ctx.send.text(f"任务 {wanted} 还没搜完，稍等一下再发。", current)
                 return True, "任务未完成", 2
-            await self._send_forward(task, self._more_limit(), replay=True)
+            await self._send_forward(task, self._more_limit(), replay=True, target=current)
             return True, "已重发指定任务", 2
         task = self._latest_task(current, user_id)
         if task is None or task.status != "done" or task.outcome is None:
             return False, "", 0
-        await self._send_forward(task, self._more_limit(), replay=True)
+        await self._send_forward(task, self._more_limit(), replay=True, target=current)
         return True, "已重发上次结果", 2
 
     def _eta_text(self) -> str:
@@ -3020,11 +3024,13 @@ class ImageSearcherPlugin(MaiBotPlugin):
         task: SearchTask,
         groups: list[tuple[str, list[Candidate]]],
         section: Any,
+        target: str = "",
     ) -> None:
         """图太多时按引擎拆成几条合并转发，每条不超过 6 张图。"""
         outcome = task.outcome
         if outcome is None:
             return
+        where = target or task.stream_id
         batches: list[tuple[str, list[Candidate]]] = []
         for engine, items in groups:
             chunk: list[Candidate] = []
@@ -3057,13 +3063,14 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 include_footer=(index == total),
             )
             try:
-                sent = await self.ctx.send.forward(nodes, task.stream_id)
+                sent = await self.ctx.send.forward(nodes, where)
             except Exception as error:  # noqa: BLE001 - 单批失败不影响后续批次
                 self.ctx.logger.warning("分条转发异常：批次=%s/%s 引擎=%s err=%s", index, total, engine, error)
                 continue
             self._vlog(
-                "分条合并转发：task=%s 批次=%s/%s 引擎=%s 候选=%s 图=%s 返回类型=%s 成功=%s",
+                "分条合并转发：task=%s 发往=%s 批次=%s/%s 引擎=%s 候选=%s 图=%s 返回类型=%s 成功=%s",
                 task.task_id,
+                where,
                 index,
                 total,
                 engine,
@@ -3085,13 +3092,23 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 limit=self.config.plugin.reference_limit,
                 eta_text=self._eta_text(),
             )
-            fallback = await self.ctx.send.text(text, task.stream_id)
+            fallback = await self.ctx.send.text(text, where)
             if not _send_ok(fallback):
                 self.ctx.logger.warning("分条转发全部失败，文字退路也失败：task=%s", task.task_id)
 
-    async def _send_forward(self, task: SearchTask, limit: int, *, replay: bool = False) -> None:
+    async def _send_forward(
+        self,
+        task: SearchTask,
+        limit: int,
+        *,
+        replay: bool = False,
+        target: str = "",
+    ) -> None:
         if self._tasks is None or not task.stream_id:
             return
+        # target 是「这条消息发到哪」：搜图完成时就是任务自己的会话，重发（更多）
+        # 时是发指令的那个会话。两者可能不是同一个。
+        where = target or task.stream_id
         await self._ensure_image(task)
         await self._ensure_engine_images(task, limit=limit, whole=replay)
         section = self.config.plugin
@@ -3099,7 +3116,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
         if replay and outcome is not None:
             groups = formatting.engine_groups(outcome, outcome.best, limit)
             if len(groups) > 1 and self._planned_images(outcome, groups) > self._MAX_FORWARD_IMAGES:
-                await self._send_engine_forwards(task, groups, section)
+                await self._send_engine_forwards(task, groups, section, target=where)
                 return
         if replay:
             # 「更多」是重发全部候选，保持单条结构（图多时会走上面的按引擎拆条）。
@@ -3148,15 +3165,16 @@ class ImageSearcherPlugin(MaiBotPlugin):
 
         for index, nodes in enumerate(blocks, start=1):
             try:
-                sent = await self.ctx.send.forward(nodes, task.stream_id)
+                sent = await self.ctx.send.forward(nodes, where)
             except Exception as error:  # noqa: BLE001 - 一块失败不影响后面的块
                 last_error = error
                 self.ctx.logger.warning("合并转发失败：块=%s/%s err=%s", index, len(blocks), error)
                 continue
             self._vlog(
-                "合并转发已发送：task=%s replay=%s 块=%s/%s 节点=%s 图=%s 返回类型=%s 成功=%s",
+                "合并转发已发送：task=%s replay=%s 发往=%s 块=%s/%s 节点=%s 图=%s 返回类型=%s 成功=%s",
                 task.task_id,
                 replay,
+                where,
                 index,
                 len(blocks),
                 len(nodes),
@@ -3181,7 +3199,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 limit=limit,
                 eta_text=self._eta_text(),
             )
-            fallback = await self.ctx.send.text(text, task.stream_id)
+            fallback = await self.ctx.send.text(text, where)
             if not _send_ok(fallback):
                 self.ctx.logger.warning("转发退路也失败：task=%s 文本长度=%s", task.task_id, len(text))
 
