@@ -391,3 +391,24 @@ class CrawlerPlaceholderTest(unittest.TestCase):
             ),
             "",
         )
+
+
+class XPageHandleTest(unittest.TestCase):
+    """从 X 页面链接里取账号名，回复页反查要用它去翻这个号的回复。"""
+
+    def test_reply_page(self) -> None:
+        self.assertEqual(
+            extract.x_page_handle("https://x.com/wn40536699/with_replies"), "wn40536699"
+        )
+
+    def test_post_url(self) -> None:
+        self.assertEqual(
+            extract.x_page_handle("https://twitter.com/hinatahimarii/status/2118658490315276514?s=20"),
+            "hinatahimarii",
+        )
+
+    def test_function_paths_and_other_hosts(self) -> None:
+        self.assertEqual(extract.x_page_handle("https://x.com/i/status/2118658490315276514"), "")
+        self.assertEqual(extract.x_page_handle("https://x.com/search?q=abc"), "")
+        self.assertEqual(extract.x_page_handle("https://sotwe.com/someone"), "")
+        self.assertEqual(extract.x_page_handle(""), "")

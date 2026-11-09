@@ -221,6 +221,24 @@ def is_x_post_page(url: str = "") -> bool:
     return x_page_kind(url) == "post"
 
 
+def x_page_handle(url: str = "") -> str:
+    """从 X 链接里取第一段路径当账号名：``x.com/<号>/with_replies`` → ``<号>``。
+
+    只认 x.com / twitter.com；``i``、``search``、``hashtag`` 这些功能段不算账号。
+    """
+    parsed = urlparse(url)
+    host = (parsed.netloc or "").strip().lower()
+    if not any(host == token or host.endswith("." + token) for token in ("x.com", "twitter.com")):
+        return ""
+    parts = [part for part in (parsed.path or "").split("/") if part]
+    if not parts:
+        return ""
+    head = parts[0].lstrip("@")
+    if head.lower() in {"i", "search", "hashtag", "home", "explore", "notifications"}:
+        return ""
+    return head
+
+
 def platform_of(url: str = "", source: str = "", title: str = "") -> str:
     """判断结果所在平台。"""
     host = (urlparse(url).netloc or source or "").lower()

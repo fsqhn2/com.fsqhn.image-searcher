@@ -43,6 +43,7 @@ from .core.extract import (
     is_social_platform,
     is_x_platform,
     is_x_post_page,
+    x_page_handle,
     x_page_kind,
     x_title_name,
 )
@@ -1552,6 +1553,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
             candidates = [item for name in names for item in grouped.get(name, [])]
         else:
             await self._verify(candidates, grouped, names, target_hash)
+            # X 的回复页会把「她回复的人的帖子」一起列出来：指纹对上了也只是
+            # 说明这张图在这一页出现过。顺着她的回复回到父帖，能确定就换成原帖。
+            await self._resolve_x_reply_page(candidates)
 
         ordered = self._rank(candidates, names, prefer_pixiv=sauce is not None)
         # 同一个账号常被 Lens、Yandex、百度一起撞见：只留质量最好的那条，
@@ -2533,6 +2537,160 @@ class ImageSearcherPlugin(MaiBotPlugin):
             f"命中 distance={best['distance']}" if best else "没有这张图",
         )
         return best
+
+    # 回复页反查的预算：翻 15 页回复（约 300 条）、回查其中前 240 个父帖，
+    # 总耗时卡在 45 秒内。翻不完就放弃，宁可保持疑似也不能把整单拖死——
+    # 这单 s-20261109-2118-5137 的实测是 391 个父帖 64 秒，按这里砍到够用为止。
+    _REPLY_SCAN_PAGES = 15
+    _REPLY_SCAN_PARENTS = 240
+    _REPLY_SCAN_BATCH = 16
+    _REPLY_SCAN_BUDGET = 45.0
+    _REPLY_SCAN_ATTEMPTS = 2
+
+    def _search_page(self, query: str, cursor: str = "") -> tuple[list[fxtwitter.SearchHit], str] | None:
+        """取一页搜索结果；翻不动就返回 None（当「没更多」处理）。"""
+        url = fxtwitter.build_search_url(query, cursor)
+        if not url:
+            return None
+        session = make_session(self._proxy(), headers={"Accept": "application/json"})
+        try:
+            response = session.get(url, timeout=15)
+            if response.status_code != 200:
+                raise HttpError(f"HTTP {response.status_code}")
+            payload = response.json()
+            return fxtwitter.parse_search(payload)
+        except Exception as error:  # noqa: BLE001 - 翻不到就不翻，别影响已拿到的结论
+            self._vlog("翻 X 搜索失败（%s）：%s", query, str(error)[:80])
+            return None
+        finally:
+            session.close()
+
+    def _parent_hit(self, status_id: str, key: str) -> dict[str, Any] | None:
+        """回查一条父帖：里面有没有媒体键为 key 的图。有就返回作者与帖子地址。"""
+        session = make_session(self._proxy(), headers={"Accept": "application/json"})
+        try:
+            response = session.get(f"{fxtwitter.API_BASE}/2/status/{status_id}", timeout=15)
+            if response.status_code != 200:
+                return None
+            data = (response.json() or {}).get("status") or {}
+        except Exception:  # noqa: BLE001 - 单条拉不到就当这条没有
+            return None
+        finally:
+            session.close()
+        media = data.get("media") if isinstance(data.get("media"), dict) else {}
+        for entry in media.get("all") or []:
+            if not isinstance(entry, dict):
+                continue
+            if fxtwitter.media_key(str(entry.get("url") or "")) != key:
+                continue
+            author = data.get("author") if isinstance(data.get("author"), dict) else {}
+            handle = str(author.get("screen_name") or "").strip()
+            return {
+                "url": str(data.get("url") or "") or (
+                    f"https://x.com/{handle}/status/{status_id}" if handle else ""
+                ),
+                "handle": handle,
+                "name": str(author.get("name") or "").strip(),
+                "created_at": str(data.get("created_at") or ""),
+            }
+        return None
+
+    async def _reply_page_lookup(self, handle: str, key: str) -> dict[str, Any] | None:
+        """顺着 @handle 的回复记录，找出那张图真正出自哪条帖子。
+
+        X 的回复页（``/<号>/with_replies``）免登录读不到，但搜索接口能按账号翻
+        回复，每条都带 ``replying_to.status``。把父帖挨个取回来比媒体键，命中
+        的那条就是原帖，作者也是真正发图的人。
+        """
+        query = fxtwitter.build_replies_query(handle)
+        if not query or not key:
+            return None
+        deadline = time.monotonic() + self._REPLY_SCAN_BUDGET
+        parents: list[str] = []
+        cursor = ""
+        for _ in range(self._REPLY_SCAN_PAGES):
+            if time.monotonic() > deadline:
+                break
+            page = await asyncio.to_thread(self._search_page, query, cursor)
+            if not page:
+                break
+            hits, cursor = page
+            if not hits:
+                break
+            for hit in hits:
+                if hit.parent_id and hit.parent_id not in parents:
+                    parents.append(hit.parent_id)
+            if not cursor or len(parents) >= self._REPLY_SCAN_PARENTS:
+                break
+        parents = parents[: self._REPLY_SCAN_PARENTS]
+        if not parents:
+            self._vlog("回复页反查：@%s 一条回复都没翻到", handle)
+            return None
+        for start in range(0, len(parents), self._REPLY_SCAN_BATCH):
+            if time.monotonic() > deadline + 10:
+                break
+            batch = parents[start : start + self._REPLY_SCAN_BATCH]
+            results = await asyncio.gather(
+                *(asyncio.to_thread(self._parent_hit, pid, key) for pid in batch)
+            )
+            for found in results:
+                if found:
+                    self._vlog(
+                        "回复页反查：@%s 回了 %s 条，命中父帖 %s（@%s）",
+                        handle,
+                        len(parents),
+                        found["url"],
+                        found["handle"] or "未知",
+                    )
+                    return found
+        self._vlog("回复页反查：@%s 翻了 %s 个父帖，没有这张图", handle, len(parents))
+        return None
+
+    async def _resolve_x_reply_page(self, candidates: list[Candidate]) -> None:
+        """把「X 回复页」上对得上的图，倒推回它真正的那条原帖。
+
+        回复页上出现的图是「她回复的那条帖子」的，发布者是别人——实测
+        s-20261109-2118-5137：图在 @wn40536699 的回复页里，指纹距离 0，实际
+        是 @hinatahimarii 发的。只在指纹已经对上（距离 ≤ 阈值）时反查，翻不到
+        就保持疑似；认错人比没找到更糟。
+        """
+        threshold = self.config.plugin.hash_threshold
+        pending = [
+            item
+            for item in candidates
+            if item.status == "suspect"
+            and item.distance is not None
+            and item.distance <= threshold
+            and x_page_kind(item.url or "") == "with_replies"
+        ]
+        if not pending:
+            return
+        attempts = 0
+        for item in pending:
+            if attempts >= self._REPLY_SCAN_ATTEMPTS:
+                break
+            handle = x_page_handle(item.url or "")
+            key = fxtwitter.media_key(item.image_url or "")
+            if not handle or not key:
+                continue
+            attempts += 1
+            found = await self._reply_page_lookup(handle, key)
+            if not found:
+                continue
+            who = f"@{found['handle']}" if found["handle"] else "某个账号"
+            item.url = found["url"] or item.url
+            if found["handle"]:
+                item.handle = who
+            if found["name"]:
+                item.name = found["name"]
+            item.platform = "X (Twitter)"
+            item.source = "X"
+            item.status = "match"
+            item.note = (
+                f"指纹一致（距离 {item.distance}）：这是 @{handle} 的回复页，"
+                f"顺着她的回复找到原帖在 {who} 名下"
+            )
+            self._vlog("回复页换成原帖：@%s → %s（距离 %s）", handle, item.url, item.distance)
 
     async def _settle_vision_handle(self, best: Candidate | None, upload: bytes | None) -> Candidate | None:
         """视觉给的是 X 账号主页时，翻这个号自己的帖子核实，翻不到就降级。

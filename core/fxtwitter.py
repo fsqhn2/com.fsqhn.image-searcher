@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from urllib.parse import urlencode
 
 API_BASE = "https://api.fxtwitter.com"
 
@@ -187,3 +188,109 @@ def parse_media_list(payload: dict | None) -> list[MediaPost]:
             )
         )
     return posts
+
+
+# ---------------------------------------------------------------------------
+# 搜索接口：按账号翻「她回复了谁」
+# ---------------------------------------------------------------------------
+
+MEDIA_HOST = "pbs.twimg.com"
+_MEDIA_PATH = re.compile(r"/media/([A-Za-z0-9_-]{5,})")
+
+
+@dataclass
+class SearchHit:
+    """一条搜索结果（``/2/search`` 里的一项）。"""
+
+    tweet_id: str = ""
+    url: str = ""
+    text: str = ""
+    created_at: str = ""
+    media: list[str] = field(default_factory=list)
+    # 这条本身是回复时，被回复那条帖子的 ID；不是回复就是空串。
+    parent_id: str = ""
+
+
+def media_key(url: str = "") -> str:
+    """从 ``pbs.twimg.com/media/<key>`` 里取出图片的媒体键。
+
+    同一个文件在 X 上只对应一个键，键相同就等于同一张图：拿它去比父帖里有没有
+    这张，比再下一次图算指纹更直接，也不用担心缩图压坏指纹。
+    """
+    raw = (url or "").strip()
+    if MEDIA_HOST not in raw:
+        return ""
+    found = _MEDIA_PATH.search(raw)
+    return found.group(1) if found else ""
+
+
+def build_search_url(query: str, cursor: str = "") -> str:
+    """X 搜索（走 fxtwitter 中转）。query 用 X 自己的语法，如 ``from:<号> filter:replies``。"""
+    text = (query or "").strip()
+    if not text:
+        return ""
+    params: dict[str, str] = {"q": text}
+    if cursor:
+        params["cursor"] = cursor
+    return f"{API_BASE}/2/search?{urlencode(params)}"
+
+
+def build_replies_query(handle: str) -> str:
+    """某账号的回复列表查询式；号名不合法时返回空串。
+
+    X 的回复页（``/<号>/with_replies``）免登录读不到，但搜索接口能按账号过滤，
+    每条回复还带 ``replying_to.status``——顺着它就能回到「她到底回复了谁的帖子」。
+    """
+    user = (handle or "").strip().lstrip("@")
+    if not user or not _HANDLE.match(user):
+        return ""
+    return f"from:{user} filter:replies"
+
+
+def parse_search(payload: dict | None) -> tuple[list[SearchHit], str]:
+    """把搜索返回拆成（结果列表，下一页游标）。
+
+    游标缺失或结果为空都说明翻到头了，调用方按「没更多」处理。
+    """
+    if not isinstance(payload, dict):
+        return [], ""
+    raw = payload.get("results")
+    hits: list[SearchHit] = []
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("type") or "status") != "status":
+            continue
+        tweet_id = str(item.get("id") or "").strip()
+        link = str(item.get("url") or "").strip()
+        if not tweet_id and not link:
+            # 空壳条目（只有 type 或什么都没有）不参与，免得下游拿着空 id 去查。
+            continue
+        urls: list[str] = []
+        media = item.get("media")
+        if isinstance(media, dict):
+            for entry in media.get("all") or []:
+                if not isinstance(entry, dict):
+                    continue
+                link = str(entry.get("url") or "").strip()
+                if link.startswith("http") and link not in urls:
+                    urls.append(link)
+        replying = item.get("replying_to")
+        parent_id = ""
+        if isinstance(replying, dict):
+            parent_id = str(replying.get("status") or "").strip()
+        hits.append(
+            SearchHit(
+                tweet_id=tweet_id,
+                url=link or (f"https://x.com/i/status/{tweet_id}" if tweet_id else ""),
+                text=str(item.get("text") or ""),
+                created_at=str(item.get("created_at") or ""),
+                media=urls,
+                parent_id=parent_id,
+            )
+        )
+    cursor = payload.get("cursor")
+    bottom = ""
+    if isinstance(cursor, dict):
+        bottom = str(cursor.get("bottom") or "").strip()
+    return hits, bottom

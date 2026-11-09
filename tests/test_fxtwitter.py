@@ -184,3 +184,69 @@ class MediaListTest(unittest.TestCase):
     def test_bad_payload(self) -> None:
         self.assertEqual(fxtwitter.parse_media_list(None), [])
         self.assertEqual(fxtwitter.parse_media_list({"code": 404}), [])
+
+
+class MediaKeyTest(unittest.TestCase):
+    """同一张图在 X 上只对应一个媒体键，靠它判断父帖里有没有这张图。"""
+
+    def test_key_from_media_url(self) -> None:
+        self.assertEqual(
+            fxtwitter.media_key("https://pbs.twimg.com/media/HWb8qgsasAA9bUk?format=webp&name=large"),
+            "HWb8qgsasAA9bUk",
+        )
+        self.assertEqual(
+            fxtwitter.media_key("https://pbs.twimg.com/media/HWb8qgsasAA9bUk.jpg"),
+            "HWb8qgsasAA9bUk",
+        )
+
+    def test_other_hosts_and_empty(self) -> None:
+        self.assertEqual(fxtwitter.media_key("https://i.imgur.com/abc.jpg"), "")
+        self.assertEqual(fxtwitter.media_key(""), "")
+        self.assertEqual(fxtwitter.media_key("https://pbs.twimg.com/profile_images/1/x.jpg"), "")
+
+
+class RepliesSearchTest(unittest.TestCase):
+    """回复页反查：靠搜索接口顺着 replying_to 回到父帖。"""
+
+    def test_build_replies_query(self) -> None:
+        self.assertEqual(fxtwitter.build_replies_query("@wn40536699"), "from:wn40536699 filter:replies")
+        self.assertEqual(fxtwitter.build_replies_query("wn40536699"), "from:wn40536699 filter:replies")
+        self.assertEqual(fxtwitter.build_replies_query(""), "")
+        self.assertEqual(fxtwitter.build_replies_query("a/b"), "")
+
+    def test_build_search_url_with_cursor(self) -> None:
+        url = fxtwitter.build_search_url("from:a filter:replies")
+        self.assertTrue(url.startswith("https://api.fxtwitter.com/2/search?q=from%3Aa+filter%3Areplies"))
+        url = fxtwitter.build_search_url("from:a filter:replies", "CUR")
+        self.assertIn("cursor=CUR", url)
+        self.assertEqual(fxtwitter.build_search_url(""), "")
+
+    def test_parse_results_and_cursor(self) -> None:
+        payload = {
+            "code": 200,
+            "results": [
+                {
+                    "type": "status",
+                    "id": "2119652310125310082",
+                    "url": "https://x.com/wn40536699/status/2119652310125310082",
+                    "text": "@qun1150028 屁股我进入",
+                    "created_at": "Mon Nov 09 04:44:26 +0000 2026",
+                    "media": {"all": []},
+                    "replying_to": {
+                        "screen_name": "qun1150028",
+                        "status": "2119305690091332085",
+                    },
+                }
+            ],
+            "cursor": {"top": "T", "bottom": "B"},
+        }
+        hits, cursor = fxtwitter.parse_search(payload)
+        self.assertEqual(cursor, "B")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].tweet_id, "2119652310125310082")
+        self.assertEqual(hits[0].parent_id, "2119305690091332085")
+
+    def test_parse_skips_non_status_and_empty(self) -> None:
+        payload = {"results": [{"type": "user", "id": "1"}, {}]}
+        self.assertEqual(fxtwitter.parse_search(payload)[0], [])
+        self.assertEqual(fxtwitter.parse_search(None), ([], ""))
