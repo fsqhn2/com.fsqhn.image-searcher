@@ -1072,6 +1072,12 @@ class EtaTextTest(unittest.TestCase):
     def test_slow_ping_text(self) -> None:
         self.assertEqual(formatting.SLOW_PING_TEXT, "这图有点难找，我需要细细对比，再稍等下哦。")
 
+    def test_trace_ping_text_says_whats_happening(self) -> None:
+        """回复页反查要花几十秒，这句得交代在干什么、还要多久。"""
+        self.assertIn("蛛丝马迹", formatting.TRACE_PING_TEXT)
+        self.assertIn("原帖", formatting.TRACE_PING_TEXT)
+        self.assertIn("1 分钟", formatting.TRACE_PING_TEXT)
+
 
 class DowngradedNearMissTest(unittest.TestCase):
     """距离够近但落点不对时，结论不能写成「均未通过阈值」。"""

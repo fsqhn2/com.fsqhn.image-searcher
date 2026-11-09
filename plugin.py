@@ -1534,6 +1534,8 @@ class ImageSearcherPlugin(MaiBotPlugin):
         sauce = self._sauce_route(candidates)
         route = "drawing" if sauce else "photo"
         route_reason = f"SauceNAO 相似度 {sauce.similarity:g}%" if sauce else "无插画库命中"
+        # 回复页反查没成功时留给 Grok 的一句话（成功就是空串）。
+        reply_hint = ""
         if sauce:
             names = _dedupe([name for name in config.engines.priority_drawn if name in names] + names)
             # 插画路线：SauceNAO 自带相似度已经能定论，再逐张下载比对没有意义。
@@ -1555,7 +1557,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
             await self._verify(candidates, grouped, names, target_hash)
             # X 的回复页会把「她回复的人的帖子」一起列出来：指纹对上了也只是
             # 说明这张图在这一页出现过。顺着她的回复回到父帖，能确定就换成原帖。
-            await self._resolve_x_reply_page(candidates)
+            reply_hint = await self._resolve_x_reply_page(candidates, stream_id)
 
         ordered = self._rank(candidates, names, prefer_pixiv=sauce is not None)
         # 同一个账号常被 Lens、Yandex、百度一起撞见：只留质量最好的那条，
@@ -1575,7 +1577,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
             if config.vision.enabled:
                 jobs["vision"] = self._vision_review(upload, ordered)
             if config.grok.enabled and (config.grok.api_key or "").strip():
-                jobs["grok"] = self._grok_lookup(upload, ordered)
+                jobs["grok"] = self._grok_lookup(upload, ordered, reply_hint=reply_hint)
             if jobs:
                 results = await asyncio.gather(*jobs.values(), return_exceptions=True)
                 for kind, result in zip(jobs, results):
@@ -2109,7 +2111,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
         )
         return info
 
-    async def _grok_lookup(self, upload: bytes | None, candidates: list[Candidate] | None = None) -> dict[str, Any]:
+    async def _grok_lookup(
+        self, upload: bytes | None, candidates: list[Candidate] | None = None, reply_hint: str = ""
+    ) -> dict[str, Any]:
         """把原图和已有候选一起交给 Grok，让它在 X 上核实到底是谁发的。
 
         实测过：单纯让它读水印会把 ``@ste11ar021`` 读成 ``@butter021``；让它凭空
@@ -2169,6 +2173,11 @@ class ImageSearcherPlugin(MaiBotPlugin):
         repost_note = "、".join(reposts[:3])
         if reposts:
             self._vlog("Grok 提示：候选里有转发页 %s", repost_note)
+        trace = " ".join((reply_hint or "").split())
+        if trace:
+            # 程序已经把「她的回复」翻过一遍还没找着，这条必须写进 prompt：
+            # 不然模型会以为没人试过，绕回同一条路，或者干脆说「没有原帖」。
+            self._vlog("Grok 提示：回复页已翻过但没成 %s", trace)
         timeout = max(15, int(section.timeout))
         proxy = self.config.plugin.proxy
 
@@ -2189,7 +2198,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
         started = time.time()
         payload: dict | None = None
         for index, (name, seconds) in enumerate(attempts):
-            body = grok.build_payload(name, data_url, hints=hints, repost_note=repost_note)
+            body = grok.build_payload(
+                name, data_url, hints=hints, repost_note=repost_note, reply_hint=trace
+            )
             try:
                 payload = await asyncio.wait_for(
                     asyncio.to_thread(call, body, seconds), timeout=seconds + 5
@@ -2538,16 +2549,21 @@ class ImageSearcherPlugin(MaiBotPlugin):
         )
         return best
 
-    # 回复页反查的预算：翻 15 页回复（约 300 条）、回查其中前 240 个父帖，
-    # 总耗时卡在 45 秒内。翻不完就放弃，宁可保持疑似也不能把整单拖死——
-    # 这单 s-20261109-2118-5137 的实测是 391 个父帖 64 秒，按这里砍到够用为止。
+    # 回复页反查的预算：翻 15 页回复、回查前 240 个父帖，总耗时卡在 60 秒内。
+    # 节奏上刻意放慢：每批 8 个请求、批间停 0.5 秒，约 5 个/秒——实测一口气
+    # 打 138 个没有触发限流，但没必要贴着上限跑，翻不完就放弃（宁可保持疑似）。
     _REPLY_SCAN_PAGES = 15
     _REPLY_SCAN_PARENTS = 240
-    _REPLY_SCAN_BATCH = 16
-    _REPLY_SCAN_BUDGET = 45.0
+    _REPLY_SCAN_BATCH = 8
+    _REPLY_SCAN_GAP = 0.5
+    _REPLY_SCAN_BUDGET = 60.0
     _REPLY_SCAN_ATTEMPTS = 2
+    # 这些状态码说明对方已经在拦了，继续发只会更糟，立刻收手。
+    _REPLY_THROTTLE_CODES = (403, 429)
 
-    def _search_page(self, query: str, cursor: str = "") -> tuple[list[fxtwitter.SearchHit], str] | None:
+    def _search_page(
+        self, query: str, cursor: str, state: dict[str, Any]
+    ) -> tuple[list[fxtwitter.SearchHit], str] | None:
         """取一页搜索结果；翻不动就返回 None（当「没更多」处理）。"""
         url = fxtwitter.build_search_url(query, cursor)
         if not url:
@@ -2555,6 +2571,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
         session = make_session(self._proxy(), headers={"Accept": "application/json"})
         try:
             response = session.get(url, timeout=15)
+            if response.status_code in self._REPLY_THROTTLE_CODES:
+                state["throttled"] = True
+                return None
             if response.status_code != 200:
                 raise HttpError(f"HTTP {response.status_code}")
             payload = response.json()
@@ -2565,11 +2584,14 @@ class ImageSearcherPlugin(MaiBotPlugin):
         finally:
             session.close()
 
-    def _parent_hit(self, status_id: str, key: str) -> dict[str, Any] | None:
+    def _parent_hit(self, status_id: str, key: str, state: dict[str, Any]) -> dict[str, Any] | None:
         """回查一条父帖：里面有没有媒体键为 key 的图。有就返回作者与帖子地址。"""
         session = make_session(self._proxy(), headers={"Accept": "application/json"})
         try:
             response = session.get(f"{fxtwitter.API_BASE}/2/status/{status_id}", timeout=15)
+            if response.status_code in self._REPLY_THROTTLE_CODES:
+                state["throttled"] = True
+                return None
             if response.status_code != 200:
                 return None
             data = (response.json() or {}).get("status") or {}
@@ -2595,23 +2617,28 @@ class ImageSearcherPlugin(MaiBotPlugin):
             }
         return None
 
-    async def _reply_page_lookup(self, handle: str, key: str) -> dict[str, Any] | None:
+    async def _reply_page_lookup(self, handle: str, key: str) -> tuple[dict[str, Any] | None, str]:
         """顺着 @handle 的回复记录，找出那张图真正出自哪条帖子。
 
         X 的回复页（``/<号>/with_replies``）免登录读不到，但搜索接口能按账号翻
         回复，每条都带 ``replying_to.status``。把父帖挨个取回来比媒体键，命中
         的那条就是原帖，作者也是真正发图的人。
+
+        返回（命中的帖子, 结果码）。结果码是 ``hit`` / ``throttled``（被限流）/
+        ``empty``（一条回复都没翻到）/ ``miss``（翻完了没这张图）/ ``timeout``，
+        失败时调用方要把它写进给 Grok 的提示里。
         """
         query = fxtwitter.build_replies_query(handle)
         if not query or not key:
-            return None
+            return None, "empty"
+        state: dict[str, Any] = {"throttled": False}
         deadline = time.monotonic() + self._REPLY_SCAN_BUDGET
         parents: list[str] = []
         cursor = ""
         for _ in range(self._REPLY_SCAN_PAGES):
-            if time.monotonic() > deadline:
+            if time.monotonic() > deadline or state["throttled"]:
                 break
-            page = await asyncio.to_thread(self._search_page, query, cursor)
+            page = await asyncio.to_thread(self._search_page, query, cursor, state)
             if not page:
                 break
             hits, cursor = page
@@ -2624,35 +2651,49 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 break
         parents = parents[: self._REPLY_SCAN_PARENTS]
         if not parents:
-            self._vlog("回复页反查：@%s 一条回复都没翻到", handle)
-            return None
+            self._vlog("回复页反查：@%s 一条回复都没翻到%s", handle, "（被限流）" if state["throttled"] else "")
+            return None, "throttled" if state["throttled"] else "empty"
+        checked = 0
         for start in range(0, len(parents), self._REPLY_SCAN_BATCH):
-            if time.monotonic() > deadline + 10:
+            if state["throttled"]:
                 break
+            if time.monotonic() > deadline:
+                self._vlog("回复页反查：@%s 到预算上限，已查 %s 个父帖", handle, checked)
+                return None, "timeout"
             batch = parents[start : start + self._REPLY_SCAN_BATCH]
             results = await asyncio.gather(
-                *(asyncio.to_thread(self._parent_hit, pid, key) for pid in batch)
+                *(asyncio.to_thread(self._parent_hit, pid, key, state) for pid in batch)
             )
+            checked += len(batch)
             for found in results:
                 if found:
                     self._vlog(
-                        "回复页反查：@%s 回了 %s 条，命中父帖 %s（@%s）",
+                        "回复页反查：@%s 翻了 %s 条、查了 %s 个父帖，命中 %s（@%s）",
                         handle,
                         len(parents),
+                        checked,
                         found["url"],
                         found["handle"] or "未知",
                     )
-                    return found
-        self._vlog("回复页反查：@%s 翻了 %s 个父帖，没有这张图", handle, len(parents))
-        return None
+                    return found, "hit"
+            # 每批之间停一下：一次性打完 200 多个请求才容易招来限流。
+            await asyncio.sleep(self._REPLY_SCAN_GAP)
+        if state["throttled"]:
+            self._vlog("回复页反查：@%s 被限流，已查 %s 个父帖就收手", handle, checked)
+            return None, "throttled"
+        self._vlog("回复页反查：@%s 查了 %s 个父帖，没有这张图", handle, checked)
+        return None, "miss"
 
-    async def _resolve_x_reply_page(self, candidates: list[Candidate]) -> None:
+    async def _resolve_x_reply_page(self, candidates: list[Candidate], stream_id: str = "") -> str:
         """把「X 回复页」上对得上的图，倒推回它真正的那条原帖。
 
         回复页上出现的图是「她回复的那条帖子」的，发布者是别人——实测
         s-20261109-2118-5137：图在 @wn40536699 的回复页里，指纹距离 0，实际
         是 @hinatahimarii 发的。只在指纹已经对上（距离 ≤ 阈值）时反查，翻不到
         就保持疑似；认错人比没找到更糟。
+
+        返回一句「已经翻过但没搞定」的说明（成功时返回空串）。调用方把它交给
+        Grok：翻不到多半是接口不给力，不是这张图没有出处，得让它换个路子查。
         """
         threshold = self.config.plugin.hash_threshold
         pending = [
@@ -2664,7 +2705,15 @@ class ImageSearcherPlugin(MaiBotPlugin):
             and x_page_kind(item.url or "") == "with_replies"
         ]
         if not pending:
-            return
+            return ""
+        # 这一段要花几十秒，先说一声——不然聊天里会以为已经搜完了。
+        if stream_id:
+            try:
+                await self.ctx.send.text(formatting.TRACE_PING_TEXT, stream_id)
+            except Exception as error:  # noqa: BLE001 - 提示发不出去不影响反查
+                self._vlog("顺藤摸瓜提示发送失败：%s", str(error)[:80])
+        self._vlog("回复页反查开始：候选=%s 提示=%s", len(pending), formatting.TRACE_PING_TEXT)
+        failed: list[str] = []
         attempts = 0
         for item in pending:
             if attempts >= self._REPLY_SCAN_ATTEMPTS:
@@ -2674,8 +2723,15 @@ class ImageSearcherPlugin(MaiBotPlugin):
             if not handle or not key:
                 continue
             attempts += 1
-            found = await self._reply_page_lookup(handle, key)
+            found, reason = await self._reply_page_lookup(handle, key)
             if not found:
+                why = {
+                    "throttled": "被接口限流、没翻完",
+                    "empty": "一条回复都没翻到",
+                    "timeout": "到时间上限、没翻完",
+                    "miss": "翻完了没命中",
+                }.get(reason, "没翻到")
+                failed.append(f"@{handle}（{why}）")
                 continue
             who = f"@{found['handle']}" if found["handle"] else "某个账号"
             item.url = found["url"] or item.url
@@ -2691,6 +2747,8 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 f"顺着她的回复找到原帖在 {who} 名下"
             )
             self._vlog("回复页换成原帖：@%s → %s（距离 %s）", handle, item.url, item.distance)
+            return ""
+        return "、".join(failed)
 
     async def _settle_vision_handle(self, best: Candidate | None, upload: bytes | None) -> Candidate | None:
         """视觉给的是 X 账号主页时，翻这个号自己的帖子核实，翻不到就降级。

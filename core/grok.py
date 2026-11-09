@@ -60,6 +60,9 @@ HINT_BLOCK = """搜索引擎这边已经返回了这些候选（账号 | 平台 
 REPOST_BLOCK = """还有一条已知事实：候选里出现了转发列表页 {items}。那说明这张图是该号从别人那里转来的，不是本人发的，不要把它当成发布者。请直接去找最初发这个号的账号或帖子；图上如果有水印、签名，那才是原发布者留下的线索。
 """
 
+REPLY_BLOCK = """另一条已知事实：程序已经顺着 {items} 的回复记录往上找过一遍，没有定位到原帖（可能翻不到、也可能接口限流）。请优先用 from:<账号> 在你的 X 搜索里把这个号的回复/转发再查一遍，找出这张图最初是谁发的；找不到帖子就说明查过哪些方式，不要停在「这个号像她」上。
+"""
+
 
 def social_first(candidates: list) -> list:
     """喂给 Grok 的候选顺序：社交平台优先。
@@ -121,12 +124,16 @@ def build_hints(candidates: list, limit: int = 8) -> list[str]:
     return lines
 
 
-def build_prompt(hints: list[str] | None = None, repost_note: str = "") -> str:
+def build_prompt(hints: list[str] | None = None, repost_note: str = "", reply_hint: str = "") -> str:
     """有候选清单就在第三步带上候选，没有就留空。
 
     ``repost_note`` 是候选里命中的转发页地址。带着它和不带它的差别是实测出来的：
     同一张图，不说「这是转发页」，模型会把转发者当成发布者、直接答「没有原帖」；
     说清楚之后它会转而读图上的水印，找到真正发帖的那个号。
+
+    ``reply_hint`` 是「程序已经顺着回复翻过一遍、没找到」时补的一句。回复页上的图
+    本来就是她回复的那条帖子的，翻失败说明该让模型换一条路（按 from:<号> 再查），
+    不能让它以为没人试过。
     """
     blocks: list[str] = []
     if hints:
@@ -136,6 +143,9 @@ def build_prompt(hints: list[str] | None = None, repost_note: str = "") -> str:
     note = " ".join((repost_note or "").split())
     if note:
         blocks.append(REPOST_BLOCK.format(items=note[:200]))
+    trace = "、".join((reply_hint or "").split())
+    if trace:
+        blocks.append(REPLY_BLOCK.format(items=trace[:200]))
     return PROMPT_TEMPLATE.format(hints=("\n\n".join(blocks) + "\n\n") if blocks else "").strip()
 
 
@@ -208,6 +218,7 @@ def build_payload(
     *,
     hints: list[str] | None = None,
     repost_note: str = "",
+    reply_hint: str = "",
     max_output_tokens: int = 1500,
 ) -> dict:
     """拼 Responses 接口的请求体。
@@ -221,7 +232,10 @@ def build_payload(
             {
                 "role": "user",
                 "content": [
-                    {"type": "input_text", "text": build_prompt(hints, repost_note=repost_note)},
+                    {
+                        "type": "input_text",
+                        "text": build_prompt(hints, repost_note=repost_note, reply_hint=reply_hint),
+                    },
                     {"type": "input_image", "image_url": image_data_url},
                 ],
             }

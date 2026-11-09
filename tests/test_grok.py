@@ -107,6 +107,23 @@ class BuildPayloadTest(unittest.TestCase):
         text = body["input"][0]["content"][0]["text"]
         self.assertNotIn("转发列表页", text)
 
+    def test_reply_hint_asks_for_account_search(self) -> None:
+        """回复页反查失败要写进 prompt：程序试过这条路了，让模型换 from:<号> 再查。"""
+        body = grok.build_payload(
+            "grok-4.7",
+            "data:image/jpeg;base64,AAA",
+            reply_hint="@wn40536699（被接口限流、没翻完）",
+        )
+        text = body["input"][0]["content"][0]["text"]
+        self.assertIn("wn40536699", text)
+        self.assertIn("from:", text)
+        self.assertIn("限流", text)
+
+    def test_no_reply_hint_keeps_prompt_clean(self) -> None:
+        body = grok.build_payload("grok-4.7", "data:image/jpeg;base64,AAA")
+        text = body["input"][0]["content"][0]["text"]
+        self.assertNotIn("from:<账号>", text)
+
     def test_build_hints_dedupes_and_prefers_identity(self) -> None:
         class _Item:
             def __init__(self, handle="", name="", platform=""):
