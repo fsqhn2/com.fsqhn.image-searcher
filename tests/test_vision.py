@@ -379,6 +379,71 @@ class VisionDisplayTest(unittest.TestCase):
             vision.VERDICT_VISION,
         )
 
+    def test_platform_id_is_not_an_account(self):
+        """BV 号、裸数字是平台编号，不是账号名。"""
+        for handle in ("BV1emeB6WEgG", "@BV1emeB6WEgG", "BV16m4y1E7Tf"):
+            self.assertTrue(vision.is_platform_id(handle), handle)
+        for handle in ("7481083391", "@7481083391", "1659556344330874880"):
+            self.assertTrue(vision.is_platform_id(handle), handle)
+        for handle in ("", "@wn40536699", "崽崽", "UID 1659556344330874880", "BV"):
+            self.assertFalse(vision.is_platform_id(handle), handle)
+
+    def test_bilibili_video_page_is_not_a_conclusion(self):
+        """B 站视频页的 BV 号被当成账号发出去，用户看到的就是「这等于没找到」。
+
+        视频页本身还可能是搬运，所以整条降级成疑似，不能顶到结论位。
+        """
+        self.assertEqual(
+            vision.verdict_of("BV1emeB6WEgG", "B站", "https://www.bilibili.com/video/BV1emeB6WEgG"),
+            vision.VERDICT_PLATFORM_ID,
+        )
+        # 电商页优先：搬运视频挂在商品页上，先说它是商品页。
+        self.assertEqual(
+            vision.verdict_of("BV1emeB6WEgG", "taobao.com", "https://item.taobao.com/item.htm?id=1"),
+            vision.VERDICT_COMMERCE,
+        )
+        # 有真账号的 B 站主页照常算结论（space 链接给的是 UID，这里只验证账号名形态）。
+        self.assertEqual(
+            vision.verdict_of("@someone", "B站", "https://space.bilibili.com/1234567"),
+            vision.VERDICT_VISION,
+        )
+
+    def test_platform_id_note_names_the_id(self):
+        """降级文案要把那个编号写出来，用户才知道那是视频号、不是账号。"""
+        note = vision.DOWNGRADE_NOTES[vision.VERDICT_PLATFORM_ID].format(
+            gap="指纹距离 30，超过阈值 8", platform="B站", handle="BV1emeB6WEgG"
+        )
+        self.assertIn("BV1emeB6WEgG", note)
+        self.assertIn("不是作者账号", note)
+        self.assertIn("疑似同一个人", note)
+
+    def test_downgraded_best_falls_back_to_not_found(self):
+        """视觉挑中又被降级的那条不能当结论：整单写成未找到，但链接仍要给出来。
+
+        B 站视频页的 BV 号被当成账号摆在结论位时，看着像「找到了一个人」。
+        """
+        item = Candidate(
+            engine="lens",
+            url="http://www.bilibili.com/video/BV1emeB6WEgG",
+            platform="B站",
+            handle="BV1emeB6WEgG",
+            distance=30,
+            status="suspect",
+            note="视觉复核：疑似同一个人，但那条只有一个页面编号（BV1emeB6WEgG）、不是作者账号（指纹距离 30，超过阈值 8），仅供参考",
+        )
+        outcome = SearchOutcome(
+            status="ok",
+            best=item,
+            candidates=[item],
+            vision={"ok": True, "checked": 16, "downgraded": 1, "reason": "同款鱼形图案T恤"},
+        )
+        text = formatting._best_block(outcome)
+        lines = text.splitlines()
+        self.assertIn("未找到可靠出处", lines[0])
+        self.assertIn("BV1emeB6WEgG", text)
+        self.assertIn("视觉挑中的那条", text)
+        self.assertNotIn("🌐 平台：B站", lines[0])
+
     def test_vision_reason_is_shown(self):
         """把模型理由亮出来：它按服装判的还是认了脸，用户一眼能分辨。"""
         item = Candidate(

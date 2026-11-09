@@ -216,10 +216,20 @@ def _vision_pick_line(outcome: SearchOutcome) -> str:
     ]
     if not picks:
         return ""
-    pick = min(picks, key=lambda item: item.distance if item.distance is not None else 999)
+    # 视觉挑中的那条 best 被降级时，用户想看的就是它——按距离另挑一条（比如
+    # YouTube 的 shorts 列表页）反而离题。
+    best = outcome.best
+    pick = None
+    label = "最接近的一条"
+    if best is not None and best.url:
+        pick = next((item for item in picks if item.url == best.url), None)
+        if pick is not None:
+            label = "视觉挑中的那条"
+    if pick is None:
+        pick = min(picks, key=lambda item: item.distance if item.distance is not None else 999)
     where = pick.platform or pick.source or pick.engine
     gap = f"，指纹距离 {pick.distance}" if pick.distance is not None else ""
-    return f"👉 最接近的一条（{where}{gap}）\n{pick.url}"
+    return f"👉 {label}（{where}{gap}）\n{pick.url}"
 
 
 def _vision_downgrade_line(outcome: SearchOutcome, vision: dict | None) -> str:
@@ -321,12 +331,20 @@ def _best_block_core(outcome: SearchOutcome, *, skip_grok: bool = False) -> str:
     best = outcome.best
     grok = outcome.grok or {}
     grok_lines = _grok_lines(grok)
+    # 视觉挑中的那条被降级成疑似后，这单其实等于「没找到」：一条 BV 号或转发页
+    # 不该摆成结论。降级原因和链接由下面的未找到分支统一给出。
+    degraded = (
+        best is not None
+        and best.status == "suspect"
+        and (best.note or "").startswith("视觉复核")
+    )
+    solid = best is not None and not degraded
     # 帖子档高于视觉档：帖子能点开对照，视觉只是模型判断，所以先给帖子。
     if grok.get("tier") == "post" and not skip_grok:
         if best is not None and best.status == "vision":
             grok_lines.append("视觉复核也认为是同一个人（模型判断，仅供参考），那张候选见参考区。")
         return "\n".join(grok_lines)
-    if best is None and grok_lines and not skip_grok:
+    if not solid and grok_lines and not skip_grok:
         # 只拿到账号：比「完全没找到」有用，但没有帖子可对照，仍然算线索。
         vision = outcome.vision or {}
         if vision.get("ok") and vision.get("checked"):
@@ -343,7 +361,7 @@ def _best_block_core(outcome: SearchOutcome, *, skip_grok: bool = False) -> str:
         elif vision.get("error"):
             grok_lines.append(f"视觉复核没做完：{vision['error']}")
         return "\n".join(grok_lines)
-    if best is None:
+    if not solid:
         compared = sum(1 for item in outcome.candidates if item.distance is not None)
         nearest = min(
             (item for item in outcome.candidates if item.distance is not None),

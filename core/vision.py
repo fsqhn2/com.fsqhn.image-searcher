@@ -145,19 +145,37 @@ def is_traceable(handle: str = "", platform: str = "", url: str = "") -> bool:
 
 
 # 视觉说「同一个人」之后，这条结果还能到什么程度。顺序有意义：先排电商商品页，
-# 再看能不能追踪，最后确认有没有账号名。
+# 再看落点是不是只是一个平台编号，最后确认有没有账号名。
 VERDICT_VISION = "vision"
 VERDICT_COMMERCE = "commerce"
 VERDICT_REPOST = "repost"
+VERDICT_PLATFORM_ID = "platform_id"
 VERDICT_UNTRACEABLE = "untraceable"
 VERDICT_NO_ACCOUNT = "no_account"
 
 DOWNGRADE_NOTES = {
     VERDICT_COMMERCE: "视觉复核：疑似同一个人，但来自电商商品页（{gap}），仅供参考",
     VERDICT_REPOST: "视觉复核：疑似同一个人，但那是转发页、图不是她发的（{gap}），仅供参考",
+    VERDICT_PLATFORM_ID: "视觉复核：疑似同一个人，但那条只有一个页面编号（{handle}）、不是作者账号（{gap}），仅供参考",
     VERDICT_UNTRACEABLE: "视觉复核：疑似同一个人，但那是{platform}上的页面、不是作者主页（{gap}），仅供参考",
     VERDICT_NO_ACCOUNT: "视觉复核：疑似同一个人，但只找到{platform}的平台页面、解析不出发布者（{gap}），仅供参考",
 }
+
+# 平台内部编号：B 站 BV 号、各类站点 UID。它们能定位到一条视频或一个人，
+# 但不是账号名——拿它当结论就是「找到了一个 BV1xx」，对用户没有任何用。
+_BV_ID = re.compile(r"^BV[A-Za-z0-9]+$", re.I)
+_NUMERIC_ID = re.compile(r"^\d{5,}$")
+
+
+def is_platform_id(handle: str = "") -> bool:
+    """这个 handle 只是平台编号（BV 号、数字 UID），不是账号名。
+
+    ``@`` 前缀照剥，标题里抽出来的 ``@12345678`` 也一样不是人名。
+    """
+    value = str(handle or "").strip().lstrip("@")
+    if not value:
+        return False
+    return bool(_BV_ID.match(value) or _NUMERIC_ID.match(value))
 
 
 def verdict_of(handle: str = "", platform: str = "", url: str = "", name: str = "") -> str:
@@ -166,11 +184,17 @@ def verdict_of(handle: str = "", platform: str = "", url: str = "", name: str = 
     只落在社交平台页面上、却没解析出账号名的（比如一条抖音 note 链接），点进去
     也确认不了是谁发的，只能算疑似——之前这类被当成结论发出去，用户看到的
     「找到了」其实只是同场景的另一条内容。
+
+    B 站视频页尤其要小心：从 `bilibili.com/video/BV…` 抠出来的 BV 号不是账号，
+    视频页也可能是搬运。实测 s-20261109-2342-2312 把一条 BV 号当成结论发给用户，
+    距离还是 30，看着像找到了人，实际什么都没找到。
     """
     if is_commerce(platform, url, name):
         return VERDICT_COMMERCE
     if is_repost_page(url):
         return VERDICT_REPOST
+    if is_platform_id(handle):
+        return VERDICT_PLATFORM_ID
     if not is_traceable(handle, platform, url):
         return VERDICT_UNTRACEABLE
     if not str(handle or "").strip():

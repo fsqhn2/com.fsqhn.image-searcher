@@ -2121,7 +2121,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
             if verdict != vision.VERDICT_VISION:
                 candidate.status = "suspect"
                 candidate.note = vision.DOWNGRADE_NOTES[verdict].format(
-                    gap=gap, platform=candidate.platform or "这个站点"
+                    gap=gap,
+                    platform=candidate.platform or "这个站点",
+                    handle=candidate.handle or "空白",
                 )
                 info["downgraded"] += 1
                 continue
