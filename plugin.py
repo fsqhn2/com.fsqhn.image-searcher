@@ -1602,13 +1602,24 @@ class ImageSearcherPlugin(MaiBotPlugin):
                         )
                     else:
                         self._vlog(
-                            "视觉复核：检查=%s 命中=%s 降级=%s 耗时=%ss 模型=%s",
+                            "视觉复核：检查=%s 命中=%s 降级=%s 耗时=%ss 模型=%s 水印=%s",
                             vision_info.get("checked"),
                             len(vision_info.get("picked") or []),
                             vision_info.get("downgraded"),
                             vision_info.get("elapsed"),
                             vision_info.get("model") or "-",
+                            vision_info.get("watermark") or "-",
                         )
+                # 视觉顺带读到的水印只当线索：模型读小字常出错，确认到账号就
+                # 给个主页让用户自己点开核对，确认不了就只写原文。
+                if vision_info and vision_info.get("watermark"):
+                    handle = vision.handle_from_watermark(vision_info["watermark"])
+                    if handle:
+                        vision_info["watermark_handle"] = handle
+                        exists = await self._account_exists(handle)
+                        if exists:
+                            vision_info["watermark_url"] = f"https://x.com/{handle}"
+                        self._vlog("水印账号核对：@%s 存在=%s", handle, exists)
                 if vision_info and vision_info.get("picked"):
                     ordered = dedupe_accounts(self._rank(candidates, names))
                     # 模型可能一次报好几格，取指纹距离最近的那条当结论——距离近说明
@@ -2067,6 +2078,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
             return info
 
         info["reason"] = vision.reason_of(text)
+        info["watermark"] = vision.watermark_of(text)
         for number in vision.parse_picks(text, len(images)):
             candidate = used[number - 1]
             if is_avatar_hit(candidate):

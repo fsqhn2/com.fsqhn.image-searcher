@@ -139,6 +139,71 @@ class ReasonTest(unittest.TestCase):
         self.assertEqual(vision.reason_of(""), "")
 
 
+class WatermarkTest(unittest.TestCase):
+    """TARGET 格上的水印顺带抄一份，只能当线索。"""
+
+    def test_prompt_asks_for_watermark(self):
+        prompt = vision.build_prompt(8)
+        self.assertIn("watermark", prompt)
+        self.assertIn("只抄 TARGET", prompt)
+
+    def test_watermark_extracted(self):
+        text = '{"same_person": [], "reason": "-", "watermark": "@sssmnms"}'
+        self.assertEqual(vision.watermark_of(text), "@sssmnms")
+
+    def test_watermark_keeps_chinese(self):
+        text = '```json\n{"watermark": "微博@某某"}\n```'
+        self.assertEqual(vision.watermark_of(text), "微博@某某")
+
+    def test_watermark_rejects_unreadable(self):
+        for value in ("", "无", "看不清", "没有水印", "None", "n/a"):
+            text = json.dumps({"watermark": value}, ensure_ascii=False)
+            self.assertEqual(vision.watermark_of(text), "", value)
+
+    def test_watermark_missing_field(self):
+        self.assertEqual(vision.watermark_of('{"same_person": [2]}'), "")
+        self.assertEqual(vision.watermark_of("没有 JSON"), "")
+
+    def test_watermark_truncated(self):
+        text = json.dumps({"watermark": "x" * 80})
+        self.assertEqual(len(vision.watermark_of(text)), 40)
+
+    def test_handle_from_at_mark(self):
+        self.assertEqual(vision.handle_from_watermark("@sssmnms"), "sssmnms")
+        self.assertEqual(vision.handle_from_watermark("水印 @abc_123 右下角"), "abc_123")
+
+    def test_handle_from_bare_account(self):
+        self.assertEqual(vision.handle_from_watermark("hinatahimarii"), "hinatahimarii")
+
+    def test_handle_rejects_guessing(self):
+        # 中文名、平台名、纯数字都不许当账号，宁缺毋滥。
+        for value in ("土狗小黄", "weibo", "1234567", "", "@a", "土狗小黄 on X"):
+            self.assertEqual(vision.handle_from_watermark(value), "", value)
+
+    def test_handle_needs_at_least_two_chars(self):
+        self.assertEqual(vision.handle_from_watermark("@sss mn ms"), "sss")
+
+    def test_watermark_line_shown(self):
+        outcome = SearchOutcome()
+        outcome.vision = {"watermark": "@sssmnms", "watermark_url": "https://x.com/sssmnms"}
+        text = formatting._best_block(outcome)
+        self.assertIn("图上水印：@sssmnms", text)
+        self.assertIn("https://x.com/sssmnms", text)
+        self.assertIn("可能读错", text)
+
+    def test_watermark_line_without_url(self):
+        outcome = SearchOutcome()
+        outcome.vision = {"watermark": "微博@某某"}
+        text = formatting._best_block(outcome)
+        self.assertIn("图上水印：微博@某某", text)
+        self.assertNotIn("可点开核对", text)
+
+    def test_no_watermark_no_line(self):
+        outcome = SearchOutcome()
+        outcome.vision = {"watermark": ""}
+        self.assertNotIn("图上水印", formatting._best_block(outcome))
+
+
 class VisionDisplayTest(unittest.TestCase):
     """视觉命中的候选不能冒充「同一张图」，文案上必须区分开。"""
 

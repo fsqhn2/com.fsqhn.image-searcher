@@ -251,6 +251,9 @@ def _vision_downgrade_line(outcome: SearchOutcome, vision: dict | None) -> str:
 def _best_block(outcome: SearchOutcome, *, skip_grok: bool = False) -> str:
     text = _best_block_core(outcome, skip_grok=skip_grok)
     extra: list[str] = []
+    watermark = _vision_watermark_line(outcome)
+    if watermark:
+        extra.append(watermark)
     if not skip_grok:
         miss = _grok_miss_line(outcome)
         if miss:
@@ -261,6 +264,22 @@ def _best_block(outcome: SearchOutcome, *, skip_grok: bool = False) -> str:
     if extra:
         text = "\n".join([text, *extra])
     return text
+
+
+def _vision_watermark_line(outcome: SearchOutcome) -> str:
+    """视觉模型顺手抄下来的图上水印，只能当线索，不能当结论。
+
+    实测模型读小号白字水印会出错（@ste11ar021 读成 @butter021），所以文案里
+    必须写明「模型识别，可能读错」；能确认到账号时附主页，让用户自己点开核对。
+    """
+    vision = outcome.vision or {}
+    text = str(vision.get("watermark") or "").strip()
+    if not text:
+        return ""
+    url = str(vision.get("watermark_url") or "").strip()
+    if url:
+        return f"🔎 图上水印：{text}（视觉模型识别，可能读错，可点开核对）：{url}"
+    return f"🔎 图上水印：{text}（视觉模型识别，可能读错）"
 
 
 def _best_block_core(outcome: SearchOutcome, *, skip_grok: bool = False) -> str:

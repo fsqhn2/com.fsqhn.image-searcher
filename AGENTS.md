@@ -175,6 +175,7 @@ core/maibot_compat.py  能力返回值解包
 30. **X 帖正文里的词会被当成人名**：`kiko on X: "Happy Halloween!"` 抽出了 Halloween，推出 @halloween（1.44 万粉）和泄露站页面。`on X:` 后面是正文，抽名字前必须剥掉。
 31. **视觉的理由可能取自别的格子**：同一单里它说「发尾蓝白渐变」，挑中的却是粉发那张——拼图里不同格的特征被串了。所以理由要原样发给用户（`_vision_reason()`），它自己就是最好的可信度提示。
 32. **转发地址的 `author` 是原作者，转发者另存 `reposted_by`**：`x.com/redwine278/status/1994540292142501924` 看着像 @redwine278 发的，fxtwitter 返回的却是 `handle=sssmnms`、`name=哎我黑切訥`、`url` 指向 sssmnms 那条，转发者在 `reposted_by=redwine278`。别拿 URL 里的号当作者，也别因为 URL 和 `url` 不一致就当解析出错——那正是转发的标志。
+33. **视觉顺带读的水印只能当线索**：同一张拼图里让模型抄 `TARGET` 格上的水印／签名／角落小字（`vision.watermark_of()`），别让它抄候选格的——那是网站或上传者加的，微博那条的 `@颜撩` 就只说明文件是她的号传的，认不出照片里的人。模型读小号白字会错（`@ste11ar021` 读成 `@butter021`），所以文案固定带「视觉模型识别，可能读错」，`handle_from_watermark()` 也只认明写的 `@xxx` 或整串裸账号，中文名一律不猜。
 
 ## 排障顺序
 

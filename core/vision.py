@@ -51,10 +51,12 @@ PROMPT_TEMPLATE = """你在帮我核对「同一个人」。
 同一个人换了姿势、换了角度、被裁掉一部分、被别人拼成对比图、加了水印或滤镜、换了背景，都算同一个人。
 拿不准的不要选，宁缺毋滥。
 
+还有一件顺手的事：第 0 格 TARGET 上要是有水印、签名、网址，或者角落里的小字账号，就把它逐字抄进 watermark（比如 "@abc123"、"微博@某某"）。只抄 TARGET 这一格：候选格上的水印是那个网站或别人上传时加的，抄进来会认错人。看不清、认不全、或者本来就没有，一律留空，别猜。
+
 只输出一行 JSON，不要任何解释与代码块：
-{{"same_person": [编号], "reason": "不超过 40 字，写你看到的那个具体特征"}}
+{{"same_person": [编号], "reason": "不超过 40 字，写你看到的那个具体特征", "watermark": "TARGET 格上的水印原文，没有就空串"}}
 一个都不是就输出：
-{{"same_person": [], "reason": "..."}}
+{{"same_person": [], "reason": "...", "watermark": ""}}
 """
 
 _JSON_BLOCK = re.compile(r"\{.*\}", re.S)
@@ -325,3 +327,86 @@ def reason_of(text: str) -> str:
     if isinstance(payload, dict):
         return str(payload.get("reason") or "").strip()[:60]
     return ""
+
+
+# 水印里像 X 账号的部分：@abc123，或者整串就是个裸账号。
+_WATERMARK_HANDLE = re.compile(r"@([A-Za-z0-9_]{2,15})")
+_WATERMARK_BARE = re.compile(r"[A-Za-z0-9_]{3,15}")
+# 模型说「没有」的各种写法。水印常常小到只有一个像素高，它照样会回一句「看不清」，
+# 这种不能当成「读到了一个 ID」。
+_WATERMARK_EMPTY = (
+    "无",
+    "没有",
+    "未发现",
+    "未见",
+    "看不清",
+    "不清晰",
+    "不清楚",
+    "空",
+    "none",
+    "null",
+    "n/a",
+    "no ",
+)
+# 水印里会出现的站名，不是账号。裸串命中这些词时不能当 handle。
+_WATERMARK_PLATFORMS = frozenset(
+    {
+        "weibo",
+        "twitter",
+        "instagram",
+        "tiktok",
+        "douyin",
+        "bilibili",
+        "wechat",
+        "xiaohongshu",
+        "www",
+        "http",
+        "https",
+        "com",
+    }
+)
+
+
+def watermark_of(text: str) -> str:
+    """取模型从 TARGET 格抄下来的水印原文。读不清或没读，一律返回空串。
+
+    只做搬运，不做推断：中文、@句柄、网址都原样留着，交给展示层判断有没有用。
+    模型读小字水印经常读错（实测 @ste11ar021 被读成 @butter021），所以这只能
+    当线索，不能当结论，调用方要在文案里说明。
+    """
+    match = _JSON_BLOCK.search(_FENCE.sub("", text or ""))
+    if not match:
+        return ""
+    try:
+        payload = json.loads(match.group(0))
+    except Exception:  # noqa: BLE001
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    value = str(payload.get("watermark") or "").strip().strip("\"'“”").strip()
+    if not value:
+        return ""
+    lowered = value.lower()
+    if len(value) <= 8 and any(lowered.startswith(word) for word in _WATERMARK_EMPTY):
+        return ""
+    return value[:40]
+
+
+def handle_from_watermark(text: str) -> str:
+    """从水印文本里取 X 账号，取不到返回空串。
+
+    只认两种：明写的 ``@xxx``，或者整串就是一个裸账号。中文名、夹杂描述的一律
+    不猜——按拼音或近似拼写去试探，等于给错人。
+    """
+    value = str(text or "").strip()
+    if not value:
+        return ""
+    match = _WATERMARK_HANDLE.search(value)
+    if match:
+        return match.group(1)
+    bare = value.strip().strip("@").strip()
+    if not _WATERMARK_BARE.fullmatch(bare):
+        return ""
+    if bare.isdigit() or bare.lower() in _WATERMARK_PLATFORMS:
+        return ""
+    return bare
