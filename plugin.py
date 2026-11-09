@@ -1621,7 +1621,14 @@ class ImageSearcherPlugin(MaiBotPlugin):
                             vision_info["watermark_url"] = f"https://x.com/{handle}"
                         elif profile.state == fxtwitter.PROFILE_SUSPENDED:
                             suffix = f"（用户 ID {profile.user_id}）" if profile.user_id else ""
-                            vision_info["watermark_note"] = f"X 接口读不到这个号{suffix}，主页能不能打开要自己点一下"
+                            if profile.confirmed:
+                                vision_info["watermark_note"] = (
+                                    f"该账号已被 X 封禁{suffix}，主页已经打不开了"
+                                )
+                            else:
+                                vision_info["watermark_note"] = (
+                                    f"X 接口读不到这个号{suffix}，主页能不能打开要自己点一下"
+                                )
                         self._vlog(
                             "水印账号核对：@%s 状态=%s id=%s",
                             handle,
@@ -2289,10 +2296,17 @@ class ImageSearcherPlugin(MaiBotPlugin):
                     info["reason"] = info["error"]
                 elif profile.state == fxtwitter.PROFILE_SUSPENDED:
                     suffix = f"（用户 ID {profile.user_id}）" if profile.user_id else ""
-                    info["reason"] = (
-                        f"{info.get('reason') or ''}｜注意：X 接口读不到 @{result.handle}{suffix}，"
-                        "可能是受限账号，主页要自己点开确认"
-                    ).lstrip("｜")
+                    if profile.confirmed:
+                        # 主页 HTML 里真的吐出「Account suspended」才算封号。
+                        info["tier"] = "none"
+                        info["handle"] = ""
+                        info["error"] = f"@{result.handle} 已被 X 封禁{suffix}，看不到内容，已丢弃"
+                        info["reason"] = info["error"]
+                    else:
+                        info["reason"] = (
+                            f"{info.get('reason') or ''}｜注意：X 接口读不到 @{result.handle}{suffix}，"
+                            "可能是受限账号，主页要自己点开确认"
+                        ).lstrip("｜")
 
             if info["tier"] == "post" and info["post_url"]:
                 # 帖子里到底有没有这张图，不能只看模型给的链接：拉回来比指纹。
@@ -2580,9 +2594,52 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 session.close()
 
         try:
-            return await asyncio.wait_for(asyncio.to_thread(fetch), timeout=20)
+            profile = await asyncio.wait_for(asyncio.to_thread(fetch), timeout=20)
         except Exception:  # noqa: BLE001 - 查不了就当没查成，不影响已经拿到的结论
             return fxtwitter.Profile()
+        if profile.state == fxtwitter.PROFILE_SUSPENDED:
+            # fxtwitter 一句 suspended 不够硬：受限账号也可能这样回。再抓一次
+            # 网页主页，服务端真的吐出「Account suspended」才敢说是封号。
+            profile.confirmed = bool(await self._homepage_suspended(handle))
+            self._vlog("账号封禁复核：@%s 主页确认=%s", handle, profile.confirmed)
+        return profile
+
+    async def _homepage_suspended(self, handle: str) -> bool | None:
+        """抓 x.com/<号> 的 HTML，看服务端有没有下发「Account suspended」。
+
+        返回 None 表示没查成（网络问题、被墙、页面结构变了），调用方不能把它
+        当成「没封」。实测封号号返回 44KB 且带 ``Account suspended`` 与
+        ``UserUnavailable``/``unavailable_reason: Suspended``；正常号 162KB，
+        带的是简介 meta。
+        """
+        user = (handle or "").strip().lstrip("@")
+        if not user:
+            return None
+
+        def fetch() -> bool | None:
+            session = make_session(self.config.plugin.proxy)
+            try:
+                response = session.get(
+                    f"https://x.com/{user}",
+                    timeout=15,
+                    headers={
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/131.0 Safari/537.36"
+                        )
+                    },
+                )
+                if response.status_code != 200:
+                    return None
+                return "account suspended" in response.text.lower()
+            finally:
+                session.close()
+
+        try:
+            return await asyncio.wait_for(asyncio.to_thread(fetch), timeout=20)
+        except Exception:  # noqa: BLE001 - 查不了就老实说没查成
+            return None
 
     async def _check_best_account(
         self, best: Candidate | None, vision_info: dict[str, Any] | None
@@ -2604,11 +2661,18 @@ class ImageSearcherPlugin(MaiBotPlugin):
             return best
         profile = await self._account_profile(handle)
         if profile.state == fxtwitter.PROFILE_SUSPENDED:
-            # 只能写「读不到」：fxtwitter 对受限账号也回 suspended，网页主页
-            # 有时照样能打开（@Babybaobaoya 就是这种情况），说成「封禁」会误导。
             suffix = f"（用户 ID {profile.user_id}）" if profile.user_id else ""
-            best.account_note = f"⚠️ X 接口读不到这个号{suffix}，可能受限或已封，主页要自己点开确认。"
-            self._vlog("结论账号读不到：@%s id=%s", handle, profile.user_id or "-")
+            if profile.confirmed:
+                best.account_note = f"⚠️ 该账号已被 X 封禁{suffix}，主页已经打不开了。"
+            else:
+                # 没确认到主页文案就只能说「读不到」：受限账号也会回 suspended。
+                best.account_note = f"⚠️ X 接口读不到这个号{suffix}，可能受限或已封，主页要自己点开确认。"
+            self._vlog(
+                "结论账号状态：@%s id=%s 封禁确认=%s",
+                handle,
+                profile.user_id or "-",
+                profile.confirmed,
+            )
         return best
 
     # 翻账号自己的带图帖子时最多看这么多条。这个接口一次只给最近十几条，

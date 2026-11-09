@@ -345,6 +345,8 @@ class ProfileStateTest(unittest.TestCase):
         profile = fxtwitter.parse_profile_info(payload)
         self.assertEqual(profile.state, fxtwitter.PROFILE_SUSPENDED)
         self.assertEqual(profile.user_id, "1659556344330874880")
+        # 接口一句话不算数，要主页 HTML 复核过才置 True。
+        self.assertFalse(profile.confirmed)
 
     def test_ok_keeps_user_id_and_name(self) -> None:
         payload = {

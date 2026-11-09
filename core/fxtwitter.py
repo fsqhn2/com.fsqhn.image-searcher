@@ -188,12 +188,17 @@ def parse_profile(payload: dict | None) -> str:
 
 @dataclass
 class Profile:
-    """账号核实结果。``user_id`` 是数字 ID，改名、封号都不会变。"""
+    """账号核实结果。``user_id`` 是数字 ID，改名、封号都不会变。
+
+    ``confirmed`` 只对 suspended 有意义：接口说被封之后，再抓一次网页主页，
+    真的看到 ``Account suspended`` 才算数——单凭 fxtwitter 一句话会误伤受限账号。
+    """
 
     state: str = PROFILE_UNKNOWN
     user_id: str = ""
     handle: str = ""
     name: str = ""
+    confirmed: bool = False
 
 
 def parse_profile_info(payload: dict | None) -> Profile:
