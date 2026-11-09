@@ -214,6 +214,32 @@ class RepliesSearchTest(unittest.TestCase):
         self.assertEqual(fxtwitter.build_replies_query(""), "")
         self.assertEqual(fxtwitter.build_replies_query("a/b"), "")
 
+    def test_build_reposts_query(self) -> None:
+        """转发页靠 filter:retweets 搜，返回的是被转的原帖。"""
+        self.assertEqual(fxtwitter.build_reposts_query("@wn40536699"), "from:wn40536699 filter:retweets")
+        self.assertEqual(fxtwitter.build_reposts_query(""), "")
+
+    def test_parse_keeps_author_for_retweets(self) -> None:
+        """搜转发时 author 是原作者，结论要用的就是这个名字。"""
+        payload = {
+            "results": [
+                {
+                    "type": "status",
+                    "id": "2075962158274445404",
+                    "url": "https://x.com/hinatahimarii/status/2075962158274445404",
+                    "author": {"screen_name": "hinatahimarii", "name": "土狗小黄"},
+                    "reposted_by": {"screen_name": "wn40536699"},
+                    "media": {"all": [{"type": "photo", "url": "https://pbs.twimg.com/media/HWb8qgsasAA9bUk.jpg"}]},
+                }
+            ]
+        }
+        hits, _ = fxtwitter.parse_search(payload)
+        self.assertEqual(hits[0].author_handle, "hinatahimarii")
+        self.assertEqual(hits[0].author_name, "土狗小黄")
+        # 有配图时帖子地址不能被写成图片直链，结论要贴的是帖子。
+        self.assertEqual(hits[0].url, "https://x.com/hinatahimarii/status/2075962158274445404")
+        self.assertEqual(hits[0].media, ["https://pbs.twimg.com/media/HWb8qgsasAA9bUk.jpg"])
+
     def test_build_search_url_with_cursor(self) -> None:
         url = fxtwitter.build_search_url("from:a filter:replies")
         self.assertTrue(url.startswith("https://api.fxtwitter.com/2/search?q=from%3Aa+filter%3Areplies"))

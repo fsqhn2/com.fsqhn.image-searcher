@@ -1555,9 +1555,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
             candidates = [item for name in names for item in grouped.get(name, [])]
         else:
             await self._verify(candidates, grouped, names, target_hash)
-            # X 的回复页会把「她回复的人的帖子」一起列出来：指纹对上了也只是
-            # 说明这张图在这一页出现过。顺着她的回复回到父帖，能确定就换成原帖。
-            reply_hint = await self._resolve_x_reply_page(candidates, stream_id)
+            # X 的回复页/转发页会把「她回复的、她转的」帖子一起列出来：指纹对上了
+            # 也只是说明这张图在这一页出现过。顺回去找到原帖，能确定就换掉。
+            reply_hint = await self._resolve_x_list_page(candidates, stream_id)
 
         ordered = self._rank(candidates, names, prefer_pixiv=sauce is not None)
         # 同一个账号常被 Lens、Yandex、百度一起撞见：只留质量最好的那条，
@@ -2684,13 +2684,69 @@ class ImageSearcherPlugin(MaiBotPlugin):
         self._vlog("回复页反查：@%s 查了 %s 个父帖，没有这张图", handle, checked)
         return None, "miss"
 
-    async def _resolve_x_reply_page(self, candidates: list[Candidate], stream_id: str = "") -> str:
-        """把「X 回复页」上对得上的图，倒推回它真正的那条原帖。
+    async def _retweet_lookup(self, handle: str, key: str) -> tuple[dict[str, Any] | None, str]:
+        """转发页：搜这个号的转发，结果本身就是她转的那条原帖，直接比媒体键。
 
-        回复页上出现的图是「她回复的那条帖子」的，发布者是别人——实测
-        s-20261109-2118-5137：图在 @wn40536699 的回复页里，指纹距离 0，实际
-        是 @hinatahimarii 发的。只在指纹已经对上（距离 ≤ 阈值）时反查，翻不到
-        就保持疑似；认错人比没找到更糟。
+        比回复页省一层：不用再逐条回查父帖，搜索结果里的 ``author`` 就是原作者。
+        代价是 X 对「转发搜索」的覆盖很浅（实测一个号只回两三条），翻不到就交给
+        Grok。
+        """
+        query = fxtwitter.build_reposts_query(handle)
+        if not query or not key:
+            return None, "empty"
+        state: dict[str, Any] = {"throttled": False}
+        deadline = time.monotonic() + self._REPLY_SCAN_BUDGET
+        cursor = ""
+        seen = 0
+        for _ in range(self._REPLY_SCAN_PAGES):
+            if time.monotonic() > deadline or state["throttled"]:
+                break
+            page = await asyncio.to_thread(self._search_page, query, cursor, state)
+            if not page:
+                break
+            hits, cursor = page
+            if not hits:
+                break
+            for hit in hits:
+                seen += 1
+                if not any(fxtwitter.media_key(link) == key for link in hit.media):
+                    continue
+                self._vlog(
+                    "转发页反查：@%s 搜了 %s 条转发，命中 %s（@%s）",
+                    handle,
+                    seen,
+                    hit.url,
+                    hit.author_handle or "未知",
+                )
+                return {
+                    "url": hit.url,
+                    "handle": hit.author_handle,
+                    "name": hit.author_name,
+                    "created_at": hit.created_at,
+                }, "hit"
+            if not cursor:
+                break
+            await asyncio.sleep(self._REPLY_SCAN_GAP)
+        if state["throttled"]:
+            self._vlog("转发页反查：@%s 被限流，搜了 %s 条就收手", handle, seen)
+            return None, "throttled"
+        if time.monotonic() > deadline:
+            self._vlog("转发页反查：@%s 到预算上限，搜了 %s 条", handle, seen)
+            return None, "timeout"
+        self._vlog("转发页反查：@%s 搜了 %s 条转发，没有这张图", handle, seen)
+        return None, "empty" if not seen else "miss"
+
+    async def _resolve_x_list_page(self, candidates: list[Candidate], stream_id: str = "") -> str:
+        """把「X 回复页 / 转发页」上对得上的图，倒推回它真正的那条原帖。
+
+        这两种页面上的图都是别人的：回复页里是她回复的那条帖子，转发页里是她转的
+        那条帖子——实测 s-20261109-2118-5137：图在 @wn40536699 的回复页里，指纹
+        距离 0，实际是 @hinatahimarii 发的。只在指纹已经对上（距离 ≤ 阈值）时
+        反查，翻不到就保持疑似；认错人比没找到更糟。
+
+        回复页走 `_reply_page_lookup`（翻回复 → 父帖），转发页走 `_retweet_lookup`
+        （搜 `filter:retweets`，结果本身就是原帖）。点赞页没有对应的搜索语法，
+        只能保持疑似。
 
         返回一句「已经翻过但没搞定」的说明（成功时返回空串）。调用方把它交给
         Grok：翻不到多半是接口不给力，不是这张图没有出处，得让它换个路子查。
@@ -2702,7 +2758,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
             if item.status == "suspect"
             and item.distance is not None
             and item.distance <= threshold
-            and x_page_kind(item.url or "") == "with_replies"
+            and x_page_kind(item.url or "") in {"with_replies", "reposts"}
         ]
         if not pending:
             return ""
@@ -2712,7 +2768,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 await self.ctx.send.text(formatting.TRACE_PING_TEXT, stream_id)
             except Exception as error:  # noqa: BLE001 - 提示发不出去不影响反查
                 self._vlog("顺藤摸瓜提示发送失败：%s", str(error)[:80])
-        self._vlog("回复页反查开始：候选=%s 提示=%s", len(pending), formatting.TRACE_PING_TEXT)
+        self._vlog("列表页反查开始：候选=%s 提示=%s", len(pending), formatting.TRACE_PING_TEXT)
         failed: list[str] = []
         attempts = 0
         for item in pending:
@@ -2722,12 +2778,16 @@ class ImageSearcherPlugin(MaiBotPlugin):
             key = fxtwitter.media_key(item.image_url or "")
             if not handle or not key:
                 continue
+            kind = x_page_kind(item.url or "")
             attempts += 1
-            found, reason = await self._reply_page_lookup(handle, key)
+            if kind == "reposts":
+                found, reason = await self._retweet_lookup(handle, key)
+            else:
+                found, reason = await self._reply_page_lookup(handle, key)
             if not found:
                 why = {
                     "throttled": "被接口限流、没翻完",
-                    "empty": "一条回复都没翻到",
+                    "empty": "一条回复都没翻到" if kind == "with_replies" else "一条转发都没搜到",
                     "timeout": "到时间上限、没翻完",
                     "miss": "翻完了没命中",
                 }.get(reason, "没翻到")
@@ -2742,11 +2802,17 @@ class ImageSearcherPlugin(MaiBotPlugin):
             item.platform = "X (Twitter)"
             item.source = "X"
             item.status = "match"
-            item.note = (
-                f"指纹一致（距离 {item.distance}）：这是 @{handle} 的回复页，"
-                f"顺着她的回复找到原帖在 {who} 名下"
-            )
-            self._vlog("回复页换成原帖：@%s → %s（距离 %s）", handle, item.url, item.distance)
+            if kind == "reposts":
+                item.note = (
+                    f"指纹一致（距离 {item.distance}）：这是 @{handle} 的转发页，"
+                    f"她转的是 {who} 的这条帖子"
+                )
+            else:
+                item.note = (
+                    f"指纹一致（距离 {item.distance}）：这是 @{handle} 的回复页，"
+                    f"顺着她的回复找到原帖在 {who} 名下"
+                )
+            self._vlog("列表页换成原帖：@%s（%s）→ %s（距离 %s）", handle, kind, item.url, item.distance)
             return ""
         return "、".join(failed)
 

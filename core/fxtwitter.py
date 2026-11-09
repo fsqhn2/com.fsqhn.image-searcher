@@ -209,6 +209,10 @@ class SearchHit:
     media: list[str] = field(default_factory=list)
     # 这条本身是回复时，被回复那条帖子的 ID；不是回复就是空串。
     parent_id: str = ""
+    # 作者。搜「转发」时搜索结果直接是被转的那条原帖，作者就是原作者，
+    # 不是转发的人——这正是要拿去当结论的那个名字。
+    author_handle: str = ""
+    author_name: str = ""
 
 
 def media_key(url: str = "") -> str:
@@ -247,6 +251,19 @@ def build_replies_query(handle: str) -> str:
     return f"from:{user} filter:replies"
 
 
+def build_reposts_query(handle: str) -> str:
+    """某账号转发的查询式；号名不合法时返回空串。
+
+    ``/2/profile/<号>/reposts`` 是 404（转发列表没有公开接口），但 X 搜索认得
+    ``filter:retweets``，返回的是**被转的那条原帖**（带 ``reposted_by``），
+    作者字段就是原作者——正好能拿来核对转发页上的图是谁发的。
+    """
+    user = (handle or "").strip().lstrip("@")
+    if not user or not _HANDLE.match(user):
+        return ""
+    return f"from:{user} filter:retweets"
+
+
 def parse_search(payload: dict | None) -> tuple[list[SearchHit], str]:
     """把搜索返回拆成（结果列表，下一页游标）。
 
@@ -272,13 +289,15 @@ def parse_search(payload: dict | None) -> tuple[list[SearchHit], str]:
             for entry in media.get("all") or []:
                 if not isinstance(entry, dict):
                     continue
-                link = str(entry.get("url") or "").strip()
-                if link.startswith("http") and link not in urls:
-                    urls.append(link)
+                # 名字不能叫 link：上面那条帖子地址用的是它，复用会把 url 写成图片直链。
+                media_url = str(entry.get("url") or "").strip()
+                if media_url.startswith("http") and media_url not in urls:
+                    urls.append(media_url)
         replying = item.get("replying_to")
         parent_id = ""
         if isinstance(replying, dict):
             parent_id = str(replying.get("status") or "").strip()
+        author = item.get("author") if isinstance(item.get("author"), dict) else {}
         hits.append(
             SearchHit(
                 tweet_id=tweet_id,
@@ -287,6 +306,8 @@ def parse_search(payload: dict | None) -> tuple[list[SearchHit], str]:
                 created_at=str(item.get("created_at") or ""),
                 media=urls,
                 parent_id=parent_id,
+                author_handle=str(author.get("screen_name") or "").strip(),
+                author_name=str(author.get("name") or "").strip(),
             )
         )
     cursor = payload.get("cursor")
