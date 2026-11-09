@@ -43,7 +43,7 @@ core/maibot_compat.py  能力返回值解包
 
 **视觉超时要按「排队 + 推理」算**：`[vision] timeout` 默认 180 秒，不是 90。宿主的 LLM 并发会被记忆整理（`A_Memorix.*`）这类任务占满，一次视觉请求实测排了 78 秒才轮到选模型，90 秒会在模型刚被选中时放弃。失败路径必须打 warning（已记等待时长与模型名），否则只剩任务摘要里一行 error，查不出是排队还是模型慢。
 
-**Grok 兜底与视觉并行，分两档**：同一个触发条件、`[grok] enabled` 开着且有 `api_key` 时，两边一起发出去（`asyncio.gather`），各自超时。发给它的是原图 + 前 8 条候选（`账号｜平台｜标题`），`build_prompt()` 让它按三步走：先读图上的水印/签名/边角小字里有没有 ID，有就按这个 ID 去 X 核实发布者，核实不到或者本来没 ID 才走图搜图、逐个比对候选（`core/grok.py` 的 `build_hints()`，日志里有 `候选=`）。判据只看返回链接：带 `status/<id>` 算「找到」，只有账号主页算「线索」。只给账号时会用 fxtwitter 的 `/2/profile/<号>` 确认账号状态（`_account_state()`）：`missing`（查无此号）和 `suspended`（已被 X 封禁）都整条丢掉，文案分开写——被封说明人真存在、只是内容看不到；`unknown`（没查成）保留原样，不能当「不存在」。**候选要按社交平台优先喂**（`grok.social_first()`）：Reddit、Instagram、抖音这类页面上的用户名才是通向作者本人的线索，按原顺序排时前 8 条常被画师站插画占满，Grok 根本看不到 `u/Smeepsi` 这个名字。**模型要配备用链**（`grok.model_chain()`）：主模型超时、连不上或回 5xx 就隔 2 秒换下一个（默认 4.7 → 4.6），两个都试完再用短超时补一次主模型；401/403 直接放弃，换模型没用。中转站实测会轮流挂 4.7 和 4.6，只在一个模型上重试经常白等。错误文案统一成「中转站 N 秒内没响应」，别把 requests 的堆栈直接发给群友。它跑过但空手时，结果里要有一句「Grok 也拿这张图去 X 搜过，没撞见原帖」，否则「没触发」和「触发了没结果」看起来一模一样。
+**Grok 兜底与视觉并行，分两档**：同一个触发条件、`[grok] enabled` 开着且有 `api_key` 时，两边一起发出去（`asyncio.gather`），各自超时。发给它的是原图 + 前 8 条候选（`账号｜平台｜标题`），`build_prompt()` 让它按三步走：先读图上的水印/签名/边角小字里有没有 ID，有就按这个 ID 去 X 核实发布者，核实不到或者本来没 ID 才走图搜图、逐个比对候选（`core/grok.py` 的 `build_hints()`，日志里有 `候选=`）。判据只看返回链接：带 `status/<id>` 算「找到」，只有账号主页算「线索」。只给账号时会用 fxtwitter 的 `/2/profile/<号>` 确认账号状态（`_account_profile()`）：`missing`（查无此号）整条丢掉；`suspended` 只代表第三方读不到（受限也会这样，不等于封号），线索保留，把「X 接口读不到、主页要自己点」和数字 ID 写进依据里；`unknown`（没查成）保留原样，不能当「不存在」。**候选要按社交平台优先喂**（`grok.social_first()`）：Reddit、Instagram、抖音这类页面上的用户名才是通向作者本人的线索，按原顺序排时前 8 条常被画师站插画占满，Grok 根本看不到 `u/Smeepsi` 这个名字。**模型要配备用链**（`grok.model_chain()`）：主模型超时、连不上或回 5xx 就隔 2 秒换下一个（默认 4.7 → 4.6），两个都试完再用短超时补一次主模型；401/403 直接放弃，换模型没用。中转站实测会轮流挂 4.7 和 4.6，只在一个模型上重试经常白等。错误文案统一成「中转站 N 秒内没响应」，别把 requests 的堆栈直接发给群友。它跑过但空手时，结果里要有一句「Grok 也拿这张图去 X 搜过，没撞见原帖」，否则「没触发」和「触发了没结果」看起来一模一样。
 
 **视觉命中还要过闸门**：判定集中在 `core/vision.py` 的 `verdict_of()`，检查顺序有意义，别调换——先 `VERDICT_COMMERCE`（候选落在速卖通 / 阿里 / 淘宝 / 1688 / Amazon / eBay 这类电商站，只是同款衣服），再 `VERDICT_REPOST`（`reposts` / `likes` / `with_replies` 这类列表页，图是别人发的），再 `VERDICT_UNTRACEABLE`（整条不可追踪：不是社交平台、也没有账号），最后 `VERDICT_NO_ACCOUNT`（落在抖音、小红书这类平台页面上，却解析不出发布者，点进去也确认不了是谁发的）。只有 `VERDICT_VISION` 能当结论，后三档一律降级成 `suspect` 只进参考区，日志记 `降级=N`，说明文案在 `DOWNGRADE_NOTES`。视觉命中发出去时，结论必须带免责声明，文案在 `core/formatting.py` 的 `_best_block()`。降级文案要**点名是哪个站**（`DOWNGRADE_NOTES` 里的 `{platform}`）：「那是 soundcloud.com 上的页面、不是作者主页」比「找不到可核对的账号」有用得多。结论里还要把模型给的理由原样列一句（`_vision_reason()`，截 80 字）——它常按「黑蕾丝、白短袜、室内」判成同一个人，理由里甚至会把发色写错，亮出来用户一眼就能看出这轮靠不靠谱。
 
@@ -157,7 +157,7 @@ core/maibot_compat.py  能力返回值解包
 12. **展示按引擎分组，配图分两档**：首次回复每个引擎只贴最接近那张，回「更多」时每个候选都贴图，图压到 60KB 左右。`outcome.images` 只在内存、不落盘。
 13. **vlm 组里的模型都能读图，但推理型的会截断正文**：`dots3-note-prev` 把 600 输出额度全花在 reasoning 上、`content` 为空。所以 `[vision] model` 默认留空、按任务组顺序挑；真想点名就填 `Qwen/Qwen3-VL-32B-Instruct`。测多模态一定要用真实尺寸的图。
 14. **视觉调用要传 `task_name`**：`model` 传任务名会被当成具体模型名。正确写法 `ctx.call_capability("llm.generate", prompt=..., task_name="vlm", ...)`，图片走 Data URL。
-15. **Grok 读水印会读错，读到的只能当线索**：实测把 `@ste11ar021` 认成 `@butter021`，所以它读出来的 ID 用 `watermark_of()` 单独存着，只进日志（`Grok 图上读到 ID：…`）和结果标注（`_watermark_line()`：一致时说「图上印的 ID 就是这个号」，不一致时说「与上面的结论不同，已按核实结果为准」），绝不参与判定。判定只认返回链接，账号存在性靠 `_account_state()` 兜（`/2/profile/<号>`，能区分查无此号与被封）。
+15. **Grok 读水印会读错，读到的只能当线索**：实测把 `@ste11ar021` 认成 `@butter021`，所以它读出来的 ID 用 `watermark_of()` 单独存着，只进日志（`Grok 图上读到 ID：…`）和结果标注（`_watermark_line()`：一致时说「图上印的 ID 就是这个号」，不一致时说「与上面的结论不同，已按核实结果为准」），绝不参与判定。判定只认返回链接，账号存在性靠 `_account_profile()` 兜（`/2/profile/<号>`，能区分查无此号，读不到时写数字 ID）。
 16. **Grok 只能走 `/v1/responses` + `tools:[{"type":"x_search"}]`**：`chat/completions` 带 `search_parameters` 会被打回 410；图片只认 data URL。一次完整检索约 48 秒，服务端抖动时超时不能省。
 17. **拼图要逐张解码**：`vision.build_grid` 是解码→缩放→贴画布→丢引用，`MAX_SOURCE_PIXELS` 是兜底，别去掉。
 18. **缓存别存「没找到」**：实测同一张图 12 小时后就能搜到，存下来反而挡住后来的原帖。
@@ -176,7 +176,7 @@ core/maibot_compat.py  能力返回值解包
 31. **视觉的理由可能取自别的格子**：同一单里它说「发尾蓝白渐变」，挑中的却是粉发那张——拼图里不同格的特征被串了。所以理由要原样发给用户（`_vision_reason()`），它自己就是最好的可信度提示。
 32. **转发地址的 `author` 是原作者，转发者另存 `reposted_by`**：`x.com/redwine278/status/1994540292142501924` 看着像 @redwine278 发的，fxtwitter 返回的却是 `handle=sssmnms`、`name=哎我黑切訥`、`url` 指向 sssmnms 那条，转发者在 `reposted_by=redwine278`。别拿 URL 里的号当作者，也别因为 URL 和 `url` 不一致就当解析出错——那正是转发的标志。
 33. **视觉顺带读的水印只能当线索**：同一张拼图里让模型抄 `TARGET` 格上的水印／签名／角落小字（`vision.watermark_of()`），别让它抄候选格的——那是网站或上传者加的，微博那条的 `@颜撩` 就只说明文件是她的号传的，认不出照片里的人。模型读小号白字会错（`@ste11ar021` 读成 `@butter021`），所以文案固定带「视觉模型识别，可能读错」，`handle_from_watermark()` 也只认明写的 `@xxx` 或整串裸账号，中文名一律不猜。
-34. **盗图站点明、封号写 ID**：`jxporn` / `lanrenbl` / `4khd` 这类付费资源站标题里的 `@账号` 是站方抄来做标签的，不是作者主页，结论里要单写一行点明（`formatting.leak_site_of()`，清单只放实测见过的站）。账号被 X 封禁时 handle 会被释放甚至被抢注，数字 ID 才是唯一还能对上人的（`x.com/i/user/<id>`），所以 `_check_best_account()` 要把封前的 ID 写进 `Candidate.account_note`，单独占一行——塞进 `note` 会渲染成「匹配：…」，看着像判定依据。纯数字 handle 多半是微博 UID / B 站 UID，别去 X 上白查。
+34. **盗图站点明、读不到的号写 ID 但别断言封号**：`jxporn` / `lanrenbl` / `4khd` 这类付费资源站标题里的 `@账号` 是站方抄来做标签的，不是作者主页，结论里要单写一行点明（`formatting.leak_site_of()`，清单只放实测见过的站）。账号核实返回 `suspended` **不等于封号**：实测 `@Babybaobaoya` 接口回 suspended，网页主页却能正常打开——fxtwitter 对受限账号也回这句。所以文案写「X 接口读不到这个号（用户 ID …），可能受限或已封，主页要自己点开确认」，数字 ID 记在 `Candidate.account_note` 单独占一行（塞进 `note` 会渲染成「匹配：…」）。纯数字 handle 多半是微博 UID / B 站 UID，别去 X 上白查。
 
 ## 排障顺序
 

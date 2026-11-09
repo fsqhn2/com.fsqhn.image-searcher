@@ -218,6 +218,10 @@ def parse_profile_info(payload: dict | None) -> Profile:
     reason = str(payload.get("reason") or "").lower()
     message = str(payload.get("message") or "").lower()
     if "suspend" in reason or "suspend" in message:
+        # 注意：fxtwitter 拿不到数据时也会回这句，不能当成「真的被封」。实测
+        # @Babybaobaoya 返回 suspended，但网页主页能正常打开（0 关注 0 关注者，
+        # 简介是引流话术）。这类号多半是被 X 限制，不是封号，所以状态只代表
+        # 「第三方读不到」，文案不能替用户下结论。
         return Profile(state=PROFILE_SUSPENDED, user_id=user_id)
     if code == 404:
         return Profile(state=PROFILE_MISSING, user_id=user_id)

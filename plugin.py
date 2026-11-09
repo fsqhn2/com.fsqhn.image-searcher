@@ -1621,7 +1621,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
                             vision_info["watermark_url"] = f"https://x.com/{handle}"
                         elif profile.state == fxtwitter.PROFILE_SUSPENDED:
                             suffix = f"（用户 ID {profile.user_id}）" if profile.user_id else ""
-                            vision_info["watermark_note"] = f"该账号已被 X 封禁{suffix}"
+                            vision_info["watermark_note"] = f"X 接口读不到这个号{suffix}，主页能不能打开要自己点一下"
                         self._vlog(
                             "水印账号核对：@%s 状态=%s id=%s",
                             handle,
@@ -2281,15 +2281,18 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 # 也不要把模型编出来的名字当成线索发出去。被封的号单独说明：
                 # 人是真的，只是内容已经看不到。
                 profile = await self._account_profile(result.handle)
-                if profile.state in {fxtwitter.PROFILE_MISSING, fxtwitter.PROFILE_SUSPENDED}:
+                if profile.state == fxtwitter.PROFILE_MISSING:
+                    # 明确查无此号才丢；suspended 只代表第三方读不到，号可能还在。
                     info["tier"] = "none"
                     info["handle"] = ""
-                    if profile.state == fxtwitter.PROFILE_SUSPENDED:
-                        suffix = f"（用户 ID {profile.user_id}）" if profile.user_id else ""
-                        info["error"] = f"@{result.handle} 已被 X 封禁{suffix}，看不到内容，已丢弃"
-                    else:
-                        info["error"] = f"@{result.handle} 在 X 上查不到，已丢弃"
+                    info["error"] = f"@{result.handle} 在 X 上查不到，已丢弃"
                     info["reason"] = info["error"]
+                elif profile.state == fxtwitter.PROFILE_SUSPENDED:
+                    suffix = f"（用户 ID {profile.user_id}）" if profile.user_id else ""
+                    info["reason"] = (
+                        f"{info.get('reason') or ''}｜注意：X 接口读不到 @{result.handle}{suffix}，"
+                        "可能是受限账号，主页要自己点开确认"
+                    ).lstrip("｜")
 
             if info["tier"] == "post" and info["post_url"]:
                 # 帖子里到底有没有这张图，不能只看模型给的链接：拉回来比指纹。
@@ -2601,9 +2604,11 @@ class ImageSearcherPlugin(MaiBotPlugin):
             return best
         profile = await self._account_profile(handle)
         if profile.state == fxtwitter.PROFILE_SUSPENDED:
+            # 只能写「读不到」：fxtwitter 对受限账号也回 suspended，网页主页
+            # 有时照样能打开（@Babybaobaoya 就是这种情况），说成「封禁」会误导。
             suffix = f"（用户 ID {profile.user_id}）" if profile.user_id else ""
-            best.account_note = f"⚠️ 该账号已被 X 封禁{suffix}，主页已经打不开了。"
-            self._vlog("结论账号被封：@%s id=%s", handle, profile.user_id or "-")
+            best.account_note = f"⚠️ X 接口读不到这个号{suffix}，可能受限或已封，主页要自己点开确认。"
+            self._vlog("结论账号读不到：@%s id=%s", handle, profile.user_id or "-")
         return best
 
     # 翻账号自己的带图帖子时最多看这么多条。这个接口一次只给最近十几条，

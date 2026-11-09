@@ -340,11 +340,11 @@ class ProfileStateTest(unittest.TestCase):
             "code": 404,
             "message": "User is suspended",
             "reason": "suspended",
-            "id": "1659881252342861824",
+            "id": "1659556344330874880",
         }
         profile = fxtwitter.parse_profile_info(payload)
         self.assertEqual(profile.state, fxtwitter.PROFILE_SUSPENDED)
-        self.assertEqual(profile.user_id, "1659881252342861824")
+        self.assertEqual(profile.user_id, "1659556344330874880")
 
     def test_ok_keeps_user_id_and_name(self) -> None:
         payload = {

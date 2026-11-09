@@ -198,11 +198,14 @@ class WatermarkTest(unittest.TestCase):
         self.assertIn("图上水印：微博@某某", text)
         self.assertNotIn("可点开核对", text)
 
-    def test_watermark_line_marks_suspended(self):
+    def test_watermark_line_marks_unreadable(self):
         outcome = SearchOutcome()
-        outcome.vision = {"watermark": "@Babybaobaoya", "watermark_note": "该账号已被 X 封禁"}
+        outcome.vision = {
+            "watermark": "@Babybaobaoya",
+            "watermark_note": "X 接口读不到这个号（用户 ID 1659556344330874880）",
+        }
         text = formatting._best_block(outcome)
-        self.assertIn("已被 X 封禁", text)
+        self.assertIn("读不到这个号", text)
         self.assertNotIn("可点开核对", text)
 
     def test_no_watermark_no_line(self):
@@ -254,9 +257,9 @@ class LeakSiteTest(unittest.TestCase):
 
 
 class AccountNoteTest(unittest.TestCase):
-    """结论账号被封时要把封前的数字 ID 一起写出来。"""
+    """结论账号读不到时要把接口状态和数字 ID 一起写出来，但别断言「封号」。"""
 
-    def test_suspended_note_shown(self):
+    def test_unreadable_note_shown(self):
         best = Candidate(
             engine="lens",
             url="https://www.jxporn.net/351632.html",
@@ -265,18 +268,20 @@ class AccountNoteTest(unittest.TestCase):
             name="崽崽",
             status="vision",
         )
-        best.account_note = "⚠️ 该账号已被 X 封禁（用户 ID 1659881252342861824），主页已经打不开了。"
+        best.account_note = (
+            "⚠️ X 接口读不到这个号（用户 ID 1659556344330874880），可能受限或已封，主页要自己点开确认。"
+        )
         outcome = SearchOutcome(status="ok", best=best, candidates=[best])
         text = formatting._best_block(outcome)
-        self.assertIn("已被 X 封禁", text)
-        self.assertIn("1659881252342861824", text)
+        self.assertIn("读不到这个号", text)
+        self.assertIn("1659556344330874880", text)
         # 单独占一行，别混进「匹配：」里当判定依据。
         self.assertNotIn("匹配：⚠️", text)
 
     def test_no_note_no_line(self):
         best = Candidate(engine="x", url="https://x.com/a/status/1", platform="X (Twitter)", handle="@a")
         outcome = SearchOutcome(status="ok", best=best, candidates=[best])
-        self.assertNotIn("封禁", formatting._best_block(outcome))
+        self.assertNotIn("读不到这个号", formatting._best_block(outcome))
 
 
 class VisionDisplayTest(unittest.TestCase):
