@@ -1612,14 +1612,15 @@ class ImageSearcherPlugin(MaiBotPlugin):
                             vision_info.get("watermark") or "-",
                         )
                 # 视觉顺带读到的水印只当线索：模型读小字常出错，确认到账号就
-                # 给个主页让用户自己点开核对，确认不了就只写原文。
+                # 翻它自己的带图帖核实——读对一个真实存在的号、却根本不是作者
+                # 的也见过（实测 @Miharu 是个 2010 年的无关老号）。
                 if vision_info and vision_info.get("watermark"):
                     handle = vision.handle_from_watermark(vision_info["watermark"])
                     if handle:
                         profile = await self._account_profile(handle)
                         vision_info["watermark_handle"] = handle
                         if profile.state == fxtwitter.PROFILE_OK:
-                            vision_info["watermark_url"] = f"https://x.com/{handle}"
+                            await self._check_watermark_post(handle, upload, vision_info)
                         elif profile.state == fxtwitter.PROFILE_SUSPENDED:
                             suffix = f"（用户 ID {profile.user_id}）" if profile.user_id else ""
                             if profile.confirmed:
@@ -1635,6 +1636,20 @@ class ImageSearcherPlugin(MaiBotPlugin):
                             handle,
                             profile.state,
                             profile.user_id or "-",
+                        )
+                    # Grok 读到另一个号时也核一下存不存在：两个都读错时，用户至少
+                    # 能看出「两个都不靠谱」，不会以为有一个是真的。
+                    other = str((grok_info or {}).get("watermark") or "").strip()
+                    other_handle = vision.handle_from_watermark(other)
+                    if other_handle and other_handle.lower() != handle.lower():
+                        other_profile = await self._account_profile(other_handle)
+                        vision_info["watermark_other"] = {
+                            "raw": other,
+                            "handle": other_handle,
+                            "state": other_profile.state,
+                        }
+                        self._vlog(
+                            "另一个水印核对：@%s 状态=%s", other_handle, other_profile.state
                         )
                 if vision_info and vision_info.get("picked"):
                     ordered = dedupe_accounts(self._rank(candidates, names))
@@ -1655,6 +1670,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
         # 引用帖不是原帖，转发的原帖也不属于转发者：指纹已经对上的 X 候选都换回
         # 原作者与那条帖子。只挑 match/suspect，mismatch 的图本来就不是这张。
         best = await self._follow_quotes(ordered, best)
+        # 图上水印核对到本人发过这张图时，这条就是结论：指纹对得上、又是本人
+        # 亲手发的帖，比「视觉说是同一个人」硬得多。
+        best = self._promote_watermark_hit(best, vision_info)
         # 结论里的账号核一下死活：被封的号 handle 会被释放，只剩数字 ID 能对上人。
         best = await self._check_best_account(best, vision_info)
 
@@ -2648,6 +2666,66 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 f"最近距离 {check['distance']}（阈值 {threshold}）。\n{link}"
             )
         return f"⚠️ 没法比对：{who} 这条帖子拉到了，但配图没取下来（{check.get('error') or '下载失败'}）。\n{link}"
+
+    def _promote_watermark_hit(
+        self, best: Candidate | None, vision_info: dict[str, Any] | None
+    ) -> Candidate | None:
+        """水印核对到本人发过这张图时，把它当成结论。
+
+        只在原本没有结论时才用：这条证据是「作者的带图帖里指纹对上」，比视觉
+        认人硬；但已经有 match 时不该被它顶掉。
+        """
+        if best is not None or not vision_info:
+            return best
+        post = str(vision_info.get("watermark_post") or "").strip()
+        handle = str(vision_info.get("watermark_handle") or "").strip()
+        if not post or not handle:
+            return best
+        account = "@" + handle.lstrip("@")
+        distance = int(vision_info.get("watermark_distance") or 0)
+        self._vlog("水印核对命中，升成结论：%s %s（距离 %s）", account, post, distance)
+        return Candidate(
+            engine="watermark",
+            url=post,
+            platform="X (Twitter)",
+            handle=account,
+            distance=distance,
+            status="match",
+            note=f"图上水印核对：{account} 自己的带图帖里有这张图（距离 {distance}）",
+        )
+
+    async def _check_watermark_post(
+        self, handle: str, upload: bytes | None, vision_info: dict[str, Any]
+    ) -> None:
+        """水印号存在还不够：翻它自己的带图帖，看有没有这张图。
+
+        模型读小字会出错，读到一个真实存在、却跟这张图毫无关系的号也见过（实测
+        ``X@Miharu`` 是个 2010 年的无关老号，点进去只会浪费时间）。所以存在的号
+        再核一道：最近十几条带图帖里有没有这张。命中就把帖子地址和距离写下来，
+        调用方会把它当成结论；没命中只写「最近没有」——老图翻不到很正常，不能
+        据此断言「不是她」。
+        """
+        if not upload:
+            vision_info["watermark_url"] = f"https://x.com/{handle}"
+            vision_info["watermark_note"] = "这个号存在，但没有原图，没法核对它发没发过"
+            return
+        vision_info["watermark_handle"] = handle
+        hit = await self._media_lookup(handle, upload)
+        if hit:
+            distance = int(hit.get("distance") or 0)
+            post = str(hit.get("url") or "")
+            vision_info["watermark_url"] = f"https://x.com/{handle}"
+            vision_info["watermark_post"] = post
+            vision_info["watermark_distance"] = distance
+            vision_info["watermark_note"] = (
+                f"自己的带图帖里有这张图，指纹距离 {distance}"
+            )
+            self._vlog("水印核对命中：@%s → %s（距离 %s）", handle, post, distance)
+            return
+        vision_info["watermark_note"] = (
+            f"@{handle} 这个号存在，但最近十几条带图帖里没有这张，可能是模型读错了"
+        )
+        self._vlog("水印核对没命中：@%s", handle)
 
     async def _account_profile(self, handle: str) -> fxtwitter.Profile:
         """查账号在 X 上的状态与数字 ID：ok / missing / suspended / unknown。

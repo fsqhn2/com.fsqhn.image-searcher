@@ -304,13 +304,21 @@ def _vision_watermark_line(outcome: SearchOutcome) -> str:
     vision = outcome.vision or {}
     grok = outcome.grok or {}
     text = str(vision.get("watermark") or "").strip()
+    if not text:
+        handle = str(vision.get("watermark_handle") or "").strip()
+        if handle:
+            text = f"X@{handle.lstrip('@')}"
     other = str(grok.get("watermark") or "").strip()
     disagree = bool(other) and _squash_handle(other) != _squash_handle(text)
     lines: list[str] = []
+    post = str(vision.get("watermark_post") or "").strip()
     if text:
         url = str(vision.get("watermark_url") or "").strip()
         note = str(vision.get("watermark_note") or "").strip()
-        if disagree:
+        if post:
+            # 水印号自己的带图帖里翻到了这张：这是核对过的结论，直接把帖子给出来。
+            lines.append(f"🔎 图上水印核对上了：{text}（{note}）：{post}")
+        elif disagree:
             # 两个模型读得不一样，连是哪个号都没定：这时候再附主页，用户点进去
             # 只会看到一个无关账号，白白浪费时间。
             lines.append(f"🔎 图上水印：{text}（视觉模型识别，可能读错，先别去认这个号）")
@@ -321,8 +329,28 @@ def _vision_watermark_line(outcome: SearchOutcome) -> str:
         else:
             lines.append(f"🔎 图上水印：{text}（视觉模型识别，可能读错）")
     if disagree:
-        lines.append(f"🔎 Grok 读到的水印不一样：{other}（两个都是模型识别，别当结论）")
+        if post:
+            # 已经用指纹核对到帖子了，另一个读法就是读错，不必再让人两头猜。
+            lines.append(f"🔎 Grok 读成 {other}，跟核对结果不一致，那是读错了")
+        else:
+            state = ""
+            other_info = vision.get("watermark_other")
+            if isinstance(other_info, dict):
+                state = _account_state_note(str(other_info.get("state") or ""))
+            tail = f"（{state}）" if state else ""
+            lines.append(f"🔎 Grok 读到的水印不一样：{other}{tail}，两个都别当结论")
     return "\n".join(lines)
+
+
+def _account_state_note(state: str) -> str:
+    """把账号核实结果翻成一句人话。"""
+    if state == "ok":
+        return "这个号存在，但没核到这张图"
+    if state == "missing":
+        return "查无此号"
+    if state == "suspended":
+        return "读不到这个号，可能受限或已封"
+    return ""
 
 
 def _bare_url(url: str) -> str:
@@ -530,6 +558,7 @@ ENGINE_LABELS = {
     "yandex": "Yandex",
     "baidu": "百度识图",
     "saucenao": "SauceNAO",
+    "watermark": "图上水印核对",
 }
 
 

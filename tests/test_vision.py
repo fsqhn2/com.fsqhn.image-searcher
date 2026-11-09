@@ -208,6 +208,31 @@ class WatermarkTest(unittest.TestCase):
         self.assertIn("读不到这个号", text)
         self.assertNotIn("可点开核对", text)
 
+    def test_watermark_hit_gives_the_post(self):
+        """水印号自己的带图帖里翻到了：直接给帖子地址，不再是「可能读错」。"""
+        outcome = SearchOutcome()
+        outcome.vision = {
+            "watermark": "X@someone",
+            "watermark_post": "https://x.com/someone/status/1",
+            "watermark_note": "自己的带图帖里有这张图（距离 3）",
+        }
+        outcome.grok = {"watermark": "X@other"}
+        text = formatting._best_block(outcome)
+        self.assertIn("图上水印核对上了", text)
+        self.assertIn("https://x.com/someone/status/1", text)
+        self.assertIn("距离 3", text)
+
+    def test_other_watermark_state_is_shown(self):
+        """另一个水印读成什么号、查没查到，也写出来。"""
+        outcome = SearchOutcome()
+        outcome.vision = {
+            "watermark": "X@Miharu",
+            "watermark_other": {"raw": "X@Moliuwu", "handle": "Moliuwu", "state": "missing"},
+        }
+        outcome.grok = {"watermark": "X@Moliuwu"}
+        text = formatting._best_block(outcome)
+        self.assertIn("查无此号", text)
+
     def test_no_watermark_no_line(self):
         outcome = SearchOutcome()
         outcome.vision = {"watermark": ""}
