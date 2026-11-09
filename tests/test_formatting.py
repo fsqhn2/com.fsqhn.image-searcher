@@ -1057,5 +1057,21 @@ class BilibiliVideoIdTest(unittest.TestCase):
         self.assertNotIn("视频号", text)
 
 
+class EtaTextTest(unittest.TestCase):
+    """耗时提示的口径：普通单 1 分钟，难找的单交代 2~6 分钟。"""
+
+    def test_fast_eta(self) -> None:
+        self.assertEqual(formatting.ETA_FAST, "约 1 分钟")
+
+    def test_full_eta_has_slow_window(self) -> None:
+        self.assertEqual(formatting.eta_full(), "约 1 分钟，如果这图比较难找，会需要 2 到 6 分钟")
+
+    def test_slow_ping_seconds_is_three_minutes(self) -> None:
+        self.assertEqual(formatting.SLOW_PING_SECONDS, 180)
+
+    def test_slow_ping_text(self) -> None:
+        self.assertEqual(formatting.SLOW_PING_TEXT, "这图有点难找，我需要细细对比，再稍等下哦。")
+
+
 if __name__ == "__main__":
     unittest.main()

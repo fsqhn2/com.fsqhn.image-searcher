@@ -439,6 +439,21 @@ def ttl_text(minutes: int) -> str:
     return f"{minutes} 分钟"
 
 
+# 搜图耗时提示。最近 14 单实测：指纹直接命中的中位数 31 秒，要跑视觉/Grok 兜底的
+# 中位数 86 秒、最慢 373 秒，所以文案先说 1 分钟，再交代难找时的上限。
+ETA_FAST = "约 1 分钟"
+ETA_SLOW_NOTE = "如果这图比较难找，会需要 2 到 6 分钟"
+# 超过这个时长还没出结果，补一条进度提示，别让人对着空气等六分钟。
+SLOW_PING_SECONDS = 180
+SLOW_PING_TEXT = "这图有点难找，我需要细细对比，再稍等下哦。"
+
+
+def eta_full() -> str:
+    """聊天里的一句话耗时交代。"""
+    return f"{ETA_FAST}，{ETA_SLOW_NOTE}"
+
+
+
 def _reference_distance(outcome: SearchOutcome, source: str) -> int | None:
     """参考图跟原图的指纹距离。
 

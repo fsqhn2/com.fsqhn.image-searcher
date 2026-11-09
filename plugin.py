@@ -886,6 +886,8 @@ class ImageSearcherPlugin(MaiBotPlugin):
         # 等待补图时记住这次要不要无视缓存重搜（「盆地找鸡 重搜」后只发图）
         self._pending_force: dict[tuple[str, str], bool] = {}
         self._pending_timers: dict[tuple[str, str], asyncio.Task] = {}
+        # 跑到 3 分钟还没出结果的任务，各挂一个补话定时器。
+        self._slow_pings: dict[str, asyncio.Task] = {}
         # 合并转发节点的 uin 不能为空，否则 QQ 端会提示消息异常；从入站消息里记机器人账号。
         self._self_id: str = ""
         # SauceNAO 的库策略按群配置，但 stream_id 是哈希，需要群号映射。
@@ -948,6 +950,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
         for timer in self._pending_timers.values():
             timer.cancel()
         self._pending_timers.clear()
+        for timer in self._slow_pings.values():
+            timer.cancel()
+        self._slow_pings.clear()
         self._pending.clear()
         self._image_cache.clear()
         self._engine_pool.shutdown(wait=False, cancel_futures=True)
@@ -1171,7 +1176,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
             await self.ctx.send.text(f"启动搜图失败：{error}", current)
             return
         self.ctx.logger.info("等待窗口内收到图片，开始搜图：stream=%s user=%s", current, user_id)
-        await self.ctx.send.text(f"🔍 收到图片，开始搜图，{self._eta_text()}。", current)
+        await self.ctx.send.text(f"🔍 收到图片，开始搜图，{formatting.eta_full()}。", current)
 
     def _remember_image(self, message: dict) -> bytes | None:
         message_id = str(message.get("message_id") or "").strip()
@@ -1848,8 +1853,12 @@ class ImageSearcherPlugin(MaiBotPlugin):
         return True, "已重发上次结果", 2
 
     def _eta_text(self) -> str:
-        """给用户看的耗时提示。深度检索要明显更久，别按乐观值写死。"""
-        return "约 2 分钟" if self.config.plugin.deep_scan else "约 60 秒"
+        """给用户看的耗时提示。
+
+        实测：指纹直接命中的单中位数 31 秒，要跑视觉/Grok 兜底的中位数 86 秒、
+        最慢 373 秒。所以先说 1 分钟，再交代难找时的上限，别按乐观值写死。
+        """
+        return formatting.ETA_FAST
 
     def _sauce_route(self, candidates: list[Candidate]) -> Candidate | None:
         """SauceNAO 高相似度命中即认为这张是插画。"""
@@ -2968,7 +2977,46 @@ class ImageSearcherPlugin(MaiBotPlugin):
         background = asyncio.create_task(self._run_task(task, raw, image_url, notify, force))
         self._background.add(background)
         background.add_done_callback(self._background.discard)
+        self._schedule_slow_ping(task)
         return task
+
+    def _schedule_slow_ping(self, task: SearchTask) -> None:
+        """给一单挂上「3 分钟还没跑完就补句话」的定时器。
+
+        实测兜底单中位数 86 秒、最慢 373 秒，中间那段静默最容易让人觉得卡死。
+        指令触发和 Tool 触发都走 _start_task，所以两边都能吃到这条提示。
+        """
+        timer = asyncio.create_task(self._slow_ping(task))
+        self._slow_pings[task.task_id] = timer
+
+        def _forget(done: asyncio.Task, key: str = task.task_id) -> None:
+            self._slow_pings.pop(key, None)
+            self._background.discard(done)
+
+        timer.add_done_callback(_forget)
+
+    async def _slow_ping(self, task: SearchTask) -> None:
+        try:
+            await asyncio.sleep(formatting.SLOW_PING_SECONDS)
+        except asyncio.CancelledError:
+            return
+        if task.status != "running":
+            return
+        sent = await self.ctx.send.text(formatting.SLOW_PING_TEXT, task.stream_id)
+        if not _send_ok(sent):
+            self.ctx.logger.warning("慢任务提示发送失败：task=%s result=%s", task.task_id, sent)
+            return
+        self._vlog(
+            "慢任务提示已发送：task=%s 已等待=%ss 发往=%s",
+            task.task_id,
+            round(task.elapsed),
+            task.stream_id,
+        )
+
+    def _cancel_slow_ping(self, task_id: str) -> None:
+        timer = self._slow_pings.pop(task_id, None)
+        if timer is not None:
+            timer.cancel()
 
     async def _run_task(self, task: SearchTask, raw: bytes, image_url: str, notify: bool, force: bool = False) -> None:
         try:
@@ -3007,6 +3055,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 self._tasks.fail(task, str(error))
             if notify and task.stream_id:
                 await self.ctx.send.text(f"搜图失败：{error}", task.stream_id)
+        finally:
+            # 任务收尾就掐掉补话定时器，别在结果已经发出后再补一句「还在找」。
+            self._cancel_slow_ping(task.task_id)
 
     # QQ 单条合并转发的图片总量有上限，超过后 send_group_forward_msg 会被对端拒绝。
     # 实测 6 张图能过、13 张失败，所以「更多」按这个预算拆成几条发。
@@ -3322,10 +3373,20 @@ class ImageSearcherPlugin(MaiBotPlugin):
         except Exception as error:  # noqa: BLE001
             return {"success": False, "content": f"启动搜图失败：{error}", "message": str(error)}
 
+        # 工具调用同样是「说完就不管」，聊天里先落一句进度，机器人的思考模型
+        # 下一轮才看得到当前到底在干什么。
+        await self.ctx.send.text(
+            f"🔍 正在搜图（图片来源：{source}{'，已忽略缓存' if forced else ''}），"
+            f"{formatting.eta_full()}，结果稍后以合并转发发出。",
+            stream_id,
+        )
+
         message = (
             f"已开始搜索（task_id={task.task_id}，图片来源：{source}"
-            f"{'，已忽略缓存' if forced else ''}），预计 {self._eta_text()}。"
+            f"{'，已忽略缓存' if forced else ''}），预计 {formatting.eta_full()}。"
             f"结果会以合并转发发到聊天里；也可以用 search_status 凭 task_id 取文字摘要。"
+            f"如果超过 {formatting.SLOW_PING_SECONDS // 60} 分钟还没出结果，我会在聊天里回一句"
+            f"「{formatting.SLOW_PING_TEXT}」，那说明确实在慢慢对比，不是卡死了。"
         )
         self.ctx.logger.info("Tool 启动搜图：task=%s user=%s note=%s", task.task_id, user_id, note)
         return {
@@ -3366,7 +3427,11 @@ class ImageSearcherPlugin(MaiBotPlugin):
             return {"success": False, "content": message, "message": message}
 
         if task.status == "running":
-            message = f"任务 {task.task_id} 还在搜索中，已等待 {task.elapsed:.0f} 秒，请稍后再查。"
+            message = (
+                f"任务 {task.task_id} 还在搜索中，已等待 {task.elapsed:.0f} 秒，请稍后再查。"
+                f"（{formatting.ETA_SLOW_NOTE}；超过 {formatting.SLOW_PING_SECONDS // 60} 分钟"
+                f"还不出结果时，聊天里会有一条「{formatting.SLOW_PING_TEXT}」）"
+            )
             return {"success": True, "task_id": task.task_id, "status": "running", "content": message}
 
         section = self.config.plugin
@@ -3440,7 +3505,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
             await self.ctx.send.text(f"启动搜图失败：{error}", current)
             return False, str(error), 1
 
-        await self.ctx.send.text(f"🔍 收到图片，开始搜图，{self._eta_text()}。", current)
+        await self.ctx.send.text(f"🔍 收到图片，开始搜图，{formatting.eta_full()}。", current)
         return True, "搜图中", 2
 
     async def _handle_command(self, stream_id: str, kwargs: dict) -> tuple[bool, str, int]:
@@ -3516,7 +3581,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
 
         await self.ctx.send.text(
             f"🔍 正在搜图（{source}{'，已忽略缓存' if force else ''}），"
-            f"{self._eta_text()}，结果稍后以合并转发发出。",
+            f"{formatting.eta_full()}，结果稍后以合并转发发出。",
             current,
         )
         return True, "搜图中", 2
