@@ -1636,8 +1636,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
                         vision_info["downgraded"] = int(vision_info.get("downgraded") or 0) + 1
                     best = settled
 
-        # 引用帖不是原帖：图来自被引用的那条时，结论换成原作者。
-        best = await self._follow_quote(best)
+        # 引用帖不是原帖，转发的原帖也不属于转发者：指纹已经对上的 X 候选都换回
+        # 原作者与那条帖子。只挑 match/suspect，mismatch 的图本来就不是这张。
+        best = await self._follow_quotes(ordered, best)
 
         self._vlog(
             "分流结果：路线=%s 原因=%s；匹配=%s 视觉=%s 疑似=%s 不符=%s 未验证=%s",
@@ -2377,8 +2378,8 @@ class ImageSearcherPlugin(MaiBotPlugin):
             return fxtwitter.Tweet(error=f"拉推文失败：{str(error)[:60]}", tweet_id=tweet_id)
         return fxtwitter.parse_tweet(payload, tweet_id=tweet_id)
 
-    async def _follow_quote(self, best: Candidate | None) -> Candidate | None:
-        """结论落在引用帖或转发上时，换成真正的原帖。
+    def _apply_tweet_identity(self, candidate: Candidate, tweet) -> bool:
+        """把候选的地址/作者换成真正的原帖。换了返回 True。
 
         fxtwitter 的 ``quote`` 字段直接给出原帖地址与作者。引用帖自己没配图
         （``media`` 为空）时，候选图只能来自被引用那条——YuMIkAnime 那单就是
@@ -2390,35 +2391,76 @@ class ImageSearcherPlugin(MaiBotPlugin):
         写明是谁转的。不换的话结论会挂到转发的人头上——实测 s-20261109-2222-b5e6
         把 @sssmnms 的图判给了转发者 @redwine278，图上的水印就写着 @sssmnms。
         """
-        if best is None or not is_x_post_page(best.url or ""):
-            return best
-        tweet = await self._fetch_tweet(best.url)
         if not tweet.ok:
-            return best
+            return False
         if tweet.reposted_by and tweet.url and tweet.handle:
             former = f"@{tweet.reposted_by}"
-            best.url = tweet.url
-            best.handle = f"@{tweet.handle}"
-            best.name = tweet.name or best.name
-            best.platform = "X (Twitter)"
-            best.source = "X"
+            candidate.url = tweet.url
+            candidate.handle = f"@{tweet.handle}"
+            candidate.name = tweet.name or candidate.name
+            candidate.platform = "X (Twitter)"
+            candidate.source = "X"
             note = f"这条是 {former} 转的帖子，原文在 @{tweet.handle}"
-            best.note = f"{best.note}；{note}" if best.note else note
-            self._vlog("转发换成原帖：%s → %s（原作者 @%s）", former, best.url, tweet.handle)
-            return best
+            candidate.note = f"{candidate.note}；{note}" if candidate.note else note
+            self._vlog("转发换成原帖：%s → %s（原作者 @%s）", former, candidate.url, tweet.handle)
+            return True
         if not tweet.quote_url or not tweet.quote_handle:
-            return best
+            return False
         if tweet.media:
-            return best
+            return False
         former = f"@{tweet.handle}" if tweet.handle else "这条帖子"
-        best.url = tweet.quote_url
-        best.handle = f"@{tweet.quote_handle}"
-        best.name = tweet.quote_name or best.name
-        best.platform = "X (Twitter)"
-        best.source = "X"
+        candidate.url = tweet.quote_url
+        candidate.handle = f"@{tweet.quote_handle}"
+        candidate.name = tweet.quote_name or candidate.name
+        candidate.platform = "X (Twitter)"
+        candidate.source = "X"
         note = f"原文是 {former} 的引用帖，图来自被引用的 @{tweet.quote_handle}"
-        best.note = f"{best.note}；{note}" if best.note else note
-        self._vlog("引用帖换成原帖：%s → %s", former, best.url)
+        candidate.note = f"{candidate.note}；{note}" if candidate.note else note
+        self._vlog("引用帖换成原帖：%s → %s", former, candidate.url)
+        return True
+
+    # 候选列表里的转发纠正：只为「已经对上图」的那批多花请求。mismatch 的图本来
+    # 就不是这张，把作者名改对也没有意义。实测每单这类候选 0～3 条，8 路并发下
+    # 增量不到 1 秒，所以预算给 12 秒就够，超时直接放弃、不影响结论。
+    _FOLLOW_CONCURRENCY = 6
+    _FOLLOW_BUDGET = 12.0
+
+    async def _follow_quotes(
+        self, candidates: list[Candidate], best: Candidate | None
+    ) -> Candidate | None:
+        """把指纹已经对上的 X 候选逐条换回原帖与原作者。
+
+        去重是按「平台 + 账号」做的，所以这一步放在去重之后：先纠正再合并会把
+        同一个原作者的几条不同帖子压成一条。改的是同一批对象，结论里的 best
+        也跟着更新，不需要重新挑。
+        """
+        targets: list[Candidate] = []
+        seen: set[str] = set()
+        for item in candidates:
+            if item is not best and item.status not in {"match", "suspect"}:
+                continue
+            url = item.url or ""
+            if not is_x_post_page(url) or url in seen:
+                continue
+            seen.add(url)
+            targets.append(item)
+        if not targets:
+            return best
+
+        semaphore = asyncio.Semaphore(self._FOLLOW_CONCURRENCY)
+
+        async def one(candidate: Candidate) -> None:
+            async with semaphore:
+                tweet = await self._fetch_tweet(candidate.url)
+                self._apply_tweet_identity(candidate, tweet)
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(one(item) for item in targets), return_exceptions=True),
+                timeout=self._FOLLOW_BUDGET,
+            )
+        except asyncio.TimeoutError:
+            self._vlog("候选转发纠正超时：候选=%s 上限=%ss", len(targets), self._FOLLOW_BUDGET)
         return best
 
     async def _verify_tweet(self, ref: str, upload: bytes | None) -> dict[str, Any]:
