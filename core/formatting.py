@@ -219,6 +219,35 @@ def _vision_pick_line(outcome: SearchOutcome) -> str:
     return f"👉 最接近的一条（{where}{gap}）\n{pick.url}"
 
 
+def _vision_downgrade_line(outcome: SearchOutcome, vision: dict | None) -> str:
+    """视觉挑中又被降级时的那句说明。
+
+    降级原因不止「图库站、商品页」一种：X 的转发页、只解析出平台页面都算。写死
+    成商品页时，实际落点是转发页就会让人看不明白，所以直接引用被降级那条自己的
+    说明，认不出来才退回旧说法。
+    """
+    vision = vision or {}
+    count = int(vision.get("downgraded") or 0)
+    if not count:
+        return ""
+    notes: list[str] = []
+    for item in outcome.candidates:
+        note = (item.note or "").strip()
+        if item.status != "suspect" or not note.startswith("视觉复核"):
+            continue
+        text = note[len("视觉复核：") :] if note.startswith("视觉复核：") else note
+        text = text.split("（指纹")[0].split("（未做")[0].strip("，, 　")
+        if text.endswith("，仅供参考"):
+            text = text[: -len("，仅供参考")]
+        if text and text not in notes:
+            notes.append(text)
+    if notes:
+        tail = "；".join(notes[:2])
+    else:
+        tail = "落点在图库站、商品页这类页面，或账号最近没发过这张图；其中最近的一条可能就包含这张图"
+    return f"视觉复核挑出 {count} 条，但都不能当原帖：{tail}。"
+
+
 def _best_block(outcome: SearchOutcome, *, skip_grok: bool = False) -> str:
     text = _best_block_core(outcome, skip_grok=skip_grok)
     extra: list[str] = []
@@ -248,9 +277,7 @@ def _best_block_core(outcome: SearchOutcome, *, skip_grok: bool = False) -> str:
         vision = outcome.vision or {}
         if vision.get("ok") and vision.get("checked"):
             if vision.get("downgraded"):
-                grok_lines.append(
-                    f"视觉复核挑出 {vision['downgraded']} 条，但都不能当原帖：落点在图库站、商品页这类页面，或账号最近没发过这张图；其中最近的一条可能就包含这张图。"
-                )
+                grok_lines.append(_vision_downgrade_line(outcome, vision))
                 reason_line = _vision_reason(vision)
                 if reason_line:
                     grok_lines.append(reason_line)
@@ -264,7 +291,11 @@ def _best_block_core(outcome: SearchOutcome, *, skip_grok: bool = False) -> str:
         return "\n".join(grok_lines)
     if best is None:
         compared = sum(1 for item in outcome.candidates if item.distance is not None)
-        highest = max((item.distance or 0 for item in outcome.candidates), default=0)
+        nearest = min(
+            (item for item in outcome.candidates if item.distance is not None),
+            key=lambda item: item.distance or 0,
+            default=None,
+        )
         # 视觉挑中又降级的条目上面已经单独说明并给了链接，不再算进「同角色或
         # 同款服装」——同一批图不能既说「像同一个人」又说「不是这张照片」。
         suspects = [
@@ -280,16 +311,26 @@ def _best_block_core(outcome: SearchOutcome, *, skip_grok: bool = False) -> str:
             if item.status == "suspect" and is_avatar_hit(item)
         ]
         lines = ["⚠️ 未找到可靠出处"]
-        if compared:
-            lines.append(f"已比对 {compared} 条候选，最高指纹距离 {highest}，均未通过阈值。")
+        if compared and nearest is not None:
+            if nearest.status == "suspect":
+                # 距离够近但被降级（转发页、头像这类）：不能说「均未通过阈值」，
+                # 那会跟下面的「指纹距离 0」自相矛盾。
+                lines.append(
+                    f"已比对 {compared} 条候选，最近的一条指纹距离 {nearest.distance}，"
+                    f"但那条不能当原帖（原因见下）。"
+                )
+            else:
+                lines.append(
+                    f"已比对 {compared} 条候选，最近的一条指纹距离 {nearest.distance}，都没到阈值。"
+                )
+        elif compared:
+            lines.append(f"已比对 {compared} 条候选，都没到阈值。")
         else:
             lines.append("候选图都没能取到或解码，无法验证。")
         vision = outcome.vision or {}
         if vision.get("ok") and vision.get("checked"):
             if vision.get("downgraded"):
-                lines.append(
-                    f"视觉复核挑出 {vision['downgraded']} 条，但都不能当原帖：落点在图库站、商品页这类页面，或账号最近没发过这张图；其中最近的一条可能就包含这张图。"
-                )
+                lines.append(_vision_downgrade_line(outcome, vision))
                 reason_line = _vision_reason(vision)
                 if reason_line:
                     lines.append(reason_line)

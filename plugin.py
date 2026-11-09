@@ -2070,11 +2070,15 @@ class ImageSearcherPlugin(MaiBotPlugin):
             distance = candidate.distance
             if candidate.image_url:
                 info["picked_images"].append(candidate.image_url)
-            gap = (
-                f"指纹距离 {distance}，超过阈值 {self.config.plugin.hash_threshold}"
-                if distance is not None
-                else "未做指纹比对"
-            )
+            threshold = self.config.plugin.hash_threshold
+            if distance is None:
+                gap = "未做指纹比对"
+            elif distance <= threshold:
+                # 距离本来就够近：降级是因为落点不对（转发页、商品页），
+                # 不能还写「超过阈值」，那会跟同一行里的距离自相矛盾。
+                gap = f"指纹距离 {distance}，指纹对得上"
+            else:
+                gap = f"指纹距离 {distance}，超过阈值 {threshold}"
             # 视觉说「同一个人」还不够，得能落到人身上：电商商品图只是同款衣服，
             # 只有平台页面没账号的结果也确认不了是谁，都降级成疑似留在参考区。
             verdict = vision.verdict_of(candidate.handle, candidate.platform, candidate.url, candidate.name)

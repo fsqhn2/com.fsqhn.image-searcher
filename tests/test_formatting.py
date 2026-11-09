@@ -1073,5 +1073,50 @@ class EtaTextTest(unittest.TestCase):
         self.assertEqual(formatting.SLOW_PING_TEXT, "这图有点难找，我需要细细对比，再稍等下哦。")
 
 
+class DowngradedNearMissTest(unittest.TestCase):
+    """距离够近但落点不对时，结论不能写成「均未通过阈值」。"""
+
+    def _near_miss_outcome(self) -> SearchOutcome:
+        hit = Candidate(
+            engine="lens",
+            url="https://x.com/someone/with_replies",
+            image_url="https://pbs.twimg.com/media/abc.jpg",
+            distance=0,
+            status="suspect",
+            platform="X (Twitter)",
+            handle="@someone",
+            note="视觉复核：疑似同一个人，但那是转发页、图不是她发的（指纹距离 0，超过阈值 8），仅供参考",
+        )
+        other = Candidate(
+            engine="yandex",
+            url="https://example.com/a",
+            distance=31,
+            status="mismatch",
+        )
+        vision = {"ok": True, "checked": 16, "downgraded": 1, "reason": "姿势一致"}
+        return SearchOutcome(status="not_found", best=None, candidates=[hit, other], vision=vision)
+
+    def test_no_false_threshold_claim(self) -> None:
+        text = formatting.build_text_summary(
+            self._task(), command="麦麦寻人", show_reference=True, limit=3
+        )
+        self.assertNotIn("均未通过阈值", text)
+        self.assertIn("最近的一条指纹距离 0", text)
+        self.assertIn("但那条不能当原帖", text)
+
+    def test_downgrade_reason_comes_from_candidate(self) -> None:
+        text = formatting.build_text_summary(
+            self._task(), command="麦麦寻人", show_reference=True, limit=3
+        )
+        self.assertIn("但那是转发页、图不是她发的", text)
+        self.assertNotIn("落点在图库站、商品页这类页面", text)
+
+    def _task(self) -> SearchTask:
+        task = SearchTask(task_id="s-test", stream_id="s1", user_id="u1")
+        task.status = "done"
+        task.outcome = self._near_miss_outcome()
+        return task
+
+
 if __name__ == "__main__":
     unittest.main()
