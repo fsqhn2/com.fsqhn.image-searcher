@@ -313,3 +313,35 @@ class RepliesSearchTest(unittest.TestCase):
         payload = {"results": [{"type": "user", "id": "1"}, {}]}
         self.assertEqual(fxtwitter.parse_search(payload)[0], [])
         self.assertEqual(fxtwitter.parse_search(None), ([], ""))
+
+
+class ProfileStateTest(unittest.TestCase):
+    """账号存在性靠 fxtwitter 的 profile：查无此号与被封要分开。"""
+
+    def test_build_profile_url(self) -> None:
+        self.assertEqual(
+            fxtwitter.build_profile_url("@wn40536699"),
+            "https://api.fxtwitter.com/2/profile/wn40536699",
+        )
+        self.assertEqual(fxtwitter.build_profile_url("bad handle"), "")
+        self.assertEqual(fxtwitter.build_profile_url(""), "")
+
+    def test_ok(self) -> None:
+        payload = {"code": 200, "message": "OK", "user": {"screen_name": "wn40536699"}}
+        self.assertEqual(fxtwitter.parse_profile(payload), fxtwitter.PROFILE_OK)
+
+    def test_suspended(self) -> None:
+        payload = {"code": 404, "message": "User is suspended", "reason": "suspended"}
+        self.assertEqual(fxtwitter.parse_profile(payload), fxtwitter.PROFILE_SUSPENDED)
+
+    def test_missing(self) -> None:
+        payload = {"code": 404, "message": "User not found", "reason": "not_found"}
+        self.assertEqual(fxtwitter.parse_profile(payload), fxtwitter.PROFILE_MISSING)
+
+    def test_unknown(self) -> None:
+        self.assertEqual(fxtwitter.parse_profile(None), fxtwitter.PROFILE_UNKNOWN)
+        self.assertEqual(fxtwitter.parse_profile({}), fxtwitter.PROFILE_UNKNOWN)
+        self.assertEqual(
+            fxtwitter.parse_profile({"code": 500, "message": "oops"}),
+            fxtwitter.PROFILE_UNKNOWN,
+        )

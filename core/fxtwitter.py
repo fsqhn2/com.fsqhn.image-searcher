@@ -155,6 +155,49 @@ def build_media_url(handle: str) -> str:
     return f"{API_BASE}/2/profile/{user}/media"
 
 
+# 账号核实结果。以前用 cdn.syndication.twimg.com 的 followbutton 接口，2026-11
+# 实测对任何号都返回空（连肯定存在的号也是空），等于确认不了；换成 fxtwitter
+# 的 profile，它能把「不存在」和「被封」分开。
+PROFILE_OK = "ok"
+PROFILE_MISSING = "missing"
+PROFILE_SUSPENDED = "suspended"
+PROFILE_UNKNOWN = "unknown"
+
+
+def build_profile_url(handle: str) -> str:
+    """账号本体。用来确认这个号到底存不存在。"""
+    user = (handle or "").strip().lstrip("@")
+    if not user or not _HANDLE.match(user):
+        return ""
+    return f"{API_BASE}/2/profile/{user}"
+
+
+def parse_profile(payload: dict | None) -> str:
+    """把 ``/2/profile/<号>`` 的返回归成四种状态。
+
+    - ``ok``：200 且带 ``user``；
+    - ``suspended``：404 且理由里写 suspended（人被 X 停了，号曾存在）；
+    - ``missing``：404 其它情况（改名或从来没有过）；
+    - ``unknown``：没拿到 JSON、结构不认识。
+
+    「被封」单独一档：它说明这个人真实存在，只是内容看不了了；当成「查不到」
+    会把一条有效线索丢掉，当成「正常」又会让用户点进封号页。
+    """
+    if not isinstance(payload, dict):
+        return PROFILE_UNKNOWN
+    user = payload.get("user")
+    if isinstance(user, dict) and user.get("screen_name"):
+        return PROFILE_OK
+    code = payload.get("code")
+    reason = str(payload.get("reason") or "").lower()
+    message = str(payload.get("message") or "").lower()
+    if "suspend" in reason or "suspend" in message:
+        return PROFILE_SUSPENDED
+    if code == 404:
+        return PROFILE_MISSING
+    return PROFILE_UNKNOWN
+
+
 def parse_media_list(payload: dict | None) -> list[MediaPost]:
     """把 ``/media`` 的返回拆成一串帖子。
 

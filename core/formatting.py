@@ -277,8 +277,11 @@ def _vision_watermark_line(outcome: SearchOutcome) -> str:
     if not text:
         return ""
     url = str(vision.get("watermark_url") or "").strip()
+    note = str(vision.get("watermark_note") or "").strip()
     if url:
         return f"🔎 图上水印：{text}（视觉模型识别，可能读错，可点开核对）：{url}"
+    if note:
+        return f"🔎 图上水印：{text}（视觉模型识别，可能读错；{note}）"
     return f"🔎 图上水印：{text}（视觉模型识别，可能读错）"
 
 

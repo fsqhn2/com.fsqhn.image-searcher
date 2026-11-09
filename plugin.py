@@ -1615,11 +1615,13 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 if vision_info and vision_info.get("watermark"):
                     handle = vision.handle_from_watermark(vision_info["watermark"])
                     if handle:
+                        state = await self._account_state(handle)
                         vision_info["watermark_handle"] = handle
-                        exists = await self._account_exists(handle)
-                        if exists:
+                        if state == fxtwitter.PROFILE_OK:
                             vision_info["watermark_url"] = f"https://x.com/{handle}"
-                        self._vlog("水印账号核对：@%s 存在=%s", handle, exists)
+                        elif state == fxtwitter.PROFILE_SUSPENDED:
+                            vision_info["watermark_note"] = "该账号已被 X 封禁"
+                        self._vlog("水印账号核对：@%s 状态=%s", handle, state)
                 if vision_info and vision_info.get("picked"):
                     ordered = dedupe_accounts(self._rank(candidates, names))
                     # 模型可能一次报好几格，取指纹距离最近的那条当结论——距离近说明
@@ -2268,12 +2270,16 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 self._vlog("Grok 图上读到 ID：%s", result.watermark)
             if result.tier == "account" and result.handle:
                 # 只给主页时先确认这个号真的存在；查不到就整条丢掉，宁可报没找到，
-                # 也不要把模型编出来的名字当成线索发出去。
-                exists = await self._account_exists(result.handle)
-                if exists is False:
+                # 也不要把模型编出来的名字当成线索发出去。被封的号单独说明：
+                # 人是真的，只是内容已经看不到。
+                state = await self._account_state(result.handle)
+                if state in {fxtwitter.PROFILE_MISSING, fxtwitter.PROFILE_SUSPENDED}:
                     info["tier"] = "none"
                     info["handle"] = ""
-                    info["error"] = f"@{result.handle} 在 X 上查不到，已丢弃"
+                    if state == fxtwitter.PROFILE_SUSPENDED:
+                        info["error"] = f"@{result.handle} 已被 X 封禁，看不到内容，已丢弃"
+                    else:
+                        info["error"] = f"@{result.handle} 在 X 上查不到，已丢弃"
                     info["reason"] = info["error"]
 
             if info["tier"] == "post" and info["post_url"]:
@@ -2536,29 +2542,34 @@ class ImageSearcherPlugin(MaiBotPlugin):
             )
         return f"⚠️ 没法比对：{who} 这条帖子拉到了，但配图没取下来（{check.get('error') or '下载失败'}）。\n{link}"
 
-    async def _account_exists(self, handle: str) -> bool | None:
-        """查账号在 X 上是否存在。返回 None 表示没查成，不能当成「不存在」。"""
-        if not handle:
-            return None
-        url = f"https://cdn.syndication.twimg.com/widgets/followbutton/info.json?screen_names={handle}"
+    async def _account_state(self, handle: str) -> str:
+        """查账号在 X 上的状态：ok / missing / suspended / unknown。
 
-        def fetch() -> bool | None:
+        原来用 ``cdn.syndication.twimg.com/widgets/followbutton/info.json``，2026-11
+        实测对任何号都返回空（连肯定存在的 @wn40536699 也是空），确认能力等于没有，
+        换成 fxtwitter 的 ``/2/profile/<号>``：它能区分「查无此号」和「被 X 封禁」。
+        """
+        url = fxtwitter.build_profile_url(handle)
+        if not url:
+            return fxtwitter.PROFILE_UNKNOWN
+
+        def fetch() -> str:
             session = make_session(self.config.plugin.proxy)
             try:
-                response = session.get(url, timeout=15)
-                if response.status_code != 200:
-                    return None
-                data = response.json()
-                if not isinstance(data, list):
-                    return None
-                return bool(data)
+                response = session.get(url, timeout=15, headers={"Accept": "application/json"})
+                if response.status_code not in {200, 404}:
+                    return fxtwitter.PROFILE_UNKNOWN
+                try:
+                    return fxtwitter.parse_profile(response.json())
+                except Exception:  # noqa: BLE001 - 不是 JSON 就当作没查成
+                    return fxtwitter.PROFILE_UNKNOWN
             finally:
                 session.close()
 
         try:
             return await asyncio.wait_for(asyncio.to_thread(fetch), timeout=20)
         except Exception:  # noqa: BLE001 - 查不了就当没查成，不影响已经拿到的结论
-            return None
+            return fxtwitter.PROFILE_UNKNOWN
 
     # 翻账号自己的带图帖子时最多看这么多条。这个接口一次只给最近十几条，
     # 多了请求不出去；够不够用取决于图新不新，翻不到就老实说没有。

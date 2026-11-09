@@ -198,6 +198,13 @@ class WatermarkTest(unittest.TestCase):
         self.assertIn("图上水印：微博@某某", text)
         self.assertNotIn("可点开核对", text)
 
+    def test_watermark_line_marks_suspended(self):
+        outcome = SearchOutcome()
+        outcome.vision = {"watermark": "@Babybaobaoya", "watermark_note": "该账号已被 X 封禁"}
+        text = formatting._best_block(outcome)
+        self.assertIn("已被 X 封禁", text)
+        self.assertNotIn("可点开核对", text)
+
     def test_no_watermark_no_line(self):
         outcome = SearchOutcome()
         outcome.vision = {"watermark": ""}
