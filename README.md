@@ -8,6 +8,8 @@
 
 > **本插件由 AI 编写。** 已经在作者自己的 MaiBot 上跑通并做了有限的实际验证，但**不保证在你那边的 MaiBot、适配器、网络环境下表现一致**。遇到问题请看[详细日志与反馈](#详细日志与反馈)。
 
+> 🧩 **还在用 MaiBot 0.12.x？** 那个版本用的是旧插件体系（manifest v1、没有 WebUI），装不了这个插件。0.12 特供版单独一个仓库：**[fsqhn/com.fsqhn.image-searcher-012](https://github.com/fsqhn/com.fsqhn.image-searcher-012)**，功能一致，装了就能用。
+
 ## 它长什么样
 
 ### 搜到了
@@ -159,6 +161,8 @@
 - **AI 图检测**（可选）：没有可靠匹配时才调 Sightengine，省额度。
 
 ## 安装
+
+本仓库是给 **MaiBot 1.x** 用的。0.12.x 装不了，请用 [0.12 特供版](https://github.com/fsqhn/com.fsqhn.image-searcher-012)。
 
 1. 把整个目录放到 MaiBot 的 `plugins/com.fsqhn.image-searcher/`。
 2. 依赖只有 `Pillow` 和 `requests`，一般已随 MaiBot 装好；缺的话 `pip install Pillow requests`。
