@@ -42,6 +42,11 @@ class Tweet:
     quote_handle: str = ""
     quote_name: str = ""
     quote_text: str = ""
+    # 这条是被转发出来的：``reposted_by`` 是转发者的号，``url``/``handle`` 已经
+    # 是原帖和原作者。候选链接常常是这种 RT 地址（``x.com/<转发者>/status/<id>``），
+    # 照抄就把结论挂到转发的人头上——实测 0.7.56 那单把 @sssmnms 的图判给了
+    # 转发者 @redwine278。
+    reposted_by: str = ""
 
 
 def parse_tweet_id(text: str) -> str:
@@ -98,6 +103,7 @@ def parse_tweet(payload: dict | None, *, tweet_id: str = "") -> Tweet:
 
     quote = data.get("quote") if isinstance(data.get("quote"), dict) else {}
     quote_author = quote.get("author") if isinstance(quote.get("author"), dict) else {}
+    reposter = data.get("reposted_by") if isinstance(data.get("reposted_by"), dict) else {}
 
     return Tweet(
         ok=True,
@@ -114,6 +120,7 @@ def parse_tweet(payload: dict | None, *, tweet_id: str = "") -> Tweet:
         quote_handle=str(quote_author.get("screen_name") or "").strip(),
         quote_name=str(quote_author.get("name") or "").strip(),
         quote_text=str(quote.get("text") or ""),
+        reposted_by=str(reposter.get("screen_name") or "").strip(),
     )
 
 

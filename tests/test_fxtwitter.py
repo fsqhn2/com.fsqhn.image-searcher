@@ -124,6 +124,43 @@ class ParseTweetTest(unittest.TestCase):
         self.assertEqual(tweet.quote_name, "uewe")
         self.assertEqual(tweet.quote_text, "138cm 합법로리 탐정")
 
+    def test_parses_reposted_by(self) -> None:
+        """候选链接是别人的转发地址时，要认得出「这条是转的」，并拿到原作者。"""
+        payload = {
+            "code": 200,
+            "tweet": {
+                "id": "1981232065648742873",
+                "url": "https://x.com/sssmnms/status/1981232065648742873",
+                "author": {"screen_name": "sssmnms", "name": "哎我黑切訥"},
+                "media": {
+                    "photos": [
+                        {"type": "photo", "url": "https://pbs.twimg.com/media/G37ADiRWsAAACDO.jpg?name=orig"}
+                    ]
+                },
+                "reposted_by": {
+                    "id": "742854226372501504",
+                    "name": "렌",
+                    "screen_name": "redwine278",
+                },
+            },
+        }
+        tweet = fxtwitter.parse_tweet(payload)
+        self.assertEqual(tweet.reposted_by, "redwine278")
+        self.assertEqual(tweet.handle, "sssmnms")
+        self.assertEqual(tweet.name, "哎我黑切訥")
+        self.assertEqual(tweet.url, "https://x.com/sssmnms/status/1981232065648742873")
+
+    def test_plain_tweet_has_no_reposter(self) -> None:
+        payload = {
+            "code": 200,
+            "tweet": {
+                "id": "2117959676180701586",
+                "url": "https://x.com/a/status/2117959676180701586",
+                "author": {"screen_name": "a", "name": "A"},
+            },
+        }
+        self.assertEqual(fxtwitter.parse_tweet(payload).reposted_by, "")
+
 
 class JudgeTest(unittest.TestCase):
     """链接核对的三态：命中、对不上、没法判断。"""

@@ -2366,17 +2366,35 @@ class ImageSearcherPlugin(MaiBotPlugin):
         return fxtwitter.parse_tweet(payload, tweet_id=tweet_id)
 
     async def _follow_quote(self, best: Candidate | None) -> Candidate | None:
-        """结论落在引用帖上时，换成被引用的原帖。
+        """结论落在引用帖或转发上时，换成真正的原帖。
 
         fxtwitter 的 ``quote`` 字段直接给出原帖地址与作者。引用帖自己没配图
         （``media`` 为空）时，候选图只能来自被引用那条——YuMIkAnime 那单就是
         引用了 @qyuuuz 的图吐槽，结果被当成作者发了出去。自己配了图的不动，
         那种情况图确实是它发的。
+
+        转发（RT）走另一条：候选链接常常是 ``x.com/<转发者>/status/<id>``，
+        fxtwitter 返回的 ``url`` 才是原帖、``author`` 才是原作者，``reposted_by``
+        写明是谁转的。不换的话结论会挂到转发的人头上——实测 s-20261109-2222-b5e6
+        把 @sssmnms 的图判给了转发者 @redwine278，图上的水印就写着 @sssmnms。
         """
         if best is None or not is_x_post_page(best.url or ""):
             return best
         tweet = await self._fetch_tweet(best.url)
-        if not tweet.ok or not tweet.quote_url or not tweet.quote_handle:
+        if not tweet.ok:
+            return best
+        if tweet.reposted_by and tweet.url and tweet.handle:
+            former = f"@{tweet.reposted_by}"
+            best.url = tweet.url
+            best.handle = f"@{tweet.handle}"
+            best.name = tweet.name or best.name
+            best.platform = "X (Twitter)"
+            best.source = "X"
+            note = f"这条是 {former} 转的帖子，原文在 @{tweet.handle}"
+            best.note = f"{best.note}；{note}" if best.note else note
+            self._vlog("转发换成原帖：%s → %s（原作者 @%s）", former, best.url, tweet.handle)
+            return best
+        if not tweet.quote_url or not tweet.quote_handle:
             return best
         if tweet.media:
             return best
