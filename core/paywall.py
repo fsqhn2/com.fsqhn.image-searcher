@@ -20,6 +20,7 @@ FANBOX 上卖。所以确认到人之后还要多走一步——读她 X 资料�
 from __future__ import annotations
 
 import re
+from datetime import date
 
 _LINKS = {
     "patreon": re.compile(r"patreon\.com/(?:c/)?([A-Za-z0-9_-]{2,40})", re.I),
@@ -99,11 +100,23 @@ def links_of(*texts: str) -> dict[str, str]:
 
 
 def keywords(*texts: str) -> list[str]:
-    """从帖子正文、候选标题里抽能对上作品名的词（罗马音 + 中日文名）。"""
+    """从帖子正文、候选标题里抽能对上作品名的词（罗马音 + 中日文名）。
+
+    中日文标题常把节令和角色名连在一起（``万圣节妃咲``），整串拿去搜一条都搜
+    不到；所以除了整串，再补上尾部 2～3 个字（``妃咲``）——角色名一般就在末尾。
+    """
     words: list[str] = []
     for text in texts:
         blob = str(text or "")
-        for word in _WORD.findall(blob.lower()) + _CJK.findall(blob) + _TAG.findall(blob):
+        candidates = list(_WORD.findall(blob.lower()))
+        for run in _CJK.findall(blob):
+            candidates.append(run)
+            if len(run) >= 3:
+                candidates.append(run[-2:])
+            if len(run) >= 4:
+                candidates.append(run[-3:])
+        candidates.extend(_TAG.findall(blob))
+        for word in candidates:
             value = word.strip().lower() if word.isascii() else word.strip()
             if not value or value in _STOP_WORDS or value in words:
                 continue
@@ -298,3 +311,103 @@ def gate_text(post: dict, tiers: list[dict] | None = None) -> str:
         tail = f"，档位从 {money(low.get('cents') or 0, low.get('currency') or '')} 起" if low else ""
         return f"这期要订阅才能看{tail}；非订阅者看不到正文与封面"
     return "这期是公开帖，不用订阅就能看"
+
+
+_MONTHS = {
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
+}
+
+_ISO_DATE = re.compile(r"(\d{4})-(\d{1,2})-(\d{1,2})")
+# X 那边的 ``Mon Oct 13 15:31:00 +0000 2025``；有的接口把年份省掉。
+_TWEET_DATE = re.compile(r"([A-Za-z]{3})\s+(\d{1,2})\s+\d{1,2}:\d{2}")
+_TWEET_YEAR = re.compile(r"\b(20\d{2})\b")
+
+
+def post_date(text: str, hint: str = "") -> date | None:
+    """把发布时间读成日期。
+
+    X 帖和付费帖的写法不一样：付费页是 ``2026-11-09``，X 是 ``Fri Oct 03
+    13:43:00 +0000 2025``，有的接口还把年份省了。省了年份时用 hint（付费帖的
+    日期）补，补出来比 hint 晚半年以上就往前推一年——上架通知总在该期前后。
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    hit = _ISO_DATE.search(text)
+    if hit:
+        try:
+            return date(int(hit.group(1)), int(hit.group(2)), int(hit.group(3)))
+        except ValueError:
+            return None
+    hit = _TWEET_DATE.search(text)
+    if not hit:
+        return None
+    month = _MONTHS.get(hit.group(1).lower())
+    if not month:
+        return None
+    year_hit = _TWEET_YEAR.search(text)
+    if year_hit:
+        year = int(year_hit.group(1))
+    else:
+        anchor = post_date(hint) or date.today()
+        year = anchor.year
+        try:
+            guess = date(year, month, int(hit.group(2)))
+        except ValueError:
+            return None
+        # 预告只会在这期前后几天发；补出来的日期比这一期还晚一周以上，那就是
+        # 去年那一条（12-06 对 11-09 这期，指的是去年 12 月）。
+        if (guess - anchor).days > 7:
+            year -= 1
+    try:
+        return date(year, month, int(hit.group(2)))
+    except ValueError:
+        return None
+
+
+def pick_teaser(
+    items: list[dict], paid_published: str = "", window: int = 14
+) -> dict | None:
+    """在一堆她自己的公开帖里挑最像「这一期预告」的那条。
+
+    光按关键词对上不够：``from:<号> 妃咲`` 会先撞上上一期「妃咲(兔女郎) 44p」的
+    上架通知，而这期是「万圣节妃咲 106p」——两条都带「妃咲」，指着不同的期。
+    所以再加一道时间的：离这一期发布日近的优先，隔太远的只当顺带看见，文案里
+    要写清是哪天的、不是这期。
+    """
+    if not items:
+        return None
+    anchor = post_date(paid_published)
+    best: dict | None = None
+    best_score = 0.0
+    for item in items:
+        when = post_date(str(item.get("published") or item.get("published_raw") or ""), paid_published)
+        gap = abs((when - anchor).days) if (when and anchor) else None
+        if gap is None:
+            score = 10.0
+        elif gap <= window:
+            score = 100.0 - gap
+        else:
+            score = max(1.0, 20.0 - min(gap, 180) / 10)
+        if str(item.get("kind")) == "announcement":
+            score += 15.0
+        if item.get("has_media"):
+            score += 8.0
+        if score > best_score:
+            best_score = score
+            best = dict(item)
+            best["gap"] = gap
+            best["same_period"] = bool(gap is not None and gap <= window)
+            best["when"] = when.isoformat() if when else ""
+    return best

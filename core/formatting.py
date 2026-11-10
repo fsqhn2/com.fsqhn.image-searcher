@@ -276,8 +276,18 @@ def _paywall_lines(outcome: SearchOutcome) -> list[str]:
     if preview.get("url"):
         title = str(preview.get("title") or "").strip()
         lines.append(f"🎁 免费预览：{title} {preview['url']}".replace("  ", " "))
-    elif post.get("url"):
-        lines.append(f"🔒 {paywall.gate_text(post, tiers)}")
+    else:
+        teaser = info.get("teaser") or {}
+        if teaser.get("url"):
+            when = str(teaser.get("when") or "").strip()
+            if teaser.get("same_period"):
+                lines.append(f"🎁 免费预告：{teaser['url']}（这一期她自己在 X 上发的，不一定是同一张）")
+            elif when:
+                lines.append(f"🔎 顺带看到：{teaser['url']}（她 X 上 {when} 提到过这个角色，不是这一期）")
+            else:
+                lines.append(f"🔎 顺带看到：{teaser['url']}（她 X 上提到过这个角色，不一定是这一期）")
+        elif post.get("url"):
+            lines.append(f"🔒 {paywall.gate_text(post, tiers)}")
     return lines
 
 

@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "com.fsqhn.image-searcher",
-  "version": "0.7.76",
+  "version": "0.7.78",
   "name": "麦麦寻人",
   "description": "把群里的图片反查原始出处与社交账号：Google Lens / Yandex / 百度 / SauceNAO 多引擎搜索，用图片指纹验证是否同一张图；指纹全灭时并行走视觉复核与 Grok 核对候选。也可以叫「麦麦找鸡」——本质一样，都是搜图，都是按图找出处、找人。输出平台、匹配方式、名字与账号，并附 AI 生成概率参考。",
   "author": {

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import date
 
 from core import paywall
 
@@ -36,6 +37,12 @@ class KeywordTest(unittest.TestCase):
         words = paywall.keywords("https://x.com/oioioi525/status/1 cosplay")
         self.assertNotIn("cosplay", words)
         self.assertNotIn("https", words)
+
+    def test_cjk_run_also_yields_character_name(self) -> None:
+        """``万圣节妃咲`` 整串搜不到，得能拆出末尾的角色名。"""
+        words = paywall.keywords("万圣节妃咲 ミサキ（ハロウィン）106p")
+        self.assertIn("万圣节妃咲", words)
+        self.assertIn("妃咲", words)
 
 
 class PatreonParseTest(unittest.TestCase):
@@ -163,6 +170,63 @@ class GateTextTest(unittest.TestCase):
     def test_money_units(self) -> None:
         self.assertEqual(paywall.money(5500, "HKD"), "HK$55")
         self.assertEqual(paywall.money(4000, "JPY"), "¥4,000")
+
+
+class PostDateTest(unittest.TestCase):
+    def test_iso_date(self) -> None:
+        self.assertEqual(paywall.post_date("2026-11-09"), date(2026, 11, 9))
+
+    def test_tweet_date_with_year(self) -> None:
+        self.assertEqual(
+            paywall.post_date("Fri Oct 03 13:43:00 +0000 2025"), date(2025, 10, 3)
+        )
+
+    def test_tweet_date_without_year_uses_anchor(self) -> None:
+        """X 的搜索结果有时不写年份，用这一期的日期补。"""
+        self.assertEqual(paywall.post_date("Mon Oct 13 15:31", "2026-11-09"), date(2026, 10, 13))
+        # 补出来比这一期晚半年以上，说明是去年那一条。
+        self.assertEqual(paywall.post_date("Fri Dec 06 01:58", "2026-11-09"), date(2025, 12, 6))
+
+    def test_garbage(self) -> None:
+        self.assertIsNone(paywall.post_date(""))
+        self.assertIsNone(paywall.post_date("昨天"))
+
+
+class PickTeaserTest(unittest.TestCase):
+    def _item(self, url: str, published: str, shop: bool = False, media: bool = False) -> dict:
+        return {
+            "url": url,
+            "published_raw": published,
+            "kind": "announcement" if shop else "teaser",
+            "has_media": media,
+        }
+
+    def test_prefers_the_same_period(self) -> None:
+        """同角色两条帖，选离这一期发布日近的那条。"""
+        items = [
+            self._item("https://x.com/a/status/1", "Fri Oct 03 13:43:00 +0000 2025", shop=True),
+            self._item("https://x.com/a/status/2", "Sun Nov 08 12:00:00 +0000 2026", media=True),
+        ]
+        picked = paywall.pick_teaser(items, "2026-11-09")
+        self.assertEqual(picked["url"], "https://x.com/a/status/2")
+        self.assertTrue(picked["same_period"])
+        self.assertEqual(picked["when"], "2026-11-08")
+
+    def test_old_announcement_is_not_same_period(self) -> None:
+        """上一期的上架通知不能算这一期：标成隔得远的那条。"""
+        items = [self._item("https://x.com/a/status/1", "Fri Oct 03 13:43:00 +0000 2025", shop=True)]
+        picked = paywall.pick_teaser(items, "2026-11-09")
+        self.assertFalse(picked["same_period"])
+        self.assertGreater(picked["gap"], 14)
+
+    def test_empty(self) -> None:
+        self.assertIsNone(paywall.pick_teaser([], "2026-11-09"))
+
+    def test_unknown_paid_date_stays_unsure(self) -> None:
+        """这一期没写发布日时，不能断言是这期的预告。"""
+        items = [self._item("https://x.com/a/status/1", "Fri Oct 03 13:43:00 +0000 2025", shop=True)]
+        picked = paywall.pick_teaser(items, "")
+        self.assertFalse(picked["same_period"])
 
 
 if __name__ == "__main__":

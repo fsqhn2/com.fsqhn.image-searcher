@@ -4213,6 +4213,13 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 continue
             if found:
                 found["handle"] = handle
+                try:
+                    teaser = await self._hunt_teaser(handle, words, found.get("post") or {})
+                except Exception as error:  # noqa: BLE001 - 翻不到预告不影响售卖页
+                    self._vlog("免费预告查找失败：%s", str(error)[:80])
+                    teaser = None
+                if teaser:
+                    found["teaser"] = teaser
                 self._vlog(
                     "付费页命中：%s %s → %s",
                     kind,
@@ -4284,6 +4291,52 @@ class ImageSearcherPlugin(MaiBotPlugin):
             if preview is not None and preview.get("url") != post.get("url"):
                 info["preview"] = {"title": preview.get("title"), "url": preview.get("url")}
         return info
+
+    async def _hunt_teaser(
+        self, handle: str, words: list[str], paid_post: dict
+    ) -> dict[str, Any] | None:
+        """去她自己的 X 上翻这一期的公开帖。
+
+        付费页那边读不到正文和封面，能先看的就是她自己发的公开帖。搜索
+        ``from:<号> <作品名>`` 比翻最近的带图帖强：既能捞到窗口外的老帖，也能
+        捞到「我在 FANBOX 发表了 …」这种上架通知（实测 ran3 的妃咲那期就有）。
+
+        但同角色的帖会撞到别的期：妃咲这期的关键词只能搜到上一期「妃咲(兔女郎)
+        44p」的上架通知，指着 10-03 那期。所以命中之后还要按发布时间跟这一期比，
+        隔得远的就降级成「顺带看见」，文案里写清是哪天的，不能当这一期的预告。
+        """
+        handle = (handle or "").strip().lstrip("@")
+        if not handle or not words:
+            return None
+        post_url = str((paid_post or {}).get("url") or "").strip()
+        queries = [word for word in words if len(word) >= 3 or not word.isascii()][:2]
+        seen: set[str] = set()
+        items: list[dict[str, Any]] = []
+        for word in queries:
+            url = fxtwitter.build_search_url(f"from:{handle} {word}")
+            if not url:
+                continue
+            hits, _ = fxtwitter.parse_search(await self._fetch_json(url))
+            for hit in hits:
+                text = hit.text or ""
+                if word.lower() not in text.lower() or not hit.url:
+                    continue
+                if post_url and post_url in text:
+                    continue
+                if hit.url in seen:
+                    continue
+                seen.add(hit.url)
+                shop_link = "fanbox.cc" in text or "patreon.com" in text
+                items.append(
+                    {
+                        "url": hit.url,
+                        "text": " ".join(text.split())[:60],
+                        "published_raw": str(hit.created_at or ""),
+                        "kind": "announcement" if shop_link else "teaser",
+                        "has_media": bool(hit.media),
+                    }
+                )
+        return paywall.pick_teaser(items, str((paid_post or {}).get("published") or ""))
 
     def _identity_texts(self, ordered: list[Candidate]) -> list[str]:
         """已经靠图像对上的那几条候选的名字，用来卡住张冠李戴。

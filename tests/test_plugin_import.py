@@ -37,6 +37,7 @@ class PluginImportTest(unittest.TestCase):
         self.assertTrue(hasattr(plugin_class, "_track_paywall"))
         self.assertTrue(hasattr(plugin_class, "_patreon_track"))
         self.assertTrue(hasattr(plugin_class, "_fanbox_track"))
+        self.assertTrue(hasattr(plugin_class, "_hunt_teaser"))
 
 
 if __name__ == "__main__":

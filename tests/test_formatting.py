@@ -1395,6 +1395,36 @@ class PaywallTest(unittest.TestCase):
         self.assertIn("免费预览", text)
         self.assertNotIn("🔒", text)
 
+    def test_teaser_line_for_same_period(self) -> None:
+        """这一期她自己 X 上发过预告时，给出链接并注明不一定是同一张。"""
+        outcome = self._paid_case()
+        outcome.paywall["teaser"] = {
+            "url": "https://x.com/oioioi525/status/1974108040506069456",
+            "kind": "announcement",
+            "when": "2026-10-03",
+            "same_period": True,
+        }
+        text = formatting._best_block(outcome)
+        self.assertIn("免费预告", text)
+        self.assertIn("这一期", text)
+        self.assertIn("不一定是同一张", text)
+        self.assertNotIn("🔒", text)
+
+    def test_teaser_from_other_period_not_sold_as_preview(self) -> None:
+        """搜到的是上一期的上架通知时，不能写成这一期的免费预告。"""
+        outcome = self._paid_case()
+        outcome.paywall["teaser"] = {
+            "url": "https://x.com/oioioi525/status/1974108040506069456",
+            "kind": "announcement",
+            "when": "2026-10-03",
+            "same_period": False,
+        }
+        text = formatting._best_block(outcome)
+        self.assertIn("顺带看到", text)
+        self.assertIn("2026-10-03", text)
+        self.assertIn("不是这一期", text)
+        self.assertNotIn("免费预告", text)
+
     def test_nothing_when_no_paywall(self) -> None:
         outcome = SearchOutcome(status="not_found", best=None, candidates=[], total_candidates=0)
         self.assertNotIn("售卖页", formatting._best_block(outcome))
