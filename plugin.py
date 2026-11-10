@@ -47,7 +47,7 @@ from .core.extract import (
     x_page_kind,
     x_title_name,
 )
-from .core.gallery import is_gallery_site, parse_source_accounts
+from .core.gallery import is_gallery_site, is_repost_site, parse_source_accounts
 from .core.hashing import dhash, hamming, prepare_upload
 from .core.httpclient import HttpError, download_image_multi, fake_ip_networks, make_session
 from .core.keypool import KeyPool
@@ -326,6 +326,32 @@ class VisionConfig(PluginConfigBase):
         json_schema_extra=_ui(
             "启用视觉复核",
             "默认开。只在整轮没有任何匹配时触发，指纹判定不受影响；关掉后搜不到就直接报没找到。",
+        ),
+    )
+    watermark_on_repost: bool = Field(
+        default=True,
+        description=(
+            "搬运站命中时也读水印：指纹已经命中，但落点是 arca.live、dcinside、reddit、"
+            "贴吧这类社区/搬运站、又没给出账号时，仍然把原图交给视觉模型读一遍水印。"
+            "这类页面往往只是转贴，图上写的水印账号才是唯一还能指到本人的线索；"
+            "只在落点没有账号时触发，读到的水印仍只当线索，不会因此改掉已经命中的那条。"
+        ),
+        json_schema_extra=_ui(
+            "搬运站命中时也读水印",
+            "默认开。命中搬运站时额外跑一次视觉读水印，命中本人的带图帖才会顶掉搬运站那条；"
+            "关掉就沿用原来的行为——有命中就收工，不再花这一次调用。",
+        ),
+    )
+    watermark_variants: bool = Field(
+        default=True,
+        description=(
+            "水印号查无此人时，按近似拼写再试：模型读小字常把 w 读散成 uw／vv，"
+            "这时会生成十来个「像是同一个号」的写法去核，只有那个号自己的带图帖里"
+            "真有这张图才算命中。猜出来的写法不会直接当结论。"
+        ),
+        json_schema_extra=_ui(
+            "水印号查无时按近似拼写再试",
+            "默认开。每单最多试十来个写法，而且必须指纹对得上才采用；关掉就只认读出来的原号。",
         ),
     )
     top_n: int = Field(
@@ -1571,13 +1597,31 @@ class ImageSearcherPlugin(MaiBotPlugin):
         # 指纹一条都没通过时才做兜底：视觉认「同一个人」，Grok 认「X 上的账号」，
         # 两件都不是 dHash 能做的。并行发出，各自超时，谁有结果用谁。
         # 插画路线不走这里：SauceNAO 的相似度已经能定论，没必要再让模型猜。
+        #
+        # 例外：命中的是搬运站/社区站（arca.live、贴吧这类），页面里没有账号，
+        # 只是别人转的图。这时仍读一次水印——图上写的号往往是唯一还能指到本人的
+        # 线索（实测 arca.live 那条距离 0，水印却清楚写着 @Sakana_Yudan）。
+        # 这条由 vision.watermark_on_repost 控制，且只在落点没有账号时触发。
+        had_best = best is not None
+        needs_watermark = bool(
+            had_best
+            and config.vision.watermark_on_repost
+            and best is not None
+            and not (best.handle or "").strip()
+            and is_repost_site(best.url or "", best.platform or "")
+        )
         vision_info: dict[str, Any] | None = None
         grok_info: dict[str, Any] | None = None
-        if best is None and sauce is None and upload:
+        if (best is None or needs_watermark) and sauce is None and upload:
             jobs: dict[str, Any] = {}
             if config.vision.enabled:
-                jobs["vision"] = self._vision_review(upload, ordered)
-            if config.grok.enabled and (config.grok.api_key or "").strip():
+                if needs_watermark:
+                    # 搬运站命中：不做拼图认人，只读原图上的水印——原图能看清小字，
+                    # 而且这里唯一想要的线索就是那个账号。
+                    jobs["vision"] = self._read_watermark(upload)
+                else:
+                    jobs["vision"] = self._vision_review(upload, ordered)
+            if had_best is False and config.grok.enabled and (config.grok.api_key or "").strip():
                 jobs["grok"] = self._grok_lookup(upload, ordered, reply_hint=reply_hint)
             if jobs:
                 results = await asyncio.gather(*jobs.values(), return_exceptions=True)
@@ -1595,11 +1639,19 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 if vision_info is not None:
                     if vision_info.get("error"):
                         self.ctx.logger.warning(
-                            "视觉复核未完成：%s（检查=%s 耗时=%ss 模型=%s）",
+                            "读水印/视觉复核未完成：%s（检查=%s 耗时=%ss 模型=%s）",
                             vision_info["error"],
                             vision_info.get("checked"),
                             vision_info.get("elapsed"),
                             vision_info.get("model") or config.vision.model or config.vision.task,
+                        )
+                    elif needs_watermark:
+                        self._vlog(
+                            "读水印：耗时=%ss 模型=%s 水印=%s 文字=%s",
+                            vision_info.get("elapsed"),
+                            vision_info.get("model") or "-",
+                            vision_info.get("watermark") or "-",
+                            vision_info.get("watermark_text") or "-",
                         )
                     else:
                         self._vlog(
@@ -1611,47 +1663,21 @@ class ImageSearcherPlugin(MaiBotPlugin):
                             vision_info.get("model") or "-",
                             vision_info.get("watermark") or "-",
                         )
-                # 视觉顺带读到的水印只当线索：模型读小字常出错，确认到账号就
-                # 翻它自己的带图帖核实——读对一个真实存在的号、却根本不是作者
-                # 的也见过（实测 @Miharu 是个 2010 年的无关老号）。
-                if vision_info and vision_info.get("watermark"):
-                    handle = vision.handle_from_watermark(vision_info["watermark"])
-                    if handle:
-                        profile = await self._account_profile(handle)
-                        vision_info["watermark_handle"] = handle
-                        if profile.state == fxtwitter.PROFILE_OK:
-                            await self._check_watermark_post(handle, upload, vision_info)
-                        elif profile.state == fxtwitter.PROFILE_SUSPENDED:
-                            suffix = f"（用户 ID {profile.user_id}）" if profile.user_id else ""
-                            if profile.confirmed:
-                                vision_info["watermark_note"] = (
-                                    f"该账号已被 X 封禁{suffix}，主页已经打不开了"
-                                )
-                            else:
-                                vision_info["watermark_note"] = (
-                                    f"X 接口读不到这个号{suffix}，主页能不能打开要自己点一下"
-                                )
-                        self._vlog(
-                            "水印账号核对：@%s 状态=%s id=%s",
-                            handle,
-                            profile.state,
-                            profile.user_id or "-",
-                        )
-                    # Grok 读到另一个号时也核一下存不存在：两个都读错时，用户至少
-                    # 能看出「两个都不靠谱」，不会以为有一个是真的。
-                    other = str((grok_info or {}).get("watermark") or "").strip()
-                    other_handle = vision.handle_from_watermark(other)
-                    if other_handle and other_handle.lower() != handle.lower():
-                        other_profile = await self._account_profile(other_handle)
-                        vision_info["watermark_other"] = {
-                            "raw": other,
-                            "handle": other_handle,
-                            "state": other_profile.state,
-                        }
-                        self._vlog(
-                            "另一个水印核对：@%s 状态=%s", other_handle, other_profile.state
-                        )
-                if vision_info and vision_info.get("picked"):
+                # 视觉和 Grok 读到的水印都只当线索：两个号都拿去翻它自己的带图帖，
+                # 谁翻到这张图谁就是结论。实测 5b5b 那单视觉读成 @Miharu（一个
+                # 无关老号）、Grok 读成 @Moliuwy（w 被读散），真号 @Moliww 两个都
+                # 没读对——所以查无此人时还要按近似拼写再核一遍，命中要求仍是
+                # 「这个号自己的帖子里有这张图」。
+                if vision_info and (
+                    vision_info.get("watermark") or (grok_info or {}).get("watermark")
+                ):
+                    await self._verify_watermarks(
+                        vision_info,
+                        grok_info,
+                        upload,
+                        allow_variants=not had_best,
+                    )
+                if not had_best and vision_info and vision_info.get("picked"):
                     ordered = dedupe_accounts(self._rank(candidates, names))
                     # 模型可能一次报好几格，取指纹距离最近的那条当结论——距离近说明
                     # 画面本来就更像，比编号顺序更靠谱。
@@ -2169,6 +2195,98 @@ class ImageSearcherPlugin(MaiBotPlugin):
         )
         return info
 
+    async def _read_watermark(self, upload: bytes | None) -> dict[str, Any]:
+        """只读原图上的水印：命中搬运站时，这一步比再拼一次对照图更值得。
+
+        拼图里 TARGET 格只有 320px，手写体小字经常被压没——实测同一张纳西妲
+        cos，拼图那次模型回空串，原图直接发过去就能读出「魚蛋 Sakana /
+        @Sakana_Yudan」。返回结构跟视觉复核一致，后面那条水印核对链路原样接。
+        """
+        section = self.config.vision
+        info: dict[str, Any] = {
+            "ok": False,
+            "checked": 0,
+            "picked": [],
+            "picked_images": [],
+            "downgraded": 0,
+            "reason": "",
+            "model": "",
+            "error": "",
+            "elapsed": 0.0,
+            "sources": [],
+            "watermark": "",
+        }
+        if not upload:
+            info["error"] = "没有原图，读不了水印"
+            return info
+
+        started = time.monotonic()
+        try:
+            data_url, width, height = await asyncio.to_thread(vision.data_url_for, upload)
+        except Exception as error:  # noqa: BLE001 - 编码失败只影响这一步
+            info["error"] = f"原图编码失败：{str(error)[:60]}"
+            return info
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": vision.build_watermark_prompt()},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }
+        ]
+        timeout = max(10, int(section.timeout))
+        options: dict[str, Any] = {
+            "prompt": messages,
+            "task_name": section.task or "vlm",
+            "temperature": 0.1,
+            # 只抄文字，不需要长回答；给太多额度反而容易开始描述画面。
+            "max_tokens": 300,
+        }
+        if section.model:
+            options["model_name"] = section.model
+        try:
+            result = await asyncio.wait_for(
+                self.ctx.call_capability("llm.generate", timeout_ms=timeout * 1000, **options),
+                timeout=timeout + 5,
+            )
+        except asyncio.TimeoutError:
+            info["error"] = f"读水印 {timeout} 秒内没返回"
+            info["elapsed"] = round(time.monotonic() - started, 1)
+            self.ctx.logger.warning("读水印超时：等待=%.1fs 超时=%ss", info["elapsed"], timeout)
+            return info
+        except Exception as error:  # noqa: BLE001
+            info["error"] = f"读水印调用失败：{str(error)[:80]}"
+            info["elapsed"] = round(time.monotonic() - started, 1)
+            self.ctx.logger.warning("读水印失败：%s", error)
+            return info
+
+        payload = result if isinstance(result, dict) else {"success": True, "response": str(result or "")}
+        info["elapsed"] = round(time.monotonic() - started, 1)
+        if not payload.get("success", True):
+            info["error"] = f"读水印返回失败：{str(payload.get('error'))[:80]}"
+            return info
+        info["ok"] = True
+        info["model"] = str(payload.get("model_name") or payload.get("model") or "")
+        text = str(payload.get("response") or payload.get("reasoning") or "")
+        if not text:
+            info["error"] = "读水印返回空内容"
+            return info
+        parsed = vision.parse_watermark_reply(text)
+        info["watermark"] = parsed["account"] or parsed["text"]
+        info["watermark_text"] = parsed["text"]
+        self.ctx.logger.info(
+            "读水印：%sx%s 模型=%s 文字=%s 账号=%s 耗时=%.1fs",
+            width,
+            height,
+            info["model"] or "未返回",
+            parsed["text"] or "无",
+            parsed["account"] or "无",
+            info["elapsed"],
+        )
+        return info
+
     _GALLERY_MAX_PAGES = 2
 
     async def _gallery_sources(self, items: list[Candidate]) -> list[dict[str, Any]]:
@@ -2458,7 +2576,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
             # 只知道账号、或者它给的帖子对不上时，去翻这个号自己的带图帖子：
             # 转发不进那个列表，命中的一定是它亲手发的，而且直接给出帖子地址。
             found = await self._media_lookup(info["handle"], upload)
-            if found:
+            if found and found.get("url"):
                 info["tier"] = "post"
                 info["post_url"] = found["url"]
                 info["verified"] = "hit"
@@ -2672,10 +2790,13 @@ class ImageSearcherPlugin(MaiBotPlugin):
     ) -> Candidate | None:
         """水印核对到本人发过这张图时，把它当成结论。
 
-        只在原本没有结论时才用：这条证据是「作者的带图帖里指纹对上」，比视觉
-        认人硬；但已经有 match 时不该被它顶掉。
+        这条证据是「作者的带图帖里指纹对上」，比视觉认人硬；已经有结论时不该被
+        它顶掉。唯一的例外是结论本身落在搬运站/社区站又没有账号（只是别人转的
+        图，例如 arca.live 那条距离 0 的帖子）——作者本人的带图帖显然更该当结论。
         """
-        if best is not None or not vision_info:
+        if not vision_info:
+            return best
+        if best is not None and not self._is_repost_result(best):
             return best
         post = str(vision_info.get("watermark_post") or "").strip()
         handle = str(vision_info.get("watermark_handle") or "").strip()
@@ -2689,10 +2810,19 @@ class ImageSearcherPlugin(MaiBotPlugin):
             url=post,
             platform="X (Twitter)",
             handle=account,
+            name=str(vision_info.get("watermark_name") or ""),
             distance=distance,
             status="match",
             note=f"图上水印核对：{account} 自己的带图帖里有这张图（距离 {distance}）",
         )
+
+    def _is_repost_result(self, item: Candidate | None) -> bool:
+        """这条结论是不是「别人转发的页面」：落点是搬运站/社区站且没给出账号。"""
+        if item is None:
+            return False
+        if (item.handle or "").strip():
+            return False
+        return is_repost_site(item.url or "", item.platform or "")
 
     async def _check_watermark_post(
         self, handle: str, upload: bytes | None, vision_info: dict[str, Any]
@@ -2710,11 +2840,31 @@ class ImageSearcherPlugin(MaiBotPlugin):
             vision_info["watermark_note"] = "这个号存在，但没有原图，没法核对它发没发过"
             return
         vision_info["watermark_handle"] = handle
+        vision_info["watermark_url"] = f"https://x.com/{handle}"
         hit = await self._media_lookup(handle, upload)
-        if hit:
+        if hit and hit.get("error"):
+            # 一次 5xx／超时可能只是接口抽风，先原样再试一次。
+            self._vlog("翻 @%s 的带图帖子失败，重试一次：%s", handle, hit["error"])
+            hit = await self._media_lookup(handle, upload)
+        if not (hit and hit.get("url")):
+            # /media 只看得到最近十几条，老图翻不到；搜索那边有时还留着一条，
+            # 用 ``from:<号> filter:images`` 再翻一页做兜底。
+            fallback = await self._search_media_lookup(handle, upload)
+            if fallback and fallback.get("url"):
+                hit = fallback
+            elif fallback and fallback.get("error") and not (hit and hit.get("error")):
+                hit = fallback
+        if hit and hit.get("error"):
+            # 拉取失败和「翻到了但没有」是两件事：接口 404/超时的时候不能写成
+            # 「最近没有这张」，那等于把一次没查成当成了否定证据。
+            vision_info["watermark_note"] = (
+                f"这次没翻成它的帖子（{hit['error']}），不能据此说没有"
+            )
+            self._vlog("水印核对没翻成：@%s（%s）", handle, hit["error"])
+            return
+        if hit and hit.get("url"):
             distance = int(hit.get("distance") or 0)
             post = str(hit.get("url") or "")
-            vision_info["watermark_url"] = f"https://x.com/{handle}"
             vision_info["watermark_post"] = post
             vision_info["watermark_distance"] = distance
             vision_info["watermark_note"] = (
@@ -2723,9 +2873,235 @@ class ImageSearcherPlugin(MaiBotPlugin):
             self._vlog("水印核对命中：@%s → %s（距离 %s）", handle, post, distance)
             return
         vision_info["watermark_note"] = (
-            f"@{handle} 这个号存在，但最近十几条带图帖里没有这张，可能是模型读错了"
+            "最近十几条带图帖和搜索结果里都没有这张，可能是模型读错了"
         )
         self._vlog("水印核对没命中：@%s", handle)
+
+    # 近似写法最多试这么多个：每个都是一次 profile 请求，试太多会把兜底拖成
+    # 几十秒，而真能对上的写法通常就在前几个（w 读散、少一个字母这类）。
+    _VARIANT_LIMIT = 18
+
+    async def _verify_watermarks(
+        self,
+        vision_info: dict[str, Any],
+        grok_info: dict[str, Any] | None,
+        upload: bytes | None,
+        *,
+        allow_variants: bool,
+    ) -> None:
+        """把两个模型读到的水印都核一遍，谁翻到这张图谁就是结论。
+
+        只核「号存不存在」是不够的：``@Miharu`` 确实存在，可是个 2010 年的无关
+        老号；``@Moliuwy`` 查无此人，真正的 ``@Moliww`` 就是这么漏掉的。所以这里
+        对每个读法都走一遍「核账号 → 翻它自己的带图帖比指纹」，查无此人时还可以
+        按近似拼写再找（仍要指纹对得上）。
+        """
+        readings: list[dict[str, Any]] = []
+        raw = str(vision_info.get("watermark") or "").strip()
+        handle = vision.handle_from_watermark(raw)
+        if handle:
+            readings.append({"source": "vision", "raw": raw, "handle": handle})
+        other_raw = str((grok_info or {}).get("watermark") or "").strip()
+        other_handle = vision.handle_from_watermark(other_raw)
+        if other_handle and all(item["handle"].lower() != other_handle.lower() for item in readings):
+            readings.append({"source": "grok", "raw": other_raw, "handle": other_handle})
+        if not readings:
+            return
+
+        checked = await asyncio.gather(
+            *(self._verify_watermark_reading(item, upload, allow_variants) for item in readings),
+            return_exceptions=True,
+        )
+        results: list[dict[str, Any]] = []
+        for item, result in zip(readings, checked):
+            if isinstance(result, BaseException):
+                self.ctx.logger.warning("水印核对异常：@%s %s", item["handle"], result)
+                continue
+            results.append(result)
+        if not results:
+            return
+        vision_info["watermark_readings"] = results
+
+        primary = next((item for item in results if item.get("post")), None)
+        if primary is None:
+            primary = next(
+                (item for item in results if item.get("source") == "vision"), results[0]
+            )
+        vision_info["watermark"] = primary.get("raw") or ""
+        vision_info["watermark_handle"] = primary.get("handle") or ""
+        vision_info["watermark_url"] = primary.get("url") or ""
+        vision_info["watermark_state"] = primary.get("state") or ""
+        vision_info["watermark_user_id"] = primary.get("user_id") or ""
+        if primary.get("name"):
+            vision_info["watermark_name"] = primary["name"]
+        if primary.get("note"):
+            vision_info["watermark_note"] = primary["note"]
+        if primary.get("post"):
+            vision_info["watermark_post"] = primary["post"]
+            vision_info["watermark_distance"] = primary.get("distance") or 0
+        if primary.get("fixed"):
+            # 记下「读成什么、最后核到哪个」，文案里要讲清楚这次是读偏了。
+            vision_info["watermark_fixed_from"] = primary.get("from") or ""
+        for item in results:
+            if item is primary:
+                continue
+            vision_info["watermark_other"] = {
+                "raw": item.get("raw") or "",
+                "handle": item.get("handle") or "",
+                "state": item.get("state") or "",
+                "source": item.get("source") or "",
+            }
+            break
+        self._vlog(
+            "水印核对：%s",
+            "；".join(
+                f"{item.get('source')}=@{(item.get('fixed') or item.get('handle'))}"
+                f"({item.get('state')}{'，命中' if item.get('post') else ''})"
+                for item in results
+            ),
+        )
+
+    async def _verify_watermark_reading(
+        self,
+        reading: dict[str, Any],
+        upload: bytes | None,
+        allow_variants: bool,
+    ) -> dict[str, Any]:
+        """核一个水印读法：先看号在不在，在就翻它的带图帖比这张图。"""
+        handle = str(reading.get("handle") or "")
+        info: dict[str, Any] = {
+            "source": reading.get("source") or "",
+            "raw": reading.get("raw") or "",
+            "handle": handle,
+            "url": f"https://x.com/{handle}",
+            "state": "unknown",
+            "user_id": "",
+            "name": "",
+            "post": "",
+            "distance": None,
+            "note": "",
+            "fixed": "",
+            "from": "",
+        }
+        try:
+            profile = await self._account_profile(handle)
+        except Exception as error:  # noqa: BLE001 - 核不到只影响这一条线索
+            self.ctx.logger.warning("水印账号核对失败：@%s %s", handle, error)
+            info["note"] = "这个号这次没核成"
+            return info
+
+        info["state"] = profile.state
+        info["user_id"] = profile.user_id or ""
+        info["name"] = profile.name or ""
+        if profile.handle:
+            # 用 X 上真实的书写形式（Moliww 而不是读出来的 moliwy），显示时别让
+            # 用户以为拼错了。
+            info["handle"] = profile.handle
+            info["url"] = f"https://x.com/{profile.handle}"
+        if profile.state == fxtwitter.PROFILE_OK:
+            holder: dict[str, Any] = {}
+            await self._check_watermark_post(handle, upload, holder)
+            info["note"] = str(holder.get("watermark_note") or "")
+            info["post"] = str(holder.get("watermark_post") or "")
+            if holder.get("watermark_distance") is not None:
+                info["distance"] = int(holder["watermark_distance"])
+            self._vlog(
+                "水印号核对：@%s（%s）状态=%s id=%s 命中=%s",
+                handle,
+                info["source"],
+                profile.state,
+                profile.user_id or "-",
+                info["post"] or "无",
+            )
+            return info
+
+        if profile.state == fxtwitter.PROFILE_MISSING and allow_variants:
+            found = await self._variant_watermark(handle, upload)
+            if found:
+                info["from"] = handle
+                info["fixed"] = found["handle"]
+                info["handle"] = found["handle"]
+                info["url"] = f"https://x.com/{found['handle']}"
+                info["state"] = fxtwitter.PROFILE_OK
+                info["user_id"] = found.get("user_id") or ""
+                info["name"] = found.get("name") or ""
+                info["post"] = found.get("post") or ""
+                info["distance"] = found.get("distance")
+                info["note"] = str(found.get("note") or "")
+                return info
+
+        if profile.state == fxtwitter.PROFILE_SUSPENDED:
+            suffix = f"（用户 ID {profile.user_id}）" if profile.user_id else ""
+            if profile.confirmed:
+                info["note"] = f"该账号已被 X 封禁{suffix}，主页已经打不开了"
+            else:
+                info["note"] = f"X 接口读不到这个号{suffix}，主页能不能打开要自己点一下"
+        elif profile.state == fxtwitter.PROFILE_MISSING:
+            info["note"] = "查无此号"
+        else:
+            info["note"] = "这个号这次没核成"
+        self._vlog(
+            "水印号核对：@%s（%s）状态=%s id=%s",
+            handle,
+            info["source"],
+            profile.state,
+            profile.user_id or "-",
+        )
+        return info
+
+    async def _variant_watermark(
+        self, handle: str, upload: bytes | None
+    ) -> dict[str, Any] | None:
+        """号名被读散时按近似写法再找一遍，只认「它自己的帖子里有这张图」。
+
+        猜写法本身不安全，所以门槛只有一道、而且很硬：候选号的带图帖里必须
+        真有这张图。这样就算猜错，也不会把别人的主页摆成作者。
+        """
+        if not upload or not handle:
+            return None
+        if not bool(getattr(self.config.vision, "watermark_variants", True)):
+            return None
+        variants = handles.typo_variants(handle, limit=self._VARIANT_LIMIT)
+        if not variants:
+            return None
+
+        semaphore = asyncio.Semaphore(6)
+
+        async def probe(name: str) -> tuple[str, fxtwitter.Profile] | None:
+            async with semaphore:
+                try:
+                    return name, await asyncio.wait_for(self._account_profile(name), timeout=12)
+                except Exception:  # noqa: BLE001 - 单个写法超时不影响其他
+                    return None
+
+        results = await asyncio.gather(*(probe(name) for name in variants), return_exceptions=True)
+        alive = [
+            item
+            for item in results
+            if isinstance(item, tuple) and item[1].state == fxtwitter.PROFILE_OK
+        ]
+        if not alive:
+            self._vlog("水印近似写法：试了 %s 个，没有对上的号", len(variants))
+            return None
+        for name, profile in alive[:3]:
+            holder: dict[str, Any] = {}
+            await self._check_watermark_post(name, upload, holder)
+            if holder.get("watermark_post"):
+                self._vlog(
+                    "水印近似写法命中：%s → @%s %s", handle, name, holder["watermark_post"]
+                )
+                return {
+                    "handle": profile.handle or name,
+                    "user_id": profile.user_id or "",
+                    "name": profile.name or "",
+                    "post": holder["watermark_post"],
+                    "distance": holder.get("watermark_distance"),
+                    "note": holder.get("watermark_note") or "",
+                }
+        self._vlog(
+            "水印近似写法：试了 %s 个，对上 %s 个，都没翻到这张图", len(variants), len(alive)
+        )
+        return None
 
     async def _account_profile(self, handle: str) -> fxtwitter.Profile:
         """查账号在 X 上的状态与数字 ID：ok / missing / suspended / unknown。
@@ -2866,7 +3242,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
             payload = await asyncio.wait_for(asyncio.to_thread(fetch), timeout=timeout + 4)
         except Exception as error:  # noqa: BLE001 - 翻不到就不翻，别影响已经拿到的结论
             self._vlog("翻 @%s 的带图帖子失败：%s", handle, str(error)[:80])
-            return None
+            # 分清「没翻到」和「没翻成」：上层据此决定写「最近没有」还是
+            # 「这次没查成」，后者不能当成否定证据。
+            return {"error": str(error)[:80]}
         posts = fxtwitter.parse_media_list(payload)
         if not posts:
             self._vlog("翻 @%s 的带图帖子：一条都没拿到", handle)
@@ -2891,6 +3269,56 @@ class ImageSearcherPlugin(MaiBotPlugin):
             "翻 @%s 的带图帖子：%s 条，结论=%s",
             handle,
             len(posts),
+            f"命中 distance={best['distance']}" if best else "没有这张图",
+        )
+        return best
+
+    # 搜索兜底：/media 只给最近十几条，老图翻不到时用搜索再捞一遍。
+    _SEARCH_SCAN_PAGES = 2
+    _SEARCH_SCAN_POSTS = 20
+
+    async def _search_media_lookup(self, handle: str, upload: bytes | None) -> dict[str, Any] | None:
+        """用 ``from:<号> filter:images`` 搜这个号发过的图，逐张比指纹。
+
+        ``/2/profile/<号>/media`` 只回最近十几条，水印读到的号要是很久以前发的，
+        那条路永远翻不到；X 的搜索索引有时还留着，命中同样给出帖子地址。
+        """
+        mine = dhash(upload) if upload else None
+        if mine is None or not handle:
+            return None
+        query = f"from:{handle} filter:images"
+        state: dict[str, Any] = {}
+        hits: list[fxtwitter.SearchHit] = []
+        cursor = ""
+        for _ in range(self._SEARCH_SCAN_PAGES):
+            page = await asyncio.to_thread(self._search_page, query, cursor, state)
+            if not page:
+                if not hits:
+                    return {"error": "搜索没返回结果"}
+                break
+            items, cursor = page
+            hits.extend(items)
+            if state.get("throttled") or not cursor:
+                break
+        if not hits:
+            return None
+        threshold = self.config.plugin.hash_threshold
+        best: dict[str, Any] | None = None
+        for hit in hits[: self._SEARCH_SCAN_POSTS]:
+            for link in hit.media[: self._MEDIA_SCAN_IMAGES]:
+                raw = await self._download(link)
+                if not raw:
+                    continue
+                other = dhash(raw)
+                if other is None:
+                    continue
+                distance = hamming(mine, other)
+                if distance <= threshold and (best is None or distance < best["distance"]):
+                    best = {"url": hit.url, "distance": distance, "created_at": hit.created_at}
+        self._vlog(
+            "搜索翻 @%s：%s 条，%s",
+            handle,
+            len(hits),
             f"命中 distance={best['distance']}" if best else "没有这张图",
         )
         return best
@@ -3182,7 +3610,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
         if not handle:
             return best
         hit = await self._media_lookup(handle, upload)
-        if hit:
+        if hit and hit.get("url"):
             # 翻到的那条是拿原图逐张比过指纹才命中的（_media_lookup 只在
             # distance <= hash_threshold 时返回），这里已经是「同一张图」而不是
             # 「同一个人」的猜测：状态必须跟着升成 match，否则外面还会按视觉结论

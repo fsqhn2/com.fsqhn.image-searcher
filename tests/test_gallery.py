@@ -29,6 +29,27 @@ class GallerySiteTest(unittest.TestCase):
         self.assertFalse(gallery.is_gallery_site("https://4play.to.evil.com/x"))
 
 
+class RepostSiteTest(unittest.TestCase):
+    def test_community_boards_count_as_repost(self):
+        """arca.live 那单：距离 0 的帖子只是别人转的图，页面里没有账号。"""
+        self.assertTrue(gallery.is_repost_site("https://arca.live/b/genshin/188444947?category=짤&p=1"))
+        self.assertTrue(gallery.is_repost_site(platform="arca.live"))
+        self.assertTrue(gallery.is_repost_site("https://tieba.baidu.com/p/123"))
+        self.assertTrue(gallery.is_repost_site("https://www.reddit.com/r/cosplay/x"))
+
+    def test_gallery_hosts_also_count(self):
+        self.assertTrue(gallery.is_repost_site("https://4play.to/koleksi/235/1847"))
+
+    def test_author_pages_are_not_repost(self):
+        self.assertFalse(gallery.is_repost_site("https://x.com/Sakana_Yudan/status/2118497064795729951"))
+        self.assertFalse(gallery.is_repost_site("https://www.instagram.com/p/DQo68QHkx0G/"))
+        self.assertFalse(gallery.is_repost_site(""))
+
+    def test_lookalike_hosts_do_not_match(self):
+        self.assertFalse(gallery.is_repost_site("https://arca.live.evil.com/b/1"))
+        self.assertFalse(gallery.is_repost_site("https://notarca.live/b/1"))
+
+
 class SourceAccountTest(unittest.TestCase):
     def test_picks_the_most_linked_account(self):
         """4play 那单的真实形状：图集里每张缩略图都链向同一个 IG。"""

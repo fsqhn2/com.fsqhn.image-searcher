@@ -28,6 +28,19 @@ GALLERY_HOSTS = (
     "yuemeinv.com",
 )
 
+# 社区、论坛、搬运性质的站点：这类页面自己也贴别人的图，图上还有没有水印、
+# 水印写的是谁，往往比页面本身有用。实测 arca.live 那条「나히다 코스프레」跟
+# 原图 dHash 距离 0，页面里却一个来源账号都没有，只写着杂物分类（짤）。
+REPOST_HOSTS = (
+    "arca.live",
+    "dcinside.com",
+    "reddit.com",
+    "tieba.baidu.com",
+    "bbs.nga.cn",
+    "ngabbs.com",
+    "5ch.net",
+)
+
 # 这些路径不是账号名。
 _IG_RESERVED = {
     "p",
@@ -81,6 +94,23 @@ def is_gallery_site(url: str = "", platform: str = "") -> bool:
     for item in hosts:
         item = item.removeprefix("www.")
         if item and any(item == token or item.endswith("." + token) for token in GALLERY_HOSTS):
+            return True
+    return False
+
+
+def is_repost_site(url: str = "", platform: str = "") -> bool:
+    """这个落点是不是搬运 / 社区站：图集站也算，它们同样不是作者主页。"""
+    if is_gallery_site(url, platform):
+        return True
+    hosts: list[str] = []
+    host = (url or "").split("://", 1)[-1].split("/", 1)[0].rsplit("@", 1)[-1].split(":")[0]
+    if host:
+        hosts.append(host.strip().lower())
+    if platform:
+        hosts.append(str(platform).strip().lower())
+    for item in hosts:
+        item = item.removeprefix("www.")
+        if item and any(item == token or item.endswith("." + token) for token in REPOST_HOSTS):
             return True
     return False
 

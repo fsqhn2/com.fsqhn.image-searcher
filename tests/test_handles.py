@@ -158,3 +158,26 @@ class BlockedSourceTest(unittest.TestCase):
         self.assertFalse(handles.is_blocked_source("galleryepic.com"))
         self.assertFalse(handles.is_blocked_source("masterfap.net"))
         self.assertFalse(handles.is_blocked_source(""))
+
+
+class TypoVariantTest(unittest.TestCase):
+    """水印号被读散时的候选写法：Moliww 被读成 Moliuwy 这种要能找回来。"""
+
+    def test_w_read_as_uw(self) -> None:
+        self.assertIn("moliww", handles.typo_variants("Moliuwy"))
+
+    def test_most_likely_variant_first(self) -> None:
+        """w 读散是最常见的错法，应该排在最前面，少发几次请求。"""
+        self.assertEqual(handles.typo_variants("Moliuwy")[0], "moliww")
+
+    def test_original_not_included(self) -> None:
+        self.assertNotIn("moliuwy", handles.typo_variants("Moliuwy"))
+
+    def test_invalid_handle_gives_nothing(self) -> None:
+        self.assertEqual(handles.typo_variants("ab"), [])
+        self.assertEqual(handles.typo_variants("中文昵称"), [])
+        self.assertEqual(handles.typo_variants(""), [])
+
+    def test_limit_applies(self) -> None:
+        self.assertLessEqual(len(handles.typo_variants("menruinyanko", limit=5)), 5)
+

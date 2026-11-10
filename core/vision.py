@@ -87,6 +87,71 @@ def build_prompt(count: int) -> str:
     return PROMPT_TEMPLATE.format(count=count)
 
 
+# 单独读水印用。拼图里 TARGET 格只有 320px，图上那种手写体小字常被压没——
+# 实测同一个人物照，拼图版模型回空串，原图版能读出「魚蛋 Sakana / @Sakana_Yudan」。
+WATERMARK_PROMPT = """请把这张图上出现的所有文字逐字抄下来。
+
+重点看这些位置：四角、上下边缘、半透明的浅色小字、边框里的署名、贴纸与角标。
+常见的形态是社交账号（``@xxx``、``x.com/xxx``、``instagram.com/xxx``）、摄影师或
+画师的署名、网址、日期。
+
+规则：
+- 只抄图上真实存在的字，看不清、认不全就留空，不要猜，不要补全；
+- 不要描述画面内容，不要判断这是什么角色、穿什么衣服；
+- 如果同一个账号出现多次，只抄一次。
+
+只输出一行 JSON，不要任何解释与代码块：
+{{"text": "图上所有文字，没有就空串", "account": "看到的社交账号，没有就空串"}}
+"""
+
+
+def build_watermark_prompt() -> str:
+    return WATERMARK_PROMPT
+
+
+def data_url_for(raw: bytes, *, max_side: int = 1600) -> tuple[str, int, int]:
+    """把原图缩到能看清字的大小再编码成 data URL。
+
+    太大会把 token 花在像素上；1600 的长边对小字水印够用了，实测 2048 的
+    原图缩到这里仍能读出角落的账号。
+    """
+    image = _decode(raw)
+    if image is None:
+        raise ValueError("图片解码失败")
+    width, height = image.size
+    scale = min(1.0, float(max_side) / max(width, height))
+    if scale < 1.0:
+        image = image.resize((max(1, int(width * scale)), max(1, int(height * scale))))
+    buffer = io.BytesIO()
+    image.convert("RGB").save(buffer, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+    return (
+        "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii"),
+        image.width,
+        image.height,
+    )
+
+
+def parse_watermark_reply(text: str) -> dict[str, str]:
+    """读水印那次调用的返回：{'text': 原文, 'account': 账号}，读不到就是空串。"""
+    match = _JSON_BLOCK.search(_FENCE.sub("", text or ""))
+    if not match:
+        return {"text": "", "account": ""}
+    try:
+        payload = json.loads(match.group(0))
+    except Exception:  # noqa: BLE001
+        return {"text": "", "account": ""}
+    if not isinstance(payload, dict):
+        return {"text": "", "account": ""}
+    result = {}
+    for key in ("text", "account"):
+        value = str(payload.get(key) or "").strip().strip("\"'“”").strip()
+        lowered = value.lower()
+        if value and len(value) <= 8 and any(lowered.startswith(word) for word in _WATERMARK_EMPTY):
+            value = ""
+        result[key] = value[:120]
+    return result
+
+
 # 电商/商品页域名。视觉模型看「同款格裙、黑丝、小皮鞋」很容易把卖同款衣服的
 # 商品图当成同一个人，实测一次命中 3 条全是速卖通的连裤袜商品页。这类结果只
 # 能当参考，不能进结论。

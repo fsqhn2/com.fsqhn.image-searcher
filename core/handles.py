@@ -70,6 +70,66 @@ def stem(handle: str) -> str:
     return re.sub(r"[_\d]+$", "", (handle or "").lower())
 
 
+# 模型读水印时最常见的错法就是把 w 读散：w 本来就是两个 u，
+# 小字／手写体上很容易变成 uw、vv、uu，末尾再拖一个 y。
+_LIGATURES = (
+    ("uwy", "ww"),
+    ("uw", "w"),
+    ("vv", "w"),
+    ("uu", "w"),
+    ("vw", "w"),
+    ("wy", "ww"),
+)
+
+# 字形相近的替换，只收真会看错的那几组，别把候选量放飞到几十个请求。
+_CONFUSIONS = {
+    "y": "w",
+    "w": "y",
+    "v": "u",
+    "u": "v",
+    "n": "m",
+    "m": "n",
+    "i": "l",
+    "l": "i",
+    "o": "0",
+    "0": "o",
+    "s": "5",
+    "5": "s",
+}
+
+_HANDLE_OK = re.compile(r"[a-z0-9_]{3,15}")
+
+
+def typo_variants(handle: str, limit: int = 18) -> list[str]:
+    """水印号读错时值得再试的写法，按可信度排序。
+
+    实测 ``Moliww`` 被读成 ``Moliuwy``（w 读散成 uw、末尾再读成 y），拿这个错号
+    去查自然是查无此人，答案就漏了。这里只生成「像是同一个号」的写法，能不能
+    用不由这里定：调用方要拿每个候选去核它自己的带图帖，翻到这张图才能当结论。
+    """
+    raw = (handle or "").strip().lstrip("@").lower()
+    if not _HANDLE_OK.fullmatch(raw):
+        return []
+    out: list[str] = []
+
+    def add(value: str) -> None:
+        if value and value != raw and _HANDLE_OK.fullmatch(value) and value not in out:
+            out.append(value)
+
+    for old, new in _LIGATURES:
+        if old in raw:
+            add(raw.replace(old, new))
+    for index in range(len(raw)):
+        add(raw[:index] + raw[index + 1 :])
+    for index in range(len(raw) - 1):
+        add(raw[:index] + raw[index + 1] + raw[index] + raw[index + 2 :])
+    for index, char in enumerate(raw):
+        replacement = _CONFUSIONS.get(char)
+        if replacement:
+            add(raw[:index] + replacement + raw[index + 1 :])
+    return out[: max(1, limit)]
+
+
 def in_url_slug(name: str, urls: list[str]) -> bool:
     """这个名字是不是出现在候选 URL 里（搬运站的路径通常就是它认定的主人名）。
 

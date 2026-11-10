@@ -1124,5 +1124,131 @@ class DowngradedNearMissTest(unittest.TestCase):
         return task
 
 
+class ResultPresentationTest(unittest.TestCase):
+    """首次回复只给结论，「怎么找的」留在「更多」里。"""
+
+    def _task(self) -> SearchTask:
+        best = Candidate(
+            engine="lens",
+            url="https://x.com/hinatahimarii/status/2118658490315276514",
+            platform="X (Twitter)",
+            handle="@hinatahimarii",
+            name="土狗小黄",
+            distance=0,
+            status="match",
+            note="指纹一致（距离 0）：这是 @wn40536699 的回复页，顺着她的回复找到原帖在 @hinatahimarii 名下",
+        )
+        outcome = SearchOutcome(status="ok", best=best, candidates=[best], route="photo")
+        task = SearchTask(task_id="s-test", stream_id="s1", user_id="u1")
+        task.status = "done"
+        task.outcome = outcome
+        return task
+
+    def test_first_reply_hides_the_search_path(self) -> None:
+        text = build_text_summary(self._task(), command="麦麦搜图", show_reference=True, limit=3)
+        self.assertIn("指纹一致（距离 0）", text)
+        self.assertNotIn("回复页", text)
+        self.assertNotIn("匹配路线", text)
+
+    def test_more_keeps_the_full_note(self) -> None:
+        nodes = build_forward_nodes(
+            self._task(), command="麦麦搜图", show_reference=True, limit=3, replay=True
+        )
+        text = "\n".join(
+            str(part.get("content"))
+            for node in nodes
+            for part in node.get("content") or []
+            if part.get("type") == "text"
+        )
+        self.assertIn("回复页", text)
+        self.assertIn("匹配路线", text)
+
+    def test_first_reply_footer_has_no_route(self) -> None:
+        blocks = build_result_forwards(self._task(), command="麦麦搜图", show_reference=True, limit=3)
+        nodes = [node for block in blocks for node in block]
+        text = "\n".join(
+            str(part.get("content"))
+            for node in nodes
+            for part in node.get("content") or []
+            if part.get("type") == "text"
+        )
+        self.assertNotIn("匹配路线", text)
+
+
+class WatermarkProfileTest(unittest.TestCase):
+    """水印号核到存在就把主页与数字 ID 给出来，别让用户自己去试。"""
+
+    def test_verified_account_shows_profile_and_id(self) -> None:
+        outcome = SearchOutcome()
+        outcome.vision = {
+            "watermark": "X@Miharu",
+            "watermark_handle": "Miharu",
+            "watermark_url": "https://x.com/Miharu",
+            "watermark_state": "ok",
+            "watermark_user_id": "6143712",
+            "watermark_note": "@Miharu 这个号存在，但这次没翻成它的帖子（HTTP 500），不能据此说没有",
+        }
+        outcome.grok = {"watermark": "X@Moliuwy"}
+        text = formatting._best_block(outcome)
+        self.assertIn("https://x.com/Miharu", text)
+        self.assertIn("6143712", text)
+        self.assertIn("不是同一个", text)
+
+    def test_unknown_account_keeps_no_link(self) -> None:
+        outcome = SearchOutcome()
+        outcome.vision = {"watermark": "X@Miharu", "watermark_url": "https://x.com/Miharu"}
+        outcome.grok = {"watermark": "X@Moliuwy"}
+        text = formatting._best_block(outcome)
+        self.assertNotIn("https://x.com/Miharu", text)
+
+    def test_misread_handle_explains_the_fix(self) -> None:
+        """号名读偏、靠近似拼写才找回来时，必须写清楚「读的是啥、核到的是谁」。"""
+        outcome = SearchOutcome()
+        outcome.vision = {
+            "watermark": "X@Miharu",
+            "watermark_readings": [
+                {"source": "vision", "raw": "X@Miharu", "handle": "Miharu", "state": "ok"},
+                {
+                    "source": "grok",
+                    "raw": "X@Moliuwy",
+                    "handle": "Moliww",
+                    "from": "Moliuwy",
+                    "fixed": "Moliww",
+                    "state": "ok",
+                    "distance": 0,
+                    "post": "https://x.com/Moliww/status/2119651416868540557",
+                    "note": "自己的带图帖里有这张图，指纹距离 0",
+                },
+            ],
+        }
+        outcome.grok = {"watermark": "X@Moliuwy"}
+        text = formatting._best_block(outcome)
+        self.assertIn("读偏了", text)
+        self.assertIn("X@Moliuwy", text)
+        self.assertIn("@Moliww", text)
+        self.assertIn("x.com/Moliww/status/2119651416868540557", text)
+
+    def test_readings_without_hit_still_warn(self) -> None:
+        """两个读法都没核到这张图时，仍然按线索写，不能变成「核对上了」。"""
+        outcome = SearchOutcome()
+        outcome.vision = {
+            "watermark": "X@Miharu",
+            "watermark_handle": "Miharu",
+            "watermark_url": "https://x.com/Miharu",
+            "watermark_state": "ok",
+            "watermark_user_id": "6143712",
+            "watermark_note": "最近十几条带图帖和搜索结果里都没有这张，可能是模型读错了",
+            "watermark_readings": [
+                {"source": "vision", "raw": "X@Miharu", "handle": "Miharu", "state": "ok"},
+                {"source": "grok", "raw": "X@Moliuwy", "handle": "Moliuwy", "state": "missing"},
+            ],
+        }
+        outcome.grok = {"watermark": "X@Moliuwy"}
+        text = formatting._best_block(outcome)
+        self.assertIn("线索，不是结论", text)
+        self.assertNotIn("核对上了", text)
+
+
+
 if __name__ == "__main__":
     unittest.main()

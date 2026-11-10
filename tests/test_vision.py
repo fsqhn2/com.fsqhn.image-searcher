@@ -405,6 +405,38 @@ class AccountNoteTest(unittest.TestCase):
         self.assertNotIn("读不到这个号", formatting._best_block(outcome))
 
 
+class WatermarkPromptTest(unittest.TestCase):
+    def test_parse_account_and_text(self):
+        reply = '{"text": "渔蛋Sakana @Sakana_Yudan", "account": "@Sakana_Yudan"}'
+        parsed = vision.parse_watermark_reply(reply)
+        self.assertEqual(parsed["account"], "@Sakana_Yudan")
+        self.assertIn("Sakana", parsed["text"])
+
+    def test_parse_tolerates_fence_and_empty(self):
+        self.assertEqual(vision.parse_watermark_reply("```json\n{\"text\":\"\",\"account\":\"\"}\n```"), {"text": "", "account": ""})
+        self.assertEqual(vision.parse_watermark_reply("没有水印"), {"text": "", "account": ""})
+
+    def test_parse_drops_none_placeholder(self):
+        """模型爱回 none/null 这类占位，不能当成水印文字写进结论。"""
+        parsed = vision.parse_watermark_reply('{"text": "none", "account": "null"}')
+        self.assertEqual(parsed, {"text": "", "account": ""})
+
+    def test_data_url_is_bounded(self):
+        from PIL import Image
+
+        buffer = io.BytesIO()
+        Image.new("RGB", (3000, 4000), (120, 30, 200)).save(buffer, "PNG")
+        url, width, height = vision.data_url_for(buffer.getvalue())
+        self.assertTrue(url.startswith("data:image/jpeg;base64,"))
+        self.assertEqual(max(width, height), 1600)
+        self.assertEqual((width, height), (1200, 1600))
+
+    def test_prompt_asks_for_account(self):
+        prompt = vision.build_watermark_prompt()
+        self.assertIn("account", prompt)
+        self.assertIn("@xxx", prompt)
+
+
 class VisionDisplayTest(unittest.TestCase):
     """视觉命中的候选不能冒充「同一张图」，文案上必须区分开。"""
 

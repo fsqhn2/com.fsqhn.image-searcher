@@ -38,10 +38,18 @@ def _route_line(outcome: SearchOutcome) -> str:
     return "🖼 匹配路线：照片"
 
 
-def _identity_lines(candidate: Candidate) -> list[str]:
+def _identity_lines(candidate: Candidate, *, detail: bool = True) -> list[str]:
     lines = [f"🌐 平台：{candidate.platform}"]
     if candidate.note:
-        lines.append(f"🔍 匹配：{candidate.note}")
+        note = candidate.note
+        if not detail and candidate.status == "match":
+            # 首次回复只给结论：命中说明里那句「这是谁的回复页、顺着回复找到原帖」
+            # 属于过程，留在「更多」里看。距离是可信度的凭据，保留。
+            if candidate.engine == "watermark":
+                note = "本人发过这张图"
+            else:
+                note = note.split("：", 1)[0]
+        lines.append(f"🔍 匹配：{note}")
     if candidate.name:
         # 论坛帖的「名字」其实是帖子标题，写清楚，免得当成作者名。
         label = "📄 标题" if is_forum_page(candidate.url) else "👤 名字"
@@ -272,8 +280,8 @@ def _vision_downgrade_line(outcome: SearchOutcome, vision: dict | None) -> str:
     return f"视觉复核挑出 {count} 条，但都不能当原帖：{tail}。"
 
 
-def _best_block(outcome: SearchOutcome, *, skip_grok: bool = False) -> str:
-    text = _best_block_core(outcome, skip_grok=skip_grok)
+def _best_block(outcome: SearchOutcome, *, skip_grok: bool = False, detail: bool = False) -> str:
+    text = _best_block_core(outcome, skip_grok=skip_grok, detail=detail)
     extra: list[str] = []
     watermark = _vision_watermark_line(outcome)
     if watermark:
@@ -303,6 +311,28 @@ def _vision_watermark_line(outcome: SearchOutcome) -> str:
     """
     vision = outcome.vision or {}
     grok = outcome.grok or {}
+    readings = [
+        item for item in (vision.get("watermark_readings") or []) if isinstance(item, dict)
+    ]
+    # 号名读偏、靠近似拼写才找回来的那种，必须讲清楚：用户看到的字跟结论里的号
+    # 对不上时，不说原因就像插件认错人了（实测 Moliww 被读成 Miharu／Moliuwy）。
+    hit = next((item for item in readings if str(item.get("post") or "").strip()), None)
+    if hit is not None and str(hit.get("fixed") or "").strip():
+        raws: list[str] = []
+        for item in readings:
+            text = str(item.get("raw") or "").strip()
+            if text and text not in raws:
+                raws.append(text)
+        where = "、".join(raws) or f"X@{hit.get('fixed')}"
+        distance = hit.get("distance")
+        gap = f"，指纹距离 {distance}" if isinstance(distance, int) else ""
+        post = str(hit.get("post") or "").strip()
+        best_url = (outcome.best.url or "").strip() if outcome.best is not None else ""
+        tail = "" if best_url and _bare_url(best_url) == _bare_url(post) else f"：{post}"
+        return (
+            f"🔎 图上水印读偏了：{where} 都不是；按近似拼写核到 @{hit.get('handle')}，"
+            f"这张图就在它自己的帖子里{gap}{tail}"
+        )
     text = str(vision.get("watermark") or "").strip()
     if not text:
         handle = str(vision.get("watermark_handle") or "").strip()
@@ -312,12 +342,28 @@ def _vision_watermark_line(outcome: SearchOutcome) -> str:
     disagree = bool(other) and _squash_handle(other) != _squash_handle(text)
     lines: list[str] = []
     post = str(vision.get("watermark_post") or "").strip()
+    if post and outcome.best is not None and (outcome.best.url or "").strip() == post:
+        # 结论本身就是这条帖子，再写一遍同样的链接只是重复。
+        return ""
+    state = str(vision.get("watermark_state") or "").strip()
+    user_id = str(vision.get("watermark_user_id") or "").strip()
     if text:
         url = str(vision.get("watermark_url") or "").strip()
         note = str(vision.get("watermark_note") or "").strip()
         if post:
             # 水印号自己的带图帖里翻到了这张：这是核对过的结论，直接把帖子给出来。
             lines.append(f"🔎 图上水印核对上了：{text}（{note}）：{post}")
+        elif state == "ok" and url:
+            # 号确实存在就把主页和数字 ID 都摆出来：能不能认人是用户的事，
+            # 但「有没有这个号」必须先核过，别让人自己去试。存在 ≠ 这图是她发的，
+            # 所以这一行永远标「线索，不是结论」——s-20261110-0836-ac88 那单
+            # 读出来的 @Miharu 就是个 2010 年的无关老号。
+            detail = "已核实这个号存在" + (f"（用户 ID {user_id}）" if user_id else "")
+            if note:
+                detail += f"，但{note}"
+            lines.append(
+                f"🔎 图上水印（线索，不是结论）：{text}（视觉模型识别，可能读错）：{url} —— {detail}"
+            )
         elif disagree:
             # 两个模型读得不一样，连是哪个号都没定：这时候再附主页，用户点进去
             # 只会看到一个无关账号，白白浪费时间。
@@ -333,12 +379,16 @@ def _vision_watermark_line(outcome: SearchOutcome) -> str:
             # 已经用指纹核对到帖子了，另一个读法就是读错，不必再让人两头猜。
             lines.append(f"🔎 Grok 读成 {other}，跟核对结果不一致，那是读错了")
         else:
-            state = ""
             other_info = vision.get("watermark_other")
-            if isinstance(other_info, dict):
-                state = _account_state_note(str(other_info.get("state") or ""))
-            tail = f"（{state}）" if state else ""
-            lines.append(f"🔎 Grok 读到的水印不一样：{other}{tail}，两个都别当结论")
+            other_state = str((other_info or {}).get("state") or "") if isinstance(other_info, dict) else ""
+            state_note = _account_state_note(other_state)
+            tail = f"（{state_note}）" if state_note else ""
+            if state == "ok":
+                lines.append(
+                    f"🔎 Grok 读成 {other}{tail}，跟上面那个号不是同一个；两个都只当线索"
+                )
+            else:
+                lines.append(f"🔎 Grok 读到的水印不一样：{other}{tail}，两个都别当结论")
     return "\n".join(lines)
 
 
@@ -422,7 +472,7 @@ def _leak_line(best) -> str:
     return f"⚠️ 这条落在 {site} 上，那是盗图/资源站：页面上的账号是从标题里抄的，不是作者主页。"
 
 
-def _best_block_core(outcome: SearchOutcome, *, skip_grok: bool = False) -> str:
+def _best_block_core(outcome: SearchOutcome, *, skip_grok: bool = False, detail: bool = False) -> str:
     best = outcome.best
     grok = outcome.grok or {}
     grok_lines = _grok_lines(grok)
@@ -536,7 +586,7 @@ def _best_block_core(outcome: SearchOutcome, *, skip_grok: bool = False) -> str:
         if outcome.total_candidates:
             lines.append(f"共收到 {outcome.total_candidates} 条结果，见参考区。")
         return "\n".join(lines)
-    lines = _identity_lines(best)
+    lines = _identity_lines(best, detail=detail)
     leak_line = _leak_line(best)
     if leak_line:
         lines.append(leak_line)
@@ -749,7 +799,8 @@ def _reference_hint(outcome: SearchOutcome, source: str) -> str:
 
 
 def _footer_lines(outcome: SearchOutcome, command: str, ttl_minutes: int, replay: bool, task_id: str = "") -> list[str]:
-    lines = [_route_line(outcome), _ai_line(outcome.ai)]
+    # 「怎么找的」只在「更多」里写：首次回复给了结论就走，路线与 AI 检测属于详情。
+    lines: list[str] = [_route_line(outcome), _ai_line(outcome.ai)] if replay else []
     if outcome.cached:
         # 说清这是复用，不是刚跑出来的：同一张图结果一样，但引擎这次一条都没调。
         lines.append("💾 这张图之前搜过，直接复用了当时的结果（引擎没有重新跑）")
@@ -813,7 +864,7 @@ def build_forward_nodes(
 
     nodes.append(node([{"type": "text", "content": _header_text(outcome, command, replay)}]))
 
-    best_content: list[dict] = [{"type": "text", "content": _best_block(outcome)}]
+    best_content: list[dict] = [{"type": "text", "content": _best_block(outcome, detail=replay)}]
     if outcome.image_b64 and outcome.best is not None:
         best_content.append({"type": "image", "content": outcome.image_b64})
     nodes.append(node(best_content))
@@ -1123,7 +1174,8 @@ def build_engine_forward_nodes(
     nodes.append(node([{"type": "text", "content": header}]))
 
     if with_best:
-        best_content: list[dict] = [{"type": "text", "content": _best_block(outcome)}]
+        # 这里是「更多」按引擎拆条的分支：详情全给出来。
+        best_content: list[dict] = [{"type": "text", "content": _best_block(outcome, detail=True)}]
         if outcome.image_b64 and outcome.best is not None:
             best_content.append({"type": "image", "content": outcome.image_b64})
         nodes.append(node(best_content))
@@ -1183,7 +1235,7 @@ def build_text_summary(
                     if item.url:
                         detail += f" · {item.url}"
                     lines.append(detail)
-    lines.append(_route_line(outcome).replace("🖼 ", ""))
-    lines.append(_ai_line(outcome.ai).replace("🤖 ", ""))
-    lines.append(f"耗时 {outcome.elapsed_ms / 1000:.1f} 秒，共 {outcome.total_candidates} 条候选。")
+    # 匹配路线、AI 检测、耗时这些属于「怎么找的」，统一放进「更多」；
+    # 首次回复只给最终结果，群里看着干净。
+    lines.append(f"（搜索路线、耗时与全部 {outcome.total_candidates} 条候选见「{command} 更多」）")
     return "\n".join(lines)
