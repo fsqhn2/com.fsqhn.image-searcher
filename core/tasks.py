@@ -56,6 +56,10 @@ class SearchOutcome:
     # "x_name", "followers", "post", "distance", "reason"}。status=hit 时结论已经换成
     # 那条帖子；seen 只说明「找到这个号了、最近没发这张」，不改结论。
     x_identity: dict | None = None
+    # 命中搬运站后又去翻候选里的 X 号：{"status": hit/none, "scanned": [号], "failed": [号],
+    # "handle", "post", "distance", "x_name"}。hit 时结论已经换成那条帖子；none 只用来
+    # 说明「翻过哪些号、都没有」，不改结论。
+    repost_author: dict | None = None
     # 展示用图片：候选图地址 → base64。只留在内存里，落盘不保存（体积太大）。
     images: dict[str, str] = field(default_factory=dict)
     # 这次结果来自按图缓存。命中时不重跑引擎，elapsed_ms 是当初那次的耗时。
@@ -82,6 +86,7 @@ class SearchOutcome:
             "paid": self.paid,
             "same_person": self.same_person,
             "x_identity": self.x_identity,
+            "repost_author": self.repost_author,
         }
 
     @classmethod

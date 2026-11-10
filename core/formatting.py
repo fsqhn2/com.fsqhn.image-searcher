@@ -47,7 +47,7 @@ def _identity_lines(candidate: Candidate, *, detail: bool = True) -> list[str]:
         if not detail and candidate.status == "match":
             # 首次回复只给结论：命中说明里那句「这是谁的回复页、顺着回复找到原帖」
             # 属于过程，留在「更多」里看。距离是可信度的凭据，保留。
-            if candidate.engine in {"watermark", "identity"}:
+            if candidate.engine in {"watermark", "identity", "repost_author"}:
                 note = "本人发过这张图"
             else:
                 note = note.split("：", 1)[0]
@@ -119,6 +119,40 @@ def _fans_text(count: int) -> str:
     if count >= 10000:
         return f"{count / 10000:.1f} 万"
     return str(count)
+
+
+def _repost_author_lines(outcome: SearchOutcome, *, detail: bool = False) -> list[str]:
+    """命中搬运站之后有没有接着翻候选里的 X 号，翻到了什么。
+
+    只写结论会让人以为「找到搬运站就收工」——jh361 那单命中距离 2，标题里还写着
+    「推特」，看着就像作者在 X 上发过。所以翻了哪几个号、翻到没有，都要留一句。
+    这类「怎么找的」只进「更多」，首次回复还是只给结论。
+    """
+    info = outcome.repost_author or {}
+    status = str(info.get("status") or "")
+    scanned = [
+        str(item).strip().lstrip("@")
+        for item in (info.get("scanned") or [])
+        if str(item).strip()
+    ]
+    if status == "hit":
+        handle = str(info.get("handle") or "").strip().lstrip("@")
+        if not handle:
+            return []
+        return [f"🔎 结论是翻出来的：搬运站那条只是转贴，@{handle} 自己的带图帖里有这张"]
+    if status != "none" or not scanned or not detail:
+        return []
+    names = "、".join(f"@{item}" for item in scanned[:3])
+    failed = [
+        str(item).strip().lstrip("@")
+        for item in (info.get("failed") or [])
+        if str(item).strip()
+    ]
+    tail = f"（{'、'.join('@' + item for item in failed[:2])} 那次没翻成）" if failed else ""
+    return [
+        f"🔎 也翻过候选里 {names} 自己的带图帖和搜索，没找到这张{tail}；"
+        "这几个号只看得到最近发的那批"
+    ]
 
 
 def _x_identity_lines(outcome: SearchOutcome) -> list[str]:
@@ -331,6 +365,7 @@ def _best_block(outcome: SearchOutcome, *, skip_grok: bool = False, detail: bool
     if watermark:
         extra.append(watermark)
     extra.extend(_x_identity_lines(outcome))
+    extra.extend(_repost_author_lines(outcome, detail=detail))
     extra.extend(_gallery_source_lines(outcome))
     if not skip_grok:
         miss = _grok_miss_line(outcome)
@@ -660,6 +695,7 @@ ENGINE_LABELS = {
     "saucenao": "SauceNAO",
     "watermark": "图上水印核对",
     "identity": "按名字换到 X 核对",
+    "repost_author": "搬运站转贴反查",
 }
 
 

@@ -367,6 +367,18 @@ class VisionConfig(PluginConfigBase):
             "每单最多一次网页检索、两个候选号，找不到就照旧按没找到写。",
         ),
     )
+    repost_author: bool = Field(
+        default=True,
+        description=(
+            "搬运站命中时翻候选里的 X 号：指纹对上的那条如果只是博客/图集站上的转贴"
+            "（没有账号），就把候选里出现过的 X 号挨个翻一遍带图帖比指纹，谁真有这张图"
+            "谁就是结论。找不到也记下来，免得看起来像「命中搬运站就收工」。"
+        ),
+        json_schema_extra=_ui(
+            "搬运站命中时翻候选里的 X 号",
+            "默认开。最多两个号、整段 90 秒；只认指纹命中，翻不到只写一句查过哪些号。",
+        ),
+    )
     top_n: int = Field(
         default=16,
         description="视觉复核时拼前几张候选，4 列排布，每格 320 像素。格数越多越慢、越容易看错。",
@@ -1757,6 +1769,24 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 x_identity = None
             if x_identity and x_identity.get("status") == "hit":
                 best = self._promote_x_identity(best, x_identity)
+        # 同一张图落在普通网页上（搬运站/图集页，页面上没有账号）时别停在那儿：
+        # 候选里出现过的 X 号挨个翻一遍，谁自己的帖子里有这张图谁就是结论。
+        repost_author: dict[str, Any] | None = None
+        if (
+            upload
+            and best is not None
+            and best.status == "match"
+            and not (best.handle or "").strip()
+            and not self._is_x(best)
+            and bool(getattr(config.vision, "repost_author", True))
+        ):
+            try:
+                repost_author = await self._hunt_repost_author(ordered, best, upload)
+            except Exception as error:  # noqa: BLE001 - 翻不到不影响已经命中的那条
+                self.ctx.logger.warning("搬运站转贴反查失败：%s", error)
+                repost_author = None
+            if repost_author and repost_author.get("status") == "hit":
+                best = self._promote_repost_author(best, repost_author)
         # 结论里的账号核一下死活：被封的号 handle 会被释放，只剩数字 ID 能对上人。
         best = await self._check_best_account(best, vision_info)
 
@@ -1838,6 +1868,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
             paid=paid_info,
             same_person=same_person_info,
             x_identity=x_identity,
+            repost_author=repost_author,
         )
 
         if grok_hit and best is None and upload:
@@ -3748,6 +3779,119 @@ class ImageSearcherPlugin(MaiBotPlugin):
     # 按名字换号时最多核这么多个候选。检索结果里第一个通常就是本人，多试只是
     # 给同名的人留一次机会，翻帖那一步一样要指纹对上才作数。
     _X_FROM_NAME_LIMIT = 2
+
+    # 命中搬运站后翻候选里的 X 号：最多两个，整段卡 90 秒。这两个号常常是
+    # 「同一篇报道里带出来的账号」，未必是作者；所以门槛还是指纹，翻不到就老实写。
+    _REPOST_AUTHOR_LIMIT = 2
+    _REPOST_AUTHOR_BUDGET = 90.0
+
+    def _repost_x_handles(self, ordered: list[Candidate], best: Candidate | None) -> list[str]:
+        """候选里出现过的 X 号，按出现顺序去重——不要求那条帖子本身就是这张图。
+
+        搬运站的转贴页没有账号，唯一还能通向本人的就是同批候选里那几个 X 账号：
+        实测 jh361 那单的 67 条候选里有 ``@oioioi525``（Lens 认为画风像，指纹距离 30），
+        这种「图不对、人可能是」的号，正式结论用不上，但翻一遍它的带图帖很便宜。
+        """
+        seen: set[str] = set()
+        blocked = (best.handle or "").strip().lstrip("@").lower() if best is not None else ""
+        found: list[str] = []
+        for item in ordered:
+            if not self._is_x(item):
+                continue
+            handle = (item.handle or "").strip().lstrip("@")
+            if not handle or handle.isdigit():
+                continue
+            lower = handle.lower()
+            if lower in seen or lower == blocked:
+                continue
+            seen.add(lower)
+            found.append(handle)
+            if len(found) >= self._REPOST_AUTHOR_LIMIT:
+                break
+        return found
+
+    async def _hunt_repost_author(
+        self, ordered: list[Candidate], best: Candidate | None, upload: bytes | None
+    ) -> dict[str, Any] | None:
+        """指纹命中落在普通网页上（没有账号）时，去翻候选里那几个 X 号自己的帖。
+
+        实测这一类落点几乎都是搬运页：jh361 那篇「推特高颜值萝莉 染三COS…」跟原图
+        距离 2，文章里却没有一个账号，标题里的「推特」只是站点模板。以前命中就收工，
+        看起来像「找到搬运站就算找到了」。现在把候选里的 X 号挨个翻一遍带图帖
+        （``/media`` 不够再翻 ``from:<号> filter:images``），谁真有这张图谁当结论。
+        """
+        handles = self._repost_x_handles(ordered, best)
+        if not handles or not upload:
+            return None
+        started = time.time()
+        scanned: list[str] = []
+        failed: list[str] = []
+        for handle in handles:
+            left = self._REPOST_AUTHOR_BUDGET - (time.time() - started)
+            if left <= 5:
+                self._vlog("翻候选 X 号：预算用完，剩下 %s 没翻", "、".join(handles[len(scanned):]))
+                break
+            hit = await self._media_lookup(handle, upload)
+            if not (hit and hit.get("url")):
+                fallback = await self._search_media_lookup(handle, upload)
+                if fallback and fallback.get("url"):
+                    hit = fallback
+            if hit and hit.get("url"):
+                distance = int(hit.get("distance") or 0)
+                profile = await self._profile(handle)
+                self._vlog(
+                    "翻候选 X 号：@%s 命中 %s（距离 %s，%ss）",
+                    handle,
+                    hit.get("url"),
+                    distance,
+                    int(time.time() - started),
+                )
+                return {
+                    "status": "hit",
+                    "scanned": [*scanned, handle],
+                    "failed": failed,
+                    "handle": handle,
+                    "post": str(hit.get("url") or ""),
+                    "distance": distance,
+                    "x_name": str((profile or {}).get("name") or ""),
+                }
+            if hit and hit.get("error"):
+                failed.append(handle)
+            scanned.append(handle)
+        self._vlog(
+            "翻候选 X 号：%s 没翻到（失败 %s，%ss）",
+            "、".join(scanned) or "无",
+            "、".join(failed) or "无",
+            int(time.time() - started),
+        )
+        if not scanned:
+            return None
+        return {"status": "none", "scanned": scanned, "failed": failed}
+
+    def _promote_repost_author(
+        self, best: Candidate | None, info: dict[str, Any]
+    ) -> Candidate | None:
+        """候选里的某个 X 号自己发过这张图时，那条帖子才是结论。
+
+        搬运页/图集页只是别人转的；这一条的证据是「作者自己的带图帖里指纹对上」，
+        跟水印核对同一档，所以直接升成 match。
+        """
+        post = str(info.get("post") or "")
+        handle = str(info.get("handle") or "").strip().lstrip("@")
+        if not post or not handle:
+            return best
+        distance = int(info.get("distance") or 0)
+        self._vlog("搬运站转贴反查命中：@%s %s（距离 %s）", handle, post, distance)
+        return Candidate(
+            engine="repost_author",
+            url=post,
+            platform="X (Twitter)",
+            handle="@" + handle,
+            name=str(info.get("x_name") or ""),
+            distance=distance,
+            status="match",
+            note=f"搬运站那条只是转贴：@{handle} 自己的带图帖里有这张图（距离 {distance}）",
+        )
 
     @staticmethod
     def _weibo_uid(item: Candidate | None) -> str:

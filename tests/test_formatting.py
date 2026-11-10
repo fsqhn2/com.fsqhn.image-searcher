@@ -1375,5 +1375,69 @@ class XIdentityTest(unittest.TestCase):
         self.assertNotIn("按名字", text)
 
 
+class RepostAuthorTest(unittest.TestCase):
+    """命中搬运站之后翻没翻候选里的 X 号，要能看出来。"""
+
+    def _site_best(self) -> Candidate:
+        best = Candidate(
+            engine="lens",
+            url="https://www.jh361.com/archives/196738",
+            platform="jh361.com",
+            name="推特高颜值萝莉染三COS明日方舟终末地洛茜大尺度写真",
+            distance=2,
+            status="match",
+            note="指纹一致（距离 2）",
+        )
+        best.finalize()
+        return best
+
+    def test_scanned_handles_only_show_up_in_more(self) -> None:
+        """「翻过哪几个号」属于怎么找的，只在「更多」里出现。"""
+        outcome = SearchOutcome(
+            status="ok",
+            best=self._site_best(),
+            repost_author={"status": "none", "scanned": ["oioioi525", "Purugear"], "failed": []},
+        )
+        first = formatting._best_block(outcome)
+        self.assertNotIn("oioioi525", first)
+        more = formatting._best_block(outcome, detail=True)
+        self.assertIn("@oioioi525", more)
+        self.assertIn("@Purugear", more)
+        self.assertIn("没找到这张", more)
+
+    def test_failed_lookup_is_not_written_as_absent(self) -> None:
+        """某个号这次没翻成，要单独说，不能混进「都没有」。"""
+        outcome = SearchOutcome(
+            status="ok",
+            best=self._site_best(),
+            repost_author={"status": "none", "scanned": ["a_one"], "failed": ["a_one"]},
+        )
+        more = formatting._best_block(outcome, detail=True)
+        self.assertIn("没翻成", more)
+
+    def test_hit_says_the_repost_was_just_a_copy(self) -> None:
+        outcome = SearchOutcome(
+            status="ok",
+            best=self._site_best(),
+            repost_author={
+                "status": "hit",
+                "scanned": ["oioioi525"],
+                "failed": [],
+                "handle": "oioioi525",
+                "post": "https://x.com/oioioi525/status/2114312460266090942",
+                "distance": 0,
+                "x_name": "ran3",
+            },
+        )
+        text = formatting._best_block(outcome)
+        self.assertIn("@oioioi525", text)
+        self.assertIn("搬运站那条只是转贴", text)
+
+    def test_no_hunt_leaves_no_trace(self) -> None:
+        outcome = SearchOutcome(status="ok", best=self._site_best())
+        more = formatting._best_block(outcome, detail=True)
+        self.assertNotIn("也翻过候选里", more)
+
+
 if __name__ == "__main__":
     unittest.main()
