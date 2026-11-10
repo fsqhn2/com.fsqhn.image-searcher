@@ -1174,6 +1174,22 @@ class ResultPresentationTest(unittest.TestCase):
         )
         self.assertNotIn("匹配路线", text)
 
+    def test_more_explains_why_it_is_not_an_illustration(self) -> None:
+        """照片路线也要说清原因：常见的疑问是「明明是插画，怎么没走 pixiv」。"""
+        task = self._task()
+        task.outcome.route_reason = "SauceNAO 最高 37.3%，不到插画阈值 75%"
+        nodes = build_forward_nodes(
+            task, command="麦麦搜图", show_reference=True, limit=3, replay=True
+        )
+        text = "\n".join(
+            str(part.get("content"))
+            for node in nodes
+            for part in node.get("content") or []
+            if part.get("type") == "text"
+        )
+        self.assertIn("匹配路线：照片", text)
+        self.assertIn("不到插画阈值 75%", text)
+
 
 class WatermarkProfileTest(unittest.TestCase):
     """水印号核到存在就把主页与数字 ID 给出来，别让用户自己去试。"""

@@ -32,10 +32,12 @@ def _ai_line(ai: dict | None) -> str:
 
 
 def _route_line(outcome: SearchOutcome) -> str:
+    reason = f"，{outcome.route_reason}" if outcome.route_reason else ""
     if outcome.route == "drawing":
-        reason = f"，{outcome.route_reason}" if outcome.route_reason else ""
         return f"🖼 匹配路线：插画{reason}"
-    return "🖼 匹配路线：照片"
+    # 照片路线也写原因：常见疑问是「明明是插画，怎么没走 pixiv」，而 pixiv 只有
+    # SauceNAO 能带出来，得把「它没认出来」这件事说清楚。
+    return f"🖼 匹配路线：照片{reason}"
 
 
 def _identity_lines(candidate: Candidate, *, detail: bool = True) -> list[str]:

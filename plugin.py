@@ -1560,7 +1560,26 @@ class ImageSearcherPlugin(MaiBotPlugin):
         # 这一步只看相似度、不需要下载图片，所以放在验证之前。
         sauce = self._sauce_route(candidates)
         route = "drawing" if sauce else "photo"
-        route_reason = f"SauceNAO 相似度 {sauce.similarity:g}%" if sauce else "无插画库命中"
+        if sauce:
+            route_reason = f"SauceNAO 相似度 {sauce.similarity:g}%"
+        else:
+            # 照片路线也要说得出为什么：绝大多数疑问是「明明是插画，怎么没走
+            # pixiv」。pixiv 只有 SauceNAO 能带出来，它没认出来就没有结果。
+            threshold = self.config.saucenao.route_similarity
+            top_sauce = max(
+                (
+                    float(item.similarity or 0)
+                    for item in candidates
+                    if item.engine == "saucenao"
+                ),
+                default=0.0,
+            )
+            if not self._enabled("saucenao"):
+                route_reason = "SauceNAO 没开，插画路线不会命中"
+            elif top_sauce:
+                route_reason = f"SauceNAO 最高 {top_sauce:g}%，不到插画阈值 {threshold:g}%"
+            else:
+                route_reason = "SauceNAO 一条都没命中"
         # 回复页反查没成功时留给 Grok 的一句话（成功就是空串）。
         reply_hint = ""
         if sauce:
