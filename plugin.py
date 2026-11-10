@@ -2463,6 +2463,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
             "ok": False,
             "tier": "none",
             "handle": "",
+            # 作者昵称：核对命中时从帖子作者身上回填，首次回复要写「名字」，
+            # 只给一条链接的话用户还得点进去才认得出是谁。
+            "name": "",
             "post_url": "",
             "reference_url": "",
             "reason": "",
@@ -2642,12 +2645,20 @@ class ImageSearcherPlugin(MaiBotPlugin):
                     if not info["handle"]:
                         info["handle"] = tweet.handle
                         info["post_url"] = f"https://x.com/{tweet.handle}/status/{tweet.tweet_id}"
+                    if getattr(tweet, "name", "") and (
+                        not info["handle"] or tweet.handle.lower() == str(info["handle"]).lower()
+                    ):
+                        info["name"] = tweet.name
                 info["verified"] = check["verdict"] if check else "unknown"
                 if check is not None:
                     info["distance"] = check["distance"]
                 if check is not None and check["verdict"] == "hit":
                     note = f"帖子配图对得上（距离 {check['distance']}）"
                     info["reason"] = f"{note}；{info['reason']}" if info["reason"] else note
+                    # 命中的那张配图顺手当参考图。以前只有核对失败才记
+                    # reference_url，于是「找到原帖」的单子转发里反而没图，只剩
+                    # 一句「没有可用的候选图，转发里是你发的原图」。
+                    info["reference_url"] = check.get("closest_url") or ""
                 elif check is not None and check["verdict"] == "miss":
                     note = f"帖子配图对不上（最近距离 {check['distance']}）"
                     if info["handle"]:
@@ -2671,6 +2682,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 info["post_url"] = found["url"]
                 info["verified"] = "hit"
                 info["distance"] = found["distance"]
+                info["reference_url"] = str(found.get("image") or "")
                 note = (
                     f"翻了 @{info['handle']} 自己的带图帖子，这张图就在里面"
                     f"（距离 {found['distance']}）"
@@ -3410,7 +3422,13 @@ class ImageSearcherPlugin(MaiBotPlugin):
                     continue
                 distance = hamming(mine, other)
                 if distance <= threshold and (best is None or distance < best["distance"]):
-                    best = {"url": post.url, "distance": distance, "created_at": post.created_at}
+                    # image 留着当参考图：命中帖子的那张配图，转发里可以直接摆出来。
+                    best = {
+                        "url": post.url,
+                        "distance": distance,
+                        "created_at": post.created_at,
+                        "image": link,
+                    }
         self._vlog(
             "翻 @%s 的带图帖子：%s 条，结论=%s",
             handle,

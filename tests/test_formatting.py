@@ -401,6 +401,31 @@ class GrokReferenceTest(unittest.TestCase):
         self.assertIn("指纹距离 20", blob)
         self.assertIn("不是同一张", blob)
 
+    def test_reference_image_on_hit_is_the_matched_photo(self) -> None:
+        """找到原帖那单也得带图：命中的帖子配图直接当参考图，别再写「没有可用的候选图」。"""
+        ref = "https://pbs.twimg.com/media/HWuoYYraMAAnwqS.jpg"
+        outcome = SearchOutcome(
+            status="ok",
+            best=None,
+            candidates=[],
+            grok={
+                "tier": "post",
+                "handle": "Banbanko_",
+                "post_url": "https://x.com/Banbanko_/status/2119974818808492177",
+                "reference_url": ref,
+                "distance": 0,
+                "verified": "hit",
+                "reason": "帖子配图对得上（距离 0）",
+            },
+            image_b64="AAAA",
+            image_source=ref,
+            total_candidates=0,
+        )
+        blob = json.dumps(build_forward_nodes(_task(outcome), command="盆地找鸡"), ensure_ascii=False)
+        self.assertIn("Grok 帖子配图里跟原图最接近", blob)
+        self.assertIn("同一张", blob)
+        self.assertNotIn("没有可用的候选图", blob)
+
     def test_reference_image_reports_candidate_distance(self) -> None:
         """参考图来自候选池时，也要标出它跟原图的距离。"""
         item = Candidate(
@@ -1282,6 +1307,52 @@ class WatermarkProfileTest(unittest.TestCase):
         text = formatting._best_block(outcome)
         self.assertIn("线索，不是结论", text)
         self.assertNotIn("核对上了", text)
+
+
+class WatermarkSameAccountTest(unittest.TestCase):
+    """水印读法跟结论只差一个符号时，不能摆出另一个同名账号来打自己的脸。"""
+
+    def _same_account_case(self) -> SearchOutcome:
+        outcome = SearchOutcome()
+        outcome.status = "ok"
+        outcome.grok = {
+            "tier": "post",
+            "handle": "Banbanko_",
+            "name": "半半子💖BANBANKO",
+            "post_url": "https://x.com/Banbanko_/status/2119974818808492177",
+            "watermark": "@Banbanko",
+            "verified": "hit",
+            "distance": 0,
+            "reason": "帖子配图对得上（距离 0）",
+        }
+        outcome.vision = {
+            "watermark": "@Banbanko",
+            "watermark_handle": "banbanko",
+            "watermark_url": "https://x.com/banbanko",
+            "watermark_state": "ok",
+            "watermark_user_id": "96473546",
+            "watermark_name": "ばんこ(高塚ばんこ)",
+            "watermark_note": "最近十几条带图帖和搜索结果里都没有这张，可能是模型读错了",
+        }
+        return outcome
+
+    def test_trailing_underscore_is_the_same_account(self) -> None:
+        """@Banbanko 与 @Banbanko_ 只差末尾下划线，就是同一个号没读全。"""
+        text = formatting._best_block(self._same_account_case())
+        self.assertIn("就是这个号", text)
+        self.assertNotIn("与上面的结论不同", text)
+
+    def test_other_account_is_not_offered_as_clue(self) -> None:
+        """那个 @banbanko 是另一个人（日本议员号），不该出现在结论下面。"""
+        text = formatting._best_block(self._same_account_case())
+        self.assertNotIn("https://x.com/banbanko", text)
+        self.assertNotIn("96473546", text)
+
+    def test_post_tier_writes_name_and_account(self) -> None:
+        """只有一条链接不够：首次回复要写明名字和账号。"""
+        text = formatting._best_block(self._same_account_case())
+        self.assertIn("半半子", text)
+        self.assertIn("@Banbanko_", text)
 
 
 class XIdentityTest(unittest.TestCase):

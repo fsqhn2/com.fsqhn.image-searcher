@@ -78,10 +78,18 @@ def _watermark_line(grok: dict) -> str:
     raw = str(grok.get("watermark") or "").strip()
     if not raw:
         return ""
-    handle = str(grok.get("handle") or "").strip().lstrip("@").lower()
+    handle = str(grok.get("handle") or "").strip().lstrip("@")
     seen = raw.lstrip("@").strip().lower()
-    if handle and handle in seen:
+    if handle and handle.lower() in seen:
         return f"🏷 图上印的 ID 就是这个号（{raw}），已按它核对。"
+    if handle and _handle_key(handle) == _handle_key(raw):
+        # 号名只差个下划线：这就是同一个号没读全，不能说成「与结论不同」。
+        # 15ea 那单图上 @Banbanko、真号 @Banbanko_，还顺手把另一个同名的
+        # 日本议员号摆了出来，看着就像认错人。
+        return (
+            f"🏷 图上印的 ID 就是这个号（{raw}，号名里的符号没读全，"
+            f"实际是 @{handle}），已按它核对。"
+        )
     return f"🏷 图上读到 ID：{raw}（与上面的结论不同，已按核实结果为准）。"
 
 
@@ -92,6 +100,12 @@ def _grok_lines(grok: dict) -> list[str]:
     mark = _watermark_line(grok)
     if tier == "post":
         lines = ["✅ 找到 X 上的原帖"]
+        name = str(grok.get("name") or "").strip()
+        handle = str(grok.get("handle") or "").strip().lstrip("@")
+        if name:
+            lines.append(f"👤 名字：{name}")
+        if handle:
+            lines.append(f"🆔 账号：@{handle}")
         if grok.get("post_url"):
             lines.append(f"🔗 {grok['post_url']}")
         if mark:
@@ -419,6 +433,12 @@ def _vision_watermark_line(outcome: SearchOutcome) -> str:
             f"这张图就在它自己的帖子里{gap}{tail}"
         )
     text = str(vision.get("watermark") or "").strip()
+    conclusion = _conclusion_handle(outcome)
+    if text and conclusion and _handle_key(text) == _handle_key(conclusion):
+        # 水印读法跟已核实的结论是同一个号（最多差个下划线）：别再来一句
+        # 「这个号存在、但最近没有这张图」——那句话是说给另一个同名账号听的，
+        # 摆在结论下面只会像认错了人。
+        return ""
     if not text:
         handle = str(vision.get("watermark_handle") or "").strip()
         if handle:
@@ -497,6 +517,27 @@ def _squash_handle(text: str) -> str:
     """比水印是否同一个号时用：忽略 ``X@`` / ``IG@`` 前缀、@、空格和大小写。"""
     value = re.sub(r"^[a-z]{1,3}@", "", str(text or "").strip().lower())
     return re.sub(r"[^0-9a-z_]+", "", value)
+
+
+def _handle_key(text: str) -> str:
+    """比「是不是同一个号」时用的归一化写法：连分隔符号一起忽略。
+
+    ``@Banbanko`` 与 ``@Banbanko_`` 只差一个下划线，多数时候是号名没读全；
+    但下划线后面也可能真挂着另一个账号（15ea 那单的 ``@banbanko`` 是个日本
+    议员），所以这个比较只用来解释水印读法，不拿来改结论。
+    """
+    return re.sub(r"[^0-9a-z]+", "", str(text or "").strip().lstrip("@").lower())
+
+
+def _conclusion_handle(outcome: SearchOutcome) -> str:
+    """这单的结论挂在哪个号上：有候选落点就用它，没有才认 Grok 给的号。"""
+    best = outcome.best
+    if best is not None and str(best.handle or "").strip():
+        return str(best.handle).strip().lstrip("@")
+    grok = outcome.grok or {}
+    if str(grok.get("tier") or "") == "post":
+        return str(grok.get("handle") or "").strip().lstrip("@")
+    return ""
 
 
 def _gallery_source_lines(outcome: SearchOutcome) -> list[str]:
