@@ -19,6 +19,7 @@ core/hashing.py        dHash 指纹 + prepare_upload（压到 480KB）
 core/formatting.py     合并转发节点、路线行、重放文案
 core/extract.py        平台识别、账号页判定与归一、账号去重
 core/handles.py        从候选标题里认疑似 X 账号名（纯函数，不碰网络）
+core/identity.py       微博 UID→昵称、昵称→X 号（解析与检索；cookie/检索要网络）
 core/resultcache.py    按图缓存（纯函数 + 原子落盘）
 core/vision.py         视觉复核：拼对照图、写 prompt、解析回复、命中档位（纯函数，不碰网络）
 core/grok.py           Grok 兜底：写 prompt、候选排序、拼请求体、解析帖子/账号链接（纯函数，不碰网络）
@@ -181,6 +182,7 @@ core/maibot_compat.py  能力返回值解包
 34. **封号要两道证据，别听接口一句话**：`jxporn` / `lanrenbl` / `4khd` 这类付费资源站标题里的 `@账号` 是站方抄来做标签的，不是作者主页，结论里要单写一行点明（`formatting.leak_site_of()`，清单只放实测见过的站）。fxtwitter 的 `/2/profile/<号>` 回 `suspended` 只算第一道，还要抓 `x.com/<号>` 的 HTML 找 `Account suspended`（`_homepage_suspended()`）：实测封号号返回 44KB 且带 `UserUnavailable`/`unavailable_reason: Suspended`，正常号 160KB+ 带简介 meta。两道都命中才写「该账号已被 X 封禁（用户 ID …），主页已经打不开了」，只命中一道就写「X 接口读不到这个号（用户 ID …），可能受限或已封」。**别被截图骗**：封号页会保留名字、简介、加入日期（那是缓存下来的资料），内容区是灰块、粉丝数显示 0，看着像「主页能打开」。数字 ID 记在 `Candidate.account_note` 单独占一行（塞进 `note` 会渲染成「匹配：…」）。纯数字 handle 多半是微博 UID / B 站 UID，别去 X 上白查。
 
 35. **水印号只核「存在」等于没核**：`@Miharu` 确实存在（2010 年的老号，6143712），可它不是作者；Grok 读的 `@Moliuwy` 又查无此人——真号 `@Moliww`（莫璃今天吃什么，104 万粉）正好在两个读法之间，一单就漏干净了。所以现在**两个模型读到的号都走 `_verify_watermark_reading()`：核账号 → 翻它自己的带图帖比指纹**，谁命中谁当结论；查无此人时还可以按近似拼写再试（`handles.typo_variants()`，`uwy→ww` 这类 w 读散的还原排在最前），由 `[vision] watermark_variants` 控制。猜写法本身不安全，所以门槛只有一道而且很硬：**候选号自己的帖子里必须真有这张图**。别把「读到的号存在」写成「就是她」，也别因为一个号对不上图就断言水印读错——handle 会被换手。拼图那一步的水印只能当草稿：`TARGET` 格只有 320px，整轮没结论时会用原图（1600 长边）再读一次（`_reread_watermark()`）。
+36. **微博这类站认不了图**：候选只给 `weibo.com/7652767178/...` 这样的 UID，视觉翻来翻去只能说「同一个人」，可那条微博发的是**另一张**照片（距离 29）。这一单的号本身没找错——`7652767178` 就是 `纸悦Etsu_ko` 本人的微博（15.3 万粉、动漫博主），只是这张图她只发在 X 上。所以现在结论停在「同一个人」且落点带微博 UID 时，会走 `_hunt_x_from_name()`：`identity.fetch_weibo_profile()` 拿昵称（`ajax/profile/info` 要先取一次访客 cookie，不带只回 `Forbidden`）→ `identity.search_x_handles()` 用 Lens 那套 SerpAPI key 跑一次 Google 网页检索 → **要求 X 的 name 跟微博昵称对得上** → 翻它自己的带图帖比指纹。命中才升成结论（`engine="identity"`），没命中只写「找到号了、最近没发这张」，别因为名字像就改结论。开关是 `[vision] x_from_name`。别再把微博 UID 当成「查无此人」，也别反过来把它当成原帖出处。
 
 ## 排障顺序
 

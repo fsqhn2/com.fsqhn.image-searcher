@@ -52,6 +52,10 @@ class SearchOutcome:
     # 候选里两个 X 号挂着同一条外链：{"link", "members": [{handle, name, followers}]}。
     # 同一个人的几个号常指向同一个 Patreon，这条比「名字像」硬。
     same_person: dict | None = None
+    # 按微博昵称换到的 X 号：{"status": hit/seen/none, "name", "weibo": {...}, "handle",
+    # "x_name", "followers", "post", "distance", "reason"}。status=hit 时结论已经换成
+    # 那条帖子；seen 只说明「找到这个号了、最近没发这张」，不改结论。
+    x_identity: dict | None = None
     # 展示用图片：候选图地址 → base64。只留在内存里，落盘不保存（体积太大）。
     images: dict[str, str] = field(default_factory=dict)
     # 这次结果来自按图缓存。命中时不重跑引擎，elapsed_ms 是当初那次的耗时。
@@ -77,6 +81,7 @@ class SearchOutcome:
             "x_guess": self.x_guess,
             "paid": self.paid,
             "same_person": self.same_person,
+            "x_identity": self.x_identity,
         }
 
     @classmethod

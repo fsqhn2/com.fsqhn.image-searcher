@@ -47,7 +47,7 @@ def _identity_lines(candidate: Candidate, *, detail: bool = True) -> list[str]:
         if not detail and candidate.status == "match":
             # 首次回复只给结论：命中说明里那句「这是谁的回复页、顺着回复找到原帖」
             # 属于过程，留在「更多」里看。距离是可信度的凭据，保留。
-            if candidate.engine == "watermark":
+            if candidate.engine in {"watermark", "identity"}:
                 note = "本人发过这张图"
             else:
                 note = note.split("：", 1)[0]
@@ -119,6 +119,48 @@ def _fans_text(count: int) -> str:
     if count >= 10000:
         return f"{count / 10000:.1f} 万"
     return str(count)
+
+
+def _x_identity_lines(outcome: SearchOutcome) -> list[str]:
+    """按微博昵称换到 X 号的那一步，怎么换的、换到没换到，都要写清。
+
+    这类单子上「人对、平台错」最容易让人误会：微博那个 UID 确实是她本人，但这张
+    图她没发在微博。所以换成功要说明换的路径（昵称 → X 号 → 她自己的帖子），
+    没换成功也要把昵称写出来，别让用户只看到一串 UID。
+    """
+    info = outcome.x_identity or {}
+    if not info:
+        return []
+    status = str(info.get("status") or "")
+    weibo = info.get("weibo") or {}
+    weibo_name = str(weibo.get("name") or info.get("name") or "").strip()
+    weibo_fans = int(weibo.get("followers") or 0)
+    weibo_part = weibo_name
+    if weibo_part and weibo_fans:
+        weibo_part = f"{weibo_part}（{_fans_text(weibo_fans)}粉）"
+    if status == "hit":
+        handle = str(info.get("handle") or "").strip().lstrip("@")
+        if not handle:
+            return []
+        return [f"🔎 这个 X 号是按名字找到的：微博 {weibo_part or '同名账号'} → X @{handle}"]
+    if status == "seen":
+        handle = str(info.get("handle") or "").strip().lstrip("@")
+        if not handle:
+            return []
+        x_name = str(info.get("x_name") or "").strip()
+        fans = int(info.get("followers") or 0)
+        who = f"@{handle}"
+        if x_name:
+            who += f"（{x_name}"
+            who += f"，{_fans_text(fans)}粉）" if fans else "）"
+        reason = str(info.get("reason") or "").strip() or "最近十几条带图帖里没这张"
+        return [
+            f"🔎 微博 {weibo_part or '同名账号'} 对应的 X 是 {who}，但{reason}："
+            "这人应该没错，原帖大概只发在别处"
+        ]
+    if not weibo_part:
+        return []
+    return [f"🔎 微博 {weibo_part} 这个号是存在的；这次没搜到对应的 X 号，没能往下核"]
 
 
 def _x_guess_lines(outcome: SearchOutcome) -> list[str]:
@@ -288,6 +330,7 @@ def _best_block(outcome: SearchOutcome, *, skip_grok: bool = False, detail: bool
     watermark = _vision_watermark_line(outcome)
     if watermark:
         extra.append(watermark)
+    extra.extend(_x_identity_lines(outcome))
     extra.extend(_gallery_source_lines(outcome))
     if not skip_grok:
         miss = _grok_miss_line(outcome)
@@ -616,6 +659,7 @@ ENGINE_LABELS = {
     "baidu": "百度识图",
     "saucenao": "SauceNAO",
     "watermark": "图上水印核对",
+    "identity": "按名字换到 X 核对",
 }
 
 
@@ -960,6 +1004,7 @@ def _vision_block(outcome: SearchOutcome) -> list[dict] | None:
     if miss:
         lines.append(miss)
     lines.extend(_same_person_lines(outcome))
+    lines.extend(_x_identity_lines(outcome))
     content: list[dict] = [{"type": "text", "content": "\n".join(lines)}]
     if outcome.image_b64:
         content.append({"type": "image", "content": outcome.image_b64})

@@ -1284,6 +1284,96 @@ class WatermarkProfileTest(unittest.TestCase):
         self.assertNotIn("核对上了", text)
 
 
+class XIdentityTest(unittest.TestCase):
+    """微博 UID 换昵称、再换到 X 号那条线怎么落到文案上。"""
+
+    def _vision_best(self, uid: str = "7652767178") -> Candidate:
+        best = Candidate(
+            engine="lens",
+            url=f"https://weibo.com/{uid}/RqDnJ6SQY",
+            platform="微博",
+            handle=uid,
+            distance=29,
+            status="vision",
+            note="视觉复核：同一个人（指纹距离 29，超过阈值 8）",
+        )
+        best.finalize()
+        return best
+
+    def test_seen_reports_the_right_account_without_claiming_source(self) -> None:
+        """找到她的 X 号、但最近没发这张：要写清「人没错、原帖在别处」。"""
+        outcome = SearchOutcome(
+            status="not_found",
+            best=self._vision_best(),
+            x_identity={
+                "status": "seen",
+                "name": "纸悦Etsu_ko",
+                "weibo": {"name": "纸悦Etsu_ko", "followers": 153067},
+                "handle": "Etsuko827",
+                "x_name": "纸悦Etsu_ko",
+                "followers": 12345,
+                "reason": "最近十几条带图帖里没这张",
+            },
+        )
+        text = formatting._best_block(outcome)
+        self.assertIn("@Etsuko827", text)
+        self.assertIn("15.3 万粉", text)
+        self.assertIn("这人应该没错", text)
+        self.assertIn("没找到同一张图", text)
+
+    def test_hit_explains_how_the_handle_was_found(self) -> None:
+        """换到号并命中时，结论是那条帖子，另起一行交代号是怎么来的。"""
+        best = Candidate(
+            engine="identity",
+            url="https://x.com/Etsuko827/status/2119988412052840742",
+            platform="X (Twitter)",
+            handle="@Etsuko827",
+            name="纸悦Etsu_ko",
+            distance=0,
+            status="match",
+            note="按微博昵称找到 X @Etsuko827：它自己的带图帖里有这张图（距离 0）",
+        )
+        best.finalize()
+        outcome = SearchOutcome(
+            status="ok",
+            best=best,
+            x_identity={
+                "status": "hit",
+                "name": "纸悦Etsu_ko",
+                "weibo": {"name": "纸悦Etsu_ko", "followers": 153067},
+                "handle": "Etsuko827",
+                "x_name": "纸悦Etsu_ko",
+                "followers": 12345,
+                "post": "https://x.com/Etsuko827/status/2119988412052840742",
+                "distance": 0,
+            },
+        )
+        text = formatting._best_block(outcome)
+        self.assertIn("本人发过这张图", text)
+        self.assertIn("https://x.com/Etsuko827/status/2119988412052840742", text)
+        self.assertIn("这个 X 号是按名字找到的", text)
+
+    def test_none_only_mentions_the_weibo_name(self) -> None:
+        """检索没给出号时，至少把昵称写出来——UID 本身搜不出人。"""
+        outcome = SearchOutcome(
+            status="not_found",
+            best=self._vision_best(),
+            x_identity={
+                "status": "none",
+                "name": "纸悦Etsu_ko",
+                "weibo": {"name": "纸悦Etsu_ko", "followers": 153067},
+                "reason": "检索没给出 X 号",
+            },
+        )
+        text = formatting._best_block(outcome)
+        self.assertIn("纸悦Etsu_ko", text)
+        self.assertIn("没搜到对应的 X 号", text)
+
+    def test_no_identity_leaves_the_block_untouched(self) -> None:
+        outcome = SearchOutcome(status="not_found", best=self._vision_best())
+        text = formatting._best_block(outcome)
+        self.assertNotIn("按名字", text)
+
 
 if __name__ == "__main__":
     unittest.main()

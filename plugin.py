@@ -20,7 +20,7 @@ from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBa
 from maibot_sdk.config import build_plugin_default_config, merge_plugin_config_data
 from maibot_sdk.types import HookMode, ToolParameterInfo, ToolParamType
 
-from .core import fxtwitter, formatting, grok, handles, paid, resultcache, same_person, vision
+from .core import fxtwitter, formatting, grok, handles, identity, paid, resultcache, same_person, vision
 from .core.commands import build_command_pattern, build_more_pattern, split_force
 from .core.config import migrate_legacy_sections
 from .core.engines import (
@@ -352,6 +352,19 @@ class VisionConfig(PluginConfigBase):
         json_schema_extra=_ui(
             "水印号查无时按近似拼写再试",
             "默认开。每单最多试十来个写法，而且必须指纹对得上才采用；关掉就只认读出来的原号。",
+        ),
+    )
+    x_from_name: bool = Field(
+        default=True,
+        description=(
+            "按名字换到 X 上核：结论只到「同一个人」、落点又是微博这类认不了图的站时，"
+            "把那个号（微博 UID）换成昵称，拿昵称检索一次 X 账号，逐个翻带图帖比指纹。"
+            "只有那个号自己的帖子里真有这张图才算命中；换号本身不会改结论。"
+        ),
+        json_schema_extra=_ui(
+            "按名字去 X 上核",
+            "默认开。微博这类站认不了图，这一步能把「同一个人」落到具体 X 号；"
+            "每单最多一次网页检索、两个候选号，找不到就照旧按没找到写。",
         ),
     )
     top_n: int = Field(
@@ -1728,6 +1741,22 @@ class ImageSearcherPlugin(MaiBotPlugin):
         # 图上水印核对到本人发过这张图时，这条就是结论：指纹对得上、又是本人
         # 亲手发的帖，比「视觉说是同一个人」硬得多。
         best = self._promote_watermark_hit(best, vision_info)
+        # 结论只到「同一个人」、落点又认不了图（微博这类站只给 UID）时，顺着名字
+        # 去 X 上找这个号核图：命中就把结论换成那条帖子，没命中只记一句供呈现用。
+        x_identity: dict[str, Any] | None = None
+        if (
+            upload
+            and best is not None
+            and best.status == "vision"
+            and bool(getattr(config.vision, "x_from_name", True))
+        ):
+            try:
+                x_identity = await self._hunt_x_from_name(best, upload)
+            except Exception as error:  # noqa: BLE001 - 换不到号不影响已经搜到的结果
+                self.ctx.logger.warning("按名字换 X 号失败：%s", error)
+                x_identity = None
+            if x_identity and x_identity.get("status") == "hit":
+                best = self._promote_x_identity(best, x_identity)
         # 结论里的账号核一下死活：被封的号 handle 会被释放，只剩数字 ID 能对上人。
         best = await self._check_best_account(best, vision_info)
 
@@ -1808,6 +1837,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
             x_guess=x_guess,
             paid=paid_info,
             same_person=same_person_info,
+            x_identity=x_identity,
         )
 
         if grok_hit and best is None and upload:
@@ -3714,6 +3744,159 @@ class ImageSearcherPlugin(MaiBotPlugin):
         best.note = f"视觉复核：疑似同一个人，但没在 @{handle} 最近的带图帖里翻到这张，仅供参考"
         self._vlog("视觉主页没翻到原帖，降级：%s", handle)
         return None
+
+    # 按名字换号时最多核这么多个候选。检索结果里第一个通常就是本人，多试只是
+    # 给同名的人留一次机会，翻帖那一步一样要指纹对上才作数。
+    _X_FROM_NAME_LIMIT = 2
+
+    @staticmethod
+    def _weibo_uid(item: Candidate | None) -> str:
+        """落点是微博、账号字段是纯数字时，那个数字就是微博 UID。
+
+        微博候选的 handle 只有 UID（``7652767178``），没有昵称；UID 本身搜不出人，
+        要先换成昵称。
+        """
+        if item is None:
+            return ""
+        handle = (item.handle or "").strip().lstrip("@")
+        if len(handle) < 5 or not handle.isdigit():
+            return ""
+        url = (item.url or "").lower()
+        if "weibo.com" in url or "weibo.cn" in url:
+            return handle
+        return ""
+
+    async def _weibo_profile(self, uid: str) -> dict[str, Any] | None:
+        """微博 UID → 昵称/粉丝/认证。查不到就当没有，不编名字。"""
+
+        def fetch() -> dict[str, Any] | None:
+            return identity.fetch_weibo_profile(uid, self._proxy(), timeout=15)
+
+        try:
+            info = await asyncio.wait_for(asyncio.to_thread(fetch), timeout=28)
+        except Exception as error:  # noqa: BLE001 - 换不到昵称就停下，不影响已有结论
+            self._vlog("微博 UID %s 换成昵称失败：%s", uid, str(error)[:80])
+            return None
+        if info:
+            self._vlog(
+                "微博 UID %s → 昵称 %s（粉丝 %s）",
+                uid,
+                info.get("name"),
+                info.get("followers"),
+            )
+        return info
+
+    async def _search_x_handles(self, name: str) -> list[str]:
+        """昵称 → 疑似 X 号，借用 Lens 那套 SerpAPI key 跑一次网页检索。"""
+        pool = self._pools.get("lens")
+        key = pool.acquire() if pool else ""
+        if not key:
+            self._vlog("按名字搜 X：没有可用的 SerpAPI key，跳过")
+            return []
+
+        def fetch() -> list[str]:
+            return identity.search_x_handles(name, key, self._proxy())
+
+        try:
+            found = await asyncio.wait_for(asyncio.to_thread(fetch), timeout=40)
+        except Exception as error:  # noqa: BLE001 - 搜不到就当没有这一步
+            self._vlog("按名字搜 X 失败：%s", str(error)[:80])
+            return []
+        self._vlog("按名字搜 X：%s → %s", name, "、".join(found) or "没给出号")
+        return found
+
+    async def _hunt_x_from_name(
+        self, best: Candidate | None, upload: bytes | None
+    ) -> dict[str, Any] | None:
+        """结论只到「同一个人」、落点又认不了图时，顺着名字去 X 上核这个号。
+
+        微博这类站给不了原帖：候选只有 UID，视觉翻来覆去也只能说「同一个人」。
+        这时把 UID 换成昵称，拿昵称检索一次 X 账号，逐个翻它们自己的带图帖比
+        指纹——命中就把结论换成那条帖子，没命中就只留一句「找到号了、最近没发
+        这张」，绝不因为名字像就改结论。
+        """
+        uid = self._weibo_uid(best)
+        if not uid or not upload:
+            return None
+        weibo = await self._weibo_profile(uid)
+        if not weibo:
+            return {"status": "none", "name": "", "uid": uid, "reason": "微博资料读不到"}
+        name = str(weibo.get("name") or "")
+        handles_found = await self._search_x_handles(name)
+        if not handles_found:
+            return {"status": "none", "name": name, "weibo": weibo, "reason": "检索没给出 X 号"}
+        seen: dict[str, Any] | None = None
+        for handle in handles_found[: self._X_FROM_NAME_LIMIT]:
+            info = await self._profile(handle)
+            if not info:
+                continue
+            x_name = str(info.get("name") or "")
+            followers = int(info.get("followers") or 0)
+            if not (
+                identity.name_matches(name, x_name)
+                or identity.name_matches(name, handle)
+            ):
+                self._vlog("按名字搜到的 @%s（%s）跟微博昵称对不上，丢掉", handle, x_name or "-")
+                continue
+            resolved = str(info.get("screen_name") or handle)
+            self._vlog(
+                "按名字对上 X：@%s（%s，粉丝 %s），翻带图帖比指纹",
+                resolved,
+                x_name or "-",
+                followers,
+            )
+            hit = await self._media_lookup(resolved, upload)
+            if hit and hit.get("url"):
+                return {
+                    "status": "hit",
+                    "name": name,
+                    "weibo": weibo,
+                    "handle": resolved,
+                    "x_name": x_name,
+                    "followers": followers,
+                    "post": str(hit.get("url") or ""),
+                    "distance": int(hit.get("distance") or 0),
+                }
+            seen = {
+                "status": "seen",
+                "name": name,
+                "weibo": weibo,
+                "handle": resolved,
+                "x_name": x_name,
+                "followers": followers,
+                "reason": "最近十几条带图帖里没这张"
+                if not (hit and hit.get("error"))
+                else "这次没翻成它的带图帖",
+            }
+        return seen or {
+            "status": "none",
+            "name": name,
+            "weibo": weibo,
+            "reason": "搜到的号跟昵称对不上",
+        }
+
+    def _promote_x_identity(self, best: Candidate | None, info: dict[str, Any]) -> Candidate | None:
+        """按名字换到的号自己发过这张图时，那条帖子就是结论。
+
+        证据是「这个号自己的带图帖里指纹对上」，比「视觉觉得是同一个人」硬，
+        所以直接升成 match；换不到就原样退回，不碰已有结论。
+        """
+        post = str(info.get("post") or "")
+        handle = str(info.get("handle") or "").strip().lstrip("@")
+        if not post or not handle:
+            return best
+        distance = int(info.get("distance") or 0)
+        self._vlog("按名字换号命中，升成结论：@%s %s（距离 %s）", handle, post, distance)
+        return Candidate(
+            engine="identity",
+            url=post,
+            platform="X (Twitter)",
+            handle="@" + handle,
+            name=str(info.get("x_name") or ""),
+            distance=distance,
+            status="match",
+            note=f"按微博昵称找到 X @{handle}：它自己的带图帖里有这张图（距离 {distance}）",
+        )
 
     # 从候选标题猜账号时最多验这么多个名字。别名列表常常挤在某一条搬运站
     # 标题里，前面几条候选的站点名会把名额吃光，所以名额放宽到 20，并按状态
