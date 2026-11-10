@@ -20,7 +20,18 @@ from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBa
 from maibot_sdk.config import build_plugin_default_config, merge_plugin_config_data
 from maibot_sdk.types import HookMode, ToolParameterInfo, ToolParamType
 
-from .core import fxtwitter, formatting, grok, handles, identity, paid, resultcache, same_person, vision
+from .core import (
+    fxtwitter,
+    formatting,
+    grok,
+    handles,
+    identity,
+    paid,
+    paywall,
+    resultcache,
+    same_person,
+    vision,
+)
 from .core.commands import build_command_pattern, build_more_pattern, split_force
 from .core.config import migrate_legacy_sections
 from .core.engines import (
@@ -377,6 +388,19 @@ class VisionConfig(PluginConfigBase):
         json_schema_extra=_ui(
             "搬运站命中时翻候选里的 X 号",
             "默认开。最多两个号、整段 90 秒；只认指纹命中，翻不到只写一句查过哪些号。",
+        ),
+    )
+    paywall: bool = Field(
+        default=True,
+        description=(
+            "确认作者后找售卖页：图包里的图公开渠道永远搜不到，作者只在 Patreon／"
+            "FANBOX 上卖。结论落到具体的人之后，读她 X 资料里挂的链接，去付费页的"
+            "公开列表里找这一期，给出售卖页、订阅档位和有没有免费预览。"
+        ),
+        json_schema_extra=_ui(
+            "确认作者后找售卖页",
+            "默认开。只读两个站的公开接口（不登录、不订阅），付费帖正文读不到；"
+            "最多多花二十秒，查不到就不写这一段。",
         ),
     )
     top_n: int = Field(
@@ -1790,6 +1814,31 @@ class ImageSearcherPlugin(MaiBotPlugin):
         # 结论里的账号核一下死活：被封的号 handle 会被释放，只剩数字 ID 能对上人。
         best = await self._check_best_account(best, vision_info)
 
+        # 结论落到人身上之后，再去她自己的付费页确认这一期卖在哪。图包里的图
+        # 公开渠道搜不到，Patreon／FANBOX 的公开列表是唯一能给到底的地方。
+        paywall_info: dict[str, Any] | None = None
+        if bool(getattr(config.vision, "paywall", True)):
+            author = ""
+            post_url = ""
+            if best is not None and (best.handle or "").strip():
+                author = best.handle.strip().lstrip("@")
+                if self._is_x(best) and "/status/" in (best.url or ""):
+                    post_url = best.url
+            elif (grok_info or {}).get("tier") == "post":
+                author = str((grok_info or {}).get("handle") or "").strip().lstrip("@")
+                post_url = str((grok_info or {}).get("post_url") or "")
+            if author:
+                texts = [best.title if best is not None else ""]
+                texts.append(str((grok_info or {}).get("reason") or ""))
+                texts.extend(str(item.title or "") for item in ordered[:8])
+                try:
+                    paywall_info = await asyncio.wait_for(
+                        self._track_paywall(author, texts, post_url), timeout=30
+                    )
+                except Exception as error:  # noqa: BLE001 - 付费页查不到不影响结论
+                    self.ctx.logger.warning("付费页追踪失败：%s", error)
+                    paywall_info = None
+
         self._vlog(
             "分流结果：路线=%s 原因=%s；匹配=%s 视觉=%s 疑似=%s 不符=%s 未验证=%s",
             route,
@@ -1869,6 +1918,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
             same_person=same_person_info,
             x_identity=x_identity,
             repost_author=repost_author,
+            paywall=paywall_info,
         )
 
         if grok_hit and best is None and upload:
@@ -4096,6 +4146,144 @@ class ImageSearcherPlugin(MaiBotPlugin):
             return await asyncio.wait_for(asyncio.to_thread(fetch), timeout=20)
         except Exception:  # noqa: BLE001 - 查不到就当没这个号
             return None
+
+    async def _fetch_json(
+        self, url: str, headers: dict[str, str] | None = None, timeout: int = 15
+    ) -> dict[str, Any] | None:
+        """读一个公开 JSON 接口。失败一律当没有，别让付费页把整单拖住。"""
+        proxy = self._proxy()
+
+        def fetch() -> dict[str, Any] | None:
+            session = make_session(proxy, headers=headers)
+            try:
+                response = session.get(url, timeout=timeout)
+                if response.status_code != 200:
+                    return None
+                payload = response.json()
+                return payload if isinstance(payload, dict) else None
+            finally:
+                session.close()
+
+        try:
+            data = await asyncio.wait_for(asyncio.to_thread(fetch), timeout=timeout + 4)
+        except Exception:  # noqa: BLE001 - 查不到就当没有
+            return None
+        return data if isinstance(data, dict) else None
+
+    async def _track_paywall(
+        self, handle: str, texts: list[str], post_url: str = ""
+    ) -> dict[str, Any] | None:
+        """确认作者之后，去她挂的付费页找这一期卖在哪。
+
+        图包里的图公开渠道永远搜不到：作者只在 Patreon／FANBOX 上卖。X 资料里
+        通常就挂着这两个链接，付费页那边有免登录的公开列表，能读到标题、发布
+        时间、最低订阅额与档位，公开帖还能当免费预览。付费帖正文读不到，所以
+        这里只给「卖在哪、多少钱、有没有免费预览」。
+        """
+        handle = (handle or "").strip().lstrip("@")
+        if not handle or not handle.isascii():
+            return None
+        user = await self._profile(handle)
+        if not user:
+            return None
+        website = user.get("website") or {}
+        website_url = str(website.get("url") or "") if isinstance(website, dict) else str(website or "")
+        links = paywall.links_of(str(user.get("description") or ""), website_url)
+        if not links:
+            return None
+        sources = list(texts)
+        if post_url:
+            tweet = await self._fetch_tweet(post_url)
+            if tweet is not None and getattr(tweet, "ok", False) and tweet.text:
+                # 结论帖的正文和话题标签最说明是哪个角色（``#RemielleDan``），排最前。
+                sources.insert(0, tweet.text)
+        words = paywall.keywords(*sources)
+        for kind in ("patreon", "fanbox"):
+            name = links.get(kind)
+            if not name:
+                continue
+            try:
+                found = (
+                    await self._patreon_track(name, words)
+                    if kind == "patreon"
+                    else await self._fanbox_track(name, words)
+                )
+            except Exception as error:  # noqa: BLE001 - 付费页查不到不影响结论
+                self._vlog("付费页追踪失败：%s %s", kind, str(error)[:80])
+                continue
+            if found:
+                found["handle"] = handle
+                self._vlog(
+                    "付费页命中：%s %s → %s",
+                    kind,
+                    name,
+                    str((found.get("post") or {}).get("url") or found.get("shop") or "")[:80],
+                )
+                return found
+        return None
+
+    async def _patreon_track(self, vanity: str, words: list[str]) -> dict[str, Any] | None:
+        """Patreon：名字换 campaign id，再读档位与最近二十期。"""
+        base = "https://www.patreon.com/api"
+        listing = await self._fetch_json(f"{base}/campaigns?filter[vanity]={vanity}")
+        items = (listing or {}).get("data") or []
+        campaign_id = str((items[0] or {}).get("id") or "") if items else ""
+        if not campaign_id:
+            return None
+        detail = await self._fetch_json(f"{base}/campaigns/{campaign_id}?include=rewards")
+        posts_payload = await self._fetch_json(
+            f"{base}/posts?filter[campaign_id]={campaign_id}&page[count]=20&sort=-published_at"
+        )
+        posts = paywall.patreon_posts(posts_payload)
+        tiers = paywall.patreon_rewards(detail)
+        currency = next((tier["currency"] for tier in tiers if tier.get("currency")), "")
+        post = paywall.pick_post(posts, words)
+        info: dict[str, Any] = {
+            "platform": "patreon",
+            "shop": f"https://www.patreon.com/{vanity}",
+            "post": post,
+            "tiers": tiers,
+            "preview": None,
+        }
+        if post is not None:
+            if not post.get("currency"):
+                post["currency"] = currency
+            preview = paywall.free_post(posts, paywall.keywords(post.get("title") or ""))
+            if preview is not None and preview.get("url") != post.get("url"):
+                info["preview"] = {"title": preview.get("title"), "url": preview.get("url")}
+        if post is None and not tiers:
+            return None
+        return info
+
+    async def _fanbox_track(self, creator: str, words: list[str]) -> dict[str, Any] | None:
+        """FANBOX：公开列表带 ``feeRequired``，能直接看出哪期要付费。"""
+        headers = {
+            "Origin": "https://www.fanbox.cc",
+            "Referer": f"https://{creator}.fanbox.cc/",
+        }
+        payload = await self._fetch_json(
+            f"https://api.fanbox.cc/post.listCreator?creatorId={creator}&limit=20", headers=headers
+        )
+        posts = paywall.fanbox_posts(payload, creator)
+        if not posts:
+            return None
+        plans = await self._fetch_json(
+            f"https://api.fanbox.cc/plan.listCreator?creatorId={creator}", headers=headers
+        )
+        tiers = paywall.fanbox_plans(plans)
+        post = paywall.pick_post(posts, words)
+        info: dict[str, Any] = {
+            "platform": "fanbox",
+            "shop": f"https://{creator}.fanbox.cc",
+            "post": post,
+            "tiers": tiers,
+            "preview": None,
+        }
+        if post is not None:
+            preview = paywall.free_post(posts, paywall.keywords(post.get("title") or ""))
+            if preview is not None and preview.get("url") != post.get("url"):
+                info["preview"] = {"title": preview.get("title"), "url": preview.get("url")}
+        return info
 
     def _identity_texts(self, ordered: list[Candidate]) -> list[str]:
         """已经靠图像对上的那几条候选的名字，用来卡住张冠李戴。

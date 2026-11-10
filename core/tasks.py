@@ -60,6 +60,11 @@ class SearchOutcome:
     # "handle", "post", "distance", "x_name"}。hit 时结论已经换成那条帖子；none 只用来
     # 说明「翻过哪些号、都没有」，不改结论。
     repost_author: dict | None = None
+    # 确认作者后在她自己的付费页找到的售卖信息：{"platform": patreon/fanbox, "handle",
+    # "shop", "post": {title, url, published, min_cents, currency},
+    # "tiers": [{title, cents, currency, free}], "preview": {title, url}}。
+    # 图包里的图公开渠道搜不到，这块是唯一能给到底的地方；没有付费页时为空。
+    paywall: dict | None = None
     # 展示用图片：候选图地址 → base64。只留在内存里，落盘不保存（体积太大）。
     images: dict[str, str] = field(default_factory=dict)
     # 这次结果来自按图缓存。命中时不重跑引擎，elapsed_ms 是当初那次的耗时。
@@ -87,6 +92,7 @@ class SearchOutcome:
             "same_person": self.same_person,
             "x_identity": self.x_identity,
             "repost_author": self.repost_author,
+            "paywall": self.paywall,
         }
 
     @classmethod
@@ -111,6 +117,9 @@ class SearchOutcome:
             x_guess=summary.get("x_guess"),
             paid=summary.get("paid"),
             same_person=summary.get("same_person"),
+            x_identity=summary.get("x_identity"),
+            repost_author=summary.get("repost_author"),
+            paywall=summary.get("paywall"),
         )
 
 

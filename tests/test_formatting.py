@@ -1355,6 +1355,77 @@ class WatermarkSameAccountTest(unittest.TestCase):
         self.assertIn("@Banbanko_", text)
 
 
+class PaywallTest(unittest.TestCase):
+    """确认作者后找到的售卖页：卖在哪、多少钱、要不要订阅。"""
+
+    def _paid_case(self) -> SearchOutcome:
+        outcome = SearchOutcome(status="ok", best=None, candidates=[], total_candidates=0)
+        outcome.paywall = {
+            "platform": "patreon",
+            "handle": "oioioi525",
+            "shop": "https://www.patreon.com/oioioi525",
+            "post": {
+                "title": "Rossi 108p",
+                "url": "https://www.patreon.com/oioioi525/posts/rossi-108p-171677785",
+                "published": "2026-10-07",
+                "min_cents": 0,
+                "locked": True,
+                "currency": "HKD",
+            },
+            "tiers": [
+                {"title": "Free", "cents": 0, "currency": "HKD", "free": True},
+                {"title": "ranran", "cents": 5500, "currency": "HKD", "free": False},
+            ],
+            "preview": None,
+        }
+        return outcome
+
+    def test_shows_shop_tiers_and_gate(self) -> None:
+        text = formatting._best_block(self._paid_case())
+        self.assertIn("售卖页（Patreon）：Rossi 108p", text)
+        self.assertIn("rossi-108p-171677785", text)
+        self.assertIn("档位", text)
+        self.assertIn("ranran HK$55", text)
+        self.assertIn("订阅", text)
+
+    def test_preview_replaces_gate_line(self) -> None:
+        outcome = self._paid_case()
+        outcome.paywall["preview"] = {"title": "Rossi 预告", "url": "https://x.com/oioioi525/status/1"}
+        text = formatting._best_block(outcome)
+        self.assertIn("免费预览", text)
+        self.assertNotIn("🔒", text)
+
+    def test_nothing_when_no_paywall(self) -> None:
+        outcome = SearchOutcome(status="not_found", best=None, candidates=[], total_candidates=0)
+        self.assertNotIn("售卖页", formatting._best_block(outcome))
+
+
+class XProfileLinkTest(unittest.TestCase):
+    """X 上给的是帖子链接，账号主页还得单独写出来。"""
+
+    def test_best_candidate_shows_profile(self) -> None:
+        best = Candidate(
+            engine="lens",
+            url="https://x.com/oioioi525/status/2119651416868540557",
+            platform="X (Twitter)",
+            handle="oioioi525",
+            name="ran3",
+            status="match",
+            note="本人发过这张图",
+        )
+        outcome = SearchOutcome(status="ok", best=best, candidates=[best], total_candidates=1)
+        self.assertIn("🐦 X 主页：https://x.com/oioioi525", formatting._best_block(outcome))
+
+    def test_grok_post_shows_profile(self) -> None:
+        outcome = SearchOutcome(status="ok", best=None, candidates=[], total_candidates=0)
+        outcome.grok = {
+            "tier": "post",
+            "handle": "Banbanko_",
+            "post_url": "https://x.com/Banbanko_/status/2119974818808492177",
+        }
+        self.assertIn("🐦 X 主页：https://x.com/Banbanko_", formatting._best_block(outcome))
+
+
 class XIdentityTest(unittest.TestCase):
     """微博 UID 换昵称、再换到 X 号那条线怎么落到文案上。"""
 

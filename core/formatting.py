@@ -8,11 +8,18 @@ from urllib.parse import urlparse
 from .engines import Candidate, is_avatar_hit
 from .extract import is_avatar_image, is_forum_page
 from .tasks import SearchOutcome, SearchTask
+from . import paywall
 
 AI_FLAG_THRESHOLD = 0.75
 
 # B 站视频号：BV 开头加一串大小写字母数字，例如 BV16m4y1E7Tf。
 _BV_RE = re.compile(r"^BV[0-9A-Za-z]{8,}$")
+
+
+def _is_x_platform(platform: str) -> bool:
+    """这条候选是不是落在 X 上。注意别用 ``"x" in platform``：pixiv 也有 x。"""
+    text = str(platform or "").strip().lower()
+    return text in {"x", "twitter", "x (twitter)"} or text.startswith("x (")
 
 
 def _ai_line(ai: dict | None) -> str:
@@ -61,6 +68,11 @@ def _identity_lines(candidate: Candidate, *, detail: bool = True) -> list[str]:
         # 有这么一个用户，去搜还搜不到——它跟 UID 一样只是定位用的编号。
         label = "🎬 视频号" if _BV_RE.match(candidate.handle.strip()) else "🆔 账号"
         lines.append(f"{label}：{candidate.handle}")
+        if label == "🆔 账号" and _is_x_platform(candidate.platform):
+            # X 上给的是帖子链接，账号本身还得点进主页看：直接把主页地址写出来。
+            profile = f"https://x.com/{candidate.handle.strip().lstrip('@')}"
+            if _bare_url(profile) != _bare_url(candidate.url):
+                lines.append(f"🐦 X 主页：{profile}")
     if candidate.account_note:
         lines.append(candidate.account_note)
     if candidate.url:
@@ -106,6 +118,7 @@ def _grok_lines(grok: dict) -> list[str]:
             lines.append(f"👤 名字：{name}")
         if handle:
             lines.append(f"🆔 账号：@{handle}")
+            lines.append(f"🐦 X 主页：https://x.com/{handle}")
         if grok.get("post_url"):
             lines.append(f"🔗 {grok['post_url']}")
         if mark:
@@ -229,6 +242,42 @@ def _x_guess_lines(outcome: SearchOutcome) -> list[str]:
     else:
         lines.append(f"从候选 {platform} 的标题里认出这个名字，X 上确认账号存在。")
     lines.append("只是同一个人可能用的号，不是这张图的原帖。")
+    return lines
+
+
+def _paywall_lines(outcome: SearchOutcome) -> list[str]:
+    """确认作者之后找到的售卖页：卖在哪、多少钱、有没有免费预览。
+
+    图包里的图公开渠道永远搜不到，能给到底的就是这一块。所以它属于结论，
+    放首次回复；「怎么查到的」才留给「更多」。付费帖封面给非订阅者打糊，
+    这里不假装能看到内容，只写清楚要不要订阅。
+    """
+    info = outcome.paywall or {}
+    platform = str(info.get("platform") or "").strip().lower()
+    if not platform:
+        return []
+    label = {"patreon": "Patreon", "fanbox": "FANBOX"}.get(platform, platform)
+    shop = str(info.get("shop") or "").strip()
+    post = info.get("post") or {}
+    lines: list[str] = []
+    if post.get("url"):
+        head = f"🛒 售卖页（{label}）：{post.get('title')}"
+        if post.get("published"):
+            head += f"，{post['published']} 发布"
+        lines.append(head)
+        lines.append(f"🔗 {post['url']}")
+    elif shop:
+        lines.append(f"🛒 她的 {label}：{shop}（最近二十期里没对上这一期）")
+    tiers = info.get("tiers") or []
+    text = paywall.tier_text(tiers)
+    if text:
+        lines.append(f"💰 档位：{text}")
+    preview = info.get("preview") or {}
+    if preview.get("url"):
+        title = str(preview.get("title") or "").strip()
+        lines.append(f"🎁 免费预览：{title} {preview['url']}".replace("  ", " "))
+    elif post.get("url"):
+        lines.append(f"🔒 {paywall.gate_text(post, tiers)}")
     return lines
 
 
@@ -380,6 +429,7 @@ def _best_block(outcome: SearchOutcome, *, skip_grok: bool = False, detail: bool
         extra.append(watermark)
     extra.extend(_x_identity_lines(outcome))
     extra.extend(_repost_author_lines(outcome, detail=detail))
+    extra.extend(_paywall_lines(outcome))
     extra.extend(_gallery_source_lines(outcome))
     if not skip_grok:
         miss = _grok_miss_line(outcome)
