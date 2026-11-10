@@ -492,12 +492,13 @@ class GrokConfig(PluginConfigBase):
         ),
     )
     timeout: int = Field(
-        default=120,
+        default=180,
         description=(
-            "找人最多等多少秒。实测顺利时约 48 秒，但服务端会抖动，出现过 70 秒无响应；"
-            "120 秒留足余量，超时就放弃，视觉结果照常返回。"
+            "找人最多等多少秒。实测中转站跑一轮带图的 X 检索要 100 秒上下"
+            "（grok-4.6 实测 118.8 秒才回，grok-4.7 会直接超 120 秒），"
+            "180 秒才留得住余量；超时就放弃，视觉结果照常返回。"
         ),
-        json_schema_extra=_ui("超时（秒）", "默认 120。抖动时一次可能跑满，嫌久可以调回 70。"),
+        json_schema_extra=_ui("超时（秒）", "默认 180。嫌久可以调回 120，但中转站慢时会整单没结果。"),
         ge=15,
         le=300,
     )
@@ -2581,10 +2582,11 @@ class ImageSearcherPlugin(MaiBotPlugin):
             finally:
                 session.close()
 
-        # 每个模型各等一次完整超时；都试完再用短超时把主模型补一次——中转站的
-        # 抖动常常是瞬时的，但同一模型连续卡死时，换模型比干等更管用。
+        # 每个模型各等一次完整超时。中转站现在跑一轮带图的 X 检索要 100 秒上下
+        # （实测 grok-4.6 118.8 秒才回、grok-4.7 直接超 120），120 秒那版刚好卡在
+        # 边缘，一抖动整单就白跑。原来还有一次「短超时补一次」，实测没救回过任何
+        # 一单，只是又白占 60 秒，去掉。
         attempts: list[tuple[str, int]] = [(name, timeout) for name in models]
-        attempts.append((model, max(30, min(60, timeout // 2))))
         started = time.time()
         payload: dict | None = None
         for index, (name, seconds) in enumerate(attempts):
