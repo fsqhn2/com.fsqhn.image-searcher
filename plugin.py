@@ -1677,6 +1677,16 @@ class ImageSearcherPlugin(MaiBotPlugin):
                         upload,
                         allow_variants=not had_best,
                     )
+                    # 拼图里 TARGET 格只有 320px，小字水印常被压没或读歪（ac88
+                    # 那次把 Moliww 读成 Miharu）。两条线都没落地时，用原图单独
+                    # 再读一次；读到新号照样核账号、翻带图帖。
+                    if (
+                        not had_best
+                        and not vision_info.get("watermark_post")
+                        and upload
+                        and config.vision.enabled
+                    ):
+                        await self._reread_watermark(vision_info, grok_info, upload)
                 if not had_best and vision_info and vision_info.get("picked"):
                     ordered = dedupe_accounts(self._rank(candidates, names))
                     # 模型可能一次报好几格，取指纹距离最近的那条当结论——距离近说明
@@ -2921,7 +2931,14 @@ class ImageSearcherPlugin(MaiBotPlugin):
         if not results:
             return
         vision_info["watermark_readings"] = results
+        self._apply_watermark_primary(vision_info, results)
 
+    def _apply_watermark_primary(
+        self, vision_info: dict[str, Any], results: list[dict[str, Any]]
+    ) -> None:
+        """把「翻到这张图」的那条读法写成主结论字段，其余留作线索。"""
+        if not results:
+            return
         primary = next((item for item in results if item.get("post")), None)
         if primary is None:
             primary = next(
@@ -2942,6 +2959,12 @@ class ImageSearcherPlugin(MaiBotPlugin):
         if primary.get("fixed"):
             # 记下「读成什么、最后核到哪个」，文案里要讲清楚这次是读偏了。
             vision_info["watermark_fixed_from"] = primary.get("from") or ""
+        else:
+            vision_info.pop("watermark_fixed_from", None)
+        if not primary.get("post"):
+            # 换了主读法但没命中时，别把上一条读法留下的帖子地址继续挂着。
+            vision_info.pop("watermark_post", None)
+            vision_info.pop("watermark_distance", None)
         for item in results:
             if item is primary:
                 continue
@@ -2960,6 +2983,49 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 for item in results
             ),
         )
+
+    async def _reread_watermark(
+        self,
+        vision_info: dict[str, Any],
+        grok_info: dict[str, Any] | None,
+        upload: bytes | None,
+    ) -> None:
+        """拼图里读的水印不可靠时，把原图单独送去再读一次。
+
+        ac88 那单的水印是 4×4 拼图读的（TARGET 格只有 320px），把 ``Moliww``
+        读成了 ``Miharu``；同一张图按原图读就清楚得多。只在整轮没结论、两条水印
+        线也都没落地时跑，多一次 vlm 调用，读到新号才继续往下核。
+        """
+        if not upload or not bool(getattr(self.config.vision, "enabled", True)):
+            return
+        readings = list(vision_info.get("watermark_readings") or [])
+        known = {
+            str(item.get("handle") or "").lower() for item in readings if isinstance(item, dict)
+        }
+        try:
+            info = await self._read_watermark(upload)
+        except Exception as error:  # noqa: BLE001 - 重读只是加分项
+            self.ctx.logger.warning("原图重读水印失败：%s", error)
+            return
+        if not info.get("ok"):
+            self._vlog("原图重读水印没成：%s", info.get("error") or "-")
+            return
+        raw = str(info.get("watermark") or "").strip()
+        handle = vision.handle_from_watermark(raw)
+        if not handle:
+            self._vlog("原图重读水印：文字=%s，没读出账号", raw or "-")
+            return
+        if handle.lower() in known:
+            self._vlog("原图重读水印：还是 @%s，不重复核", handle)
+            return
+        reading = await self._verify_watermark_reading(
+            {"source": "vision-original", "raw": raw, "handle": handle},
+            upload,
+            True,
+        )
+        readings.append(reading)
+        vision_info["watermark_readings"] = readings
+        self._apply_watermark_primary(vision_info, readings)
 
     async def _verify_watermark_reading(
         self,

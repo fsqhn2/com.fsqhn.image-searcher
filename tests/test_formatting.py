@@ -1228,6 +1228,25 @@ class WatermarkProfileTest(unittest.TestCase):
         self.assertIn("@Moliww", text)
         self.assertIn("x.com/Moliww/status/2119651416868540557", text)
 
+    def test_reread_hit_is_not_listed_as_misread(self) -> None:
+        """原图重读直接读对时，这个写法算读对了，不列进「读偏了」。"""
+        outcome = SearchOutcome()
+        outcome.vision = {
+            "watermark": "X@Miharu",
+            "watermark_readings": [
+                {"source": "vision", "raw": "X@Miharu", "handle": "miharu", "state": "ok"},
+                {"source": "grok", "raw": "X@Moliuwy", "handle": "Moliww", "from": "Moliuwy",
+                 "fixed": "Moliww", "state": "ok", "distance": 0,
+                 "post": "https://x.com/Moliww/status/2119651416868540557"},
+                {"source": "vision-original", "raw": "X@Moliww", "handle": "Moliww",
+                 "state": "ok", "distance": 0,
+                 "post": "https://x.com/Moliww/status/2119651416868540557"},
+            ],
+        }
+        text = formatting._best_block(outcome)
+        self.assertIn("X@Miharu、X@Moliuwy", text)
+        self.assertNotIn("X@Moliww 都", text)
+
     def test_readings_without_hit_still_warn(self) -> None:
         """两个读法都没核到这张图时，仍然按线索写，不能变成「核对上了」。"""
         outcome = SearchOutcome()

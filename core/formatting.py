@@ -320,10 +320,15 @@ def _vision_watermark_line(outcome: SearchOutcome) -> str:
     if hit is not None and str(hit.get("fixed") or "").strip():
         raws: list[str] = []
         for item in readings:
+            if str(item.get("post") or "").strip() and not str(item.get("fixed") or "").strip():
+                # 命中且没经过近似拼写的那条，写法本身没错，不用列。
+                continue
             text = str(item.get("raw") or "").strip()
             if text and text not in raws:
                 raws.append(text)
-        where = "、".join(raws) or f"X@{hit.get('fixed')}"
+        where = "、".join(raws[:2]) or f"X@{hit.get('fixed')}"
+        if len(raws) > 2:
+            where += " 等"
         distance = hit.get("distance")
         gap = f"，指纹距离 {distance}" if isinstance(distance, int) else ""
         post = str(hit.get("post") or "").strip()
