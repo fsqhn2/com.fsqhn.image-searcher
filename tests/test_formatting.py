@@ -1355,6 +1355,47 @@ class WatermarkSameAccountTest(unittest.TestCase):
         self.assertIn("@Banbanko_", text)
 
 
+class WatermarkOtherAccountTest(unittest.TestCase):
+    """水印落在本人另一个号上：两边同名时写「她自己的另一个号」，别写成「与结论不同」。"""
+
+    def _case(self) -> SearchOutcome:
+        outcome = SearchOutcome(status="ok", best=None, candidates=[], total_candidates=0)
+        outcome.grok = {
+            "tier": "post",
+            "handle": "asagiriairi002",
+            "name": "朝霧愛理",
+            "post_url": "https://x.com/asagiriairi002/status/2120058321285886140",
+            "watermark": "@Asagiriairi001",
+            "verified": "hit",
+            "distance": 0,
+            "reason": "帖子配图对得上（距离 0）",
+        }
+        outcome.vision = {
+            "watermark": "@Asagiriairi001",
+            "watermark_handle": "Asagiriairi001",
+            "watermark_url": "https://x.com/Asagiriairi001",
+            "watermark_state": "ok",
+            "watermark_user_id": "1111971545025601537",
+            "watermark_name": "朝霧愛理",
+            "watermark_note": "最近十几条带图帖和搜索结果里都没有这张，可能是模型读错了",
+            "watermark_readings": [
+                {"source": "grok", "raw": "@Asagiriairi001", "handle": "Asagiriairi001", "state": "ok"},
+            ],
+        }
+        return outcome
+
+    def test_same_name_reads_as_her_other_account(self) -> None:
+        text = formatting._best_block(self._case())
+        self.assertIn("她自己的另一个号", text)
+        self.assertNotIn("与上面的结论不同", text)
+        self.assertNotIn("可能读错", text)
+
+    def test_does_not_say_it_twice(self) -> None:
+        """水印那行讲过一次就够了，Grok 不再补一句「图上读到 ID」。"""
+        text = formatting._best_block(self._case())
+        self.assertEqual(text.count("@Asagiriairi001"), 1)
+
+
 class PaywallTest(unittest.TestCase):
     """确认作者后找到的售卖页：卖在哪、多少钱、要不要订阅。"""
 
@@ -1394,6 +1435,27 @@ class PaywallTest(unittest.TestCase):
         text = formatting._best_block(outcome)
         self.assertIn("免费预览", text)
         self.assertNotIn("🔒", text)
+
+    def test_free_only_tier_line_is_dropped(self) -> None:
+        """只有 Free 档时「档位：Free（免费）」等于没说。"""
+        outcome = self._paid_case()
+        outcome.paywall["tiers"] = [{"title": "Free", "cents": 0, "currency": "USD", "free": True}]
+        text = formatting._best_block(outcome)
+        self.assertNotIn("档位", text)
+
+    def test_teaser_equal_to_conclusion_post_is_dropped(self) -> None:
+        """预告指向的帖子就是结论那一条时，别自己再引用一遍自己。"""
+        outcome = self._paid_case()
+        outcome.grok = {"post_url": "https://x.com/asagiriairi002/status/2120058321285886140"}
+        outcome.paywall["teaser"] = {
+            "url": "https://x.com/asagiriairi002/status/2120058321285886140?utm=1",
+            "kind": "teaser",
+            "same_period": False,
+            "when": "2026-11-10",
+        }
+        text = formatting._best_block(outcome)
+        self.assertNotIn("免费预告", text)
+        self.assertNotIn("顺带看到", text)
 
     def test_teaser_line_for_same_period(self) -> None:
         """这一期她自己 X 上发过预告时，给出链接并注明不一定是同一张。"""

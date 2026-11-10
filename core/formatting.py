@@ -105,11 +105,16 @@ def _watermark_line(grok: dict) -> str:
     return f"🏷 图上读到 ID：{raw}（与上面的结论不同，已按核实结果为准）。"
 
 
-def _grok_lines(grok: dict) -> list[str]:
-    """Grok 兜底的两档文案：post 是找到，account 只是线索。"""
+def _grok_lines(grok: dict, *, skip_mark: bool = False) -> list[str]:
+    """Grok 兜底的两档文案：post 是找到，account 只是线索。
+
+    ``skip_mark`` 用于「水印那行已经讲清楚了」的场合：78c8 那单水印
+    @Asagiriairi001 与结论 @asagiriairi002 是同一个人，一处说「是她自己的另一个
+    号」、另一处又说「与结论不同」，读起来像插件自己没弄明白。
+    """
     tier = grok.get("tier")
     reason = str(grok.get("reason") or "").strip()
-    mark = _watermark_line(grok)
+    mark = "" if skip_mark else _watermark_line(grok)
     if tier == "post":
         lines = ["✅ 找到 X 上的原帖"]
         name = str(grok.get("name") or "").strip()
@@ -269,23 +274,37 @@ def _paywall_lines(outcome: SearchOutcome) -> list[str]:
     elif shop:
         lines.append(f"🛒 她的 {label}：{shop}（最近二十期里没对上这一期）")
     tiers = info.get("tiers") or []
-    text = paywall.tier_text(tiers)
-    if text:
-        lines.append(f"💰 档位：{text}")
+    # 只有 Free 档时「档位：Free（免费）」等于没说，不如省一行。
+    if any(not tier.get("free") for tier in tiers):
+        text = paywall.tier_text(tiers)
+        if text:
+            lines.append(f"💰 档位：{text}")
     preview = info.get("preview") or {}
     if preview.get("url"):
         title = str(preview.get("title") or "").strip()
         lines.append(f"🎁 免费预览：{title} {preview['url']}".replace("  ", " "))
     else:
         teaser = info.get("teaser") or {}
-        if teaser.get("url"):
+        teaser_url = str(teaser.get("url") or "").strip()
+        # 兜一道保险：预告跟结论是同一条帖子时，写了就是自说自话。
+        posted = {
+            _bare_url(value)
+            for value in (
+                (outcome.best.url or "") if outcome.best is not None else "",
+                str((outcome.grok or {}).get("post_url") or ""),
+            )
+            if value
+        }
+        if teaser_url and _bare_url(teaser_url) in posted:
+            teaser_url = ""
+        if teaser_url:
             when = str(teaser.get("when") or "").strip()
             if teaser.get("same_period"):
-                lines.append(f"🎁 免费预告：{teaser['url']}（这一期她自己在 X 上发的，不一定是同一张）")
+                lines.append(f"🎁 免费预告：{teaser_url}（这一期她自己在 X 上发的，不一定是同一张）")
             elif when:
-                lines.append(f"🔎 顺带看到：{teaser['url']}（她 X 上 {when} 提到过这个角色，不是这一期）")
+                lines.append(f"🔎 顺带看到：{teaser_url}（她 X 上 {when} 提到过这个角色，不是这一期）")
             else:
-                lines.append(f"🔎 顺带看到：{teaser['url']}（她 X 上提到过这个角色，不一定是这一期）")
+                lines.append(f"🔎 顺带看到：{teaser_url}（她 X 上提到过这个角色，不一定是这一期）")
         elif post.get("url"):
             lines.append(f"🔒 {paywall.gate_text(post, tiers)}")
     return lines
@@ -512,12 +531,23 @@ def _vision_watermark_line(outcome: SearchOutcome) -> str:
         return ""
     state = str(vision.get("watermark_state") or "").strip()
     user_id = str(vision.get("watermark_user_id") or "").strip()
+    mark_name = _squash_name(vision.get("watermark_name"))
+    post_name = _squash_name(outcome.best.name if outcome.best is not None else grok.get("name"))
+    same_person = bool(mark_name) and mark_name == post_name
     if text:
         url = str(vision.get("watermark_url") or "").strip()
         note = str(vision.get("watermark_note") or "").strip()
         if post:
             # 水印号自己的带图帖里翻到了这张：这是核对过的结论，直接把帖子给出来。
             lines.append(f"🔎 图上水印核对上了：{text}（{note}）：{post}")
+        elif same_person and state == "ok":
+            # 78c8 那单：水印 @Asagiriairi001、结论 @asagiriairi002，两边都叫
+            # 「朝霧愛理」——这是她自己的另一个号，不是「模型读错了」，也不是
+            # 「与结论不同」。分两句写只会让人以为插件认错了人。
+            lines.append(
+                f"🔎 图上水印 {text} 是她自己的另一个号（两边都叫「{vision.get('watermark_name')}」），"
+                f"这张图发在 @{conclusion} 上"
+            )
         elif state == "ok" and url:
             # 号确实存在就把主页和数字 ID 都摆出来：能不能认人是用户的事，
             # 但「有没有这个号」必须先核过，别让人自己去试。存在 ≠ 这图是她发的，
@@ -577,6 +607,15 @@ def _squash_handle(text: str) -> str:
     """比水印是否同一个号时用：忽略 ``X@`` / ``IG@`` 前缀、@、空格和大小写。"""
     value = re.sub(r"^[a-z]{1,3}@", "", str(text or "").strip().lower())
     return re.sub(r"[^0-9a-z_]+", "", value)
+
+
+def _squash_name(text: Any) -> str:
+    """比两个号是不是同一个人时用：只去掉空白、不看大小写。
+
+    别用 ``_squash_handle``：它会把中文整个抹掉，「朝霧愛理」和「纸悦」都会变成
+    空串，一比就相等了。
+    """
+    return re.sub(r"\s+", "", str(text or "").strip().lower())
 
 
 def _handle_key(text: str) -> str:
@@ -661,7 +700,20 @@ def _leak_line(best) -> str:
 def _best_block_core(outcome: SearchOutcome, *, skip_grok: bool = False, detail: bool = False) -> str:
     best = outcome.best
     grok = outcome.grok or {}
-    grok_lines = _grok_lines(grok)
+    vision_watermark = str((outcome.vision or {}).get("watermark") or "").strip()
+    grok_watermark = str(grok.get("watermark") or "").strip()
+    conclusion = _conclusion_handle(outcome)
+    # 水印号就是结论号（最多差个下划线）时，那句「图上印的 ID 就是这个号」还得留着：
+    # 视觉那行在同号时会自己早退，两边一起去掉就什么都不说了。
+    same_as_conclusion = bool(vision_watermark) and bool(conclusion) and (
+        _handle_key(vision_watermark) == _handle_key(conclusion)
+    )
+    skip_mark = (
+        bool(vision_watermark)
+        and _squash_handle(vision_watermark) == _squash_handle(grok_watermark)
+        and not same_as_conclusion
+    )
+    grok_lines = _grok_lines(grok, skip_mark=skip_mark)
     # 视觉挑中的那条被降级成疑似后，这单其实等于「没找到」：一条 BV 号或转发页
     # 不该摆成结论。降级原因和链接由下面的未找到分支统一给出。
     degraded = (

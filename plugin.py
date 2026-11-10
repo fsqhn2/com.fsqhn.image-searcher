@@ -4214,13 +4214,18 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 continue
             if found:
                 found["handle"] = handle
-                try:
-                    teaser = await self._hunt_teaser(handle, words, found.get("post") or {})
-                except Exception as error:  # noqa: BLE001 - 翻不到预告不影响售卖页
-                    self._vlog("免费预告查找失败：%s", str(error)[:80])
-                    teaser = None
-                if teaser:
-                    found["teaser"] = teaser
+                post = found.get("post") or {}
+                # 没对上这一期就没有「这一期」可对，翻了也只会添乱：78c8 那单
+                # 售卖页没对上任何一期，硬翻出来的那条恰好就是结论帖本身，还被
+                # 写成「她 X 上提到过这个角色，不是这一期」。
+                if post.get("url"):
+                    try:
+                        teaser = await self._hunt_teaser(handle, words, post, exclude=post_url)
+                    except Exception as error:  # noqa: BLE001 - 翻不到预告不影响售卖页
+                        self._vlog("免费预告查找失败：%s", str(error)[:80])
+                        teaser = None
+                    if teaser:
+                        found["teaser"] = teaser
                 self._vlog(
                     "付费页命中：%s %s → %s",
                     kind,
@@ -4294,7 +4299,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
         return info
 
     async def _hunt_teaser(
-        self, handle: str, words: list[str], paid_post: dict
+        self, handle: str, words: list[str], paid_post: dict, exclude: str = ""
     ) -> dict[str, Any] | None:
         """去她自己的 X 上翻这一期的公开帖。
 
@@ -4310,6 +4315,13 @@ class ImageSearcherPlugin(MaiBotPlugin):
         if not handle or not words:
             return None
         post_url = str((paid_post or {}).get("url") or "").strip()
+        # 结论帖自己不能被当成「预告」：78c8 那单售卖页没对上期，翻出来的
+        # 恰好就是结论那条帖子，摆出来像在自说自话。
+        avoid = {
+            value.split("?", 1)[0].rstrip("/").lower()
+            for value in (post_url, exclude)
+            if value
+        }
         queries = [word for word in words if len(word) >= 3 or not word.isascii()][:2]
         seen: set[str] = set()
         items: list[dict[str, Any]] = []
@@ -4323,6 +4335,8 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 if word.lower() not in text.lower() or not hit.url:
                     continue
                 if post_url and post_url in text:
+                    continue
+                if hit.url.split("?", 1)[0].rstrip("/").lower() in avoid:
                     continue
                 if hit.url in seen:
                     continue
