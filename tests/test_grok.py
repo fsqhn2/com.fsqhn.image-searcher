@@ -44,6 +44,39 @@ class ModelChainTest(unittest.TestCase):
         self.assertEqual(grok.model_chain("", []), ["grok-4.7"])
 
 
+class IsUpstreamDownTest(unittest.TestCase):
+    """哪些失败报文算「中转站上游整家挂了」。"""
+
+    def test_gateway_errors_count(self) -> None:
+        for code in (500, 502, 503, 504):
+            with self.subTest(code=code):
+                self.assertTrue(grok.is_upstream_down(f"HTTP {code}：<html>bad gateway</html>"))
+
+    def test_empty_body_still_counts(self) -> None:
+        """502 常常连报文体都没有，只有状态码。"""
+        self.assertTrue(grok.is_upstream_down("HTTP 502："))
+
+    def test_auth_errors_do_not_count(self) -> None:
+        """401/403 是 key 的问题，换模型、探活都救不了，由调用方直接放弃。"""
+        for code in (401, 403):
+            with self.subTest(code=code):
+                self.assertFalse(grok.is_upstream_down(f"HTTP {code}：unauthorized"))
+
+    def test_client_errors_do_not_count(self) -> None:
+        self.assertFalse(grok.is_upstream_down("HTTP 404：model not found"))
+        self.assertFalse(grok.is_upstream_down("HTTP 429：rate limited"))
+
+    def test_transport_errors_do_not_count(self) -> None:
+        """超时、连不上不算上游挂——那两种各自还有自己的判断。"""
+        self.assertFalse(grok.is_upstream_down("中转站 210 秒内没响应"))
+        self.assertFalse(grok.is_upstream_down("中转站连不上"))
+        self.assertFalse(grok.is_upstream_down(""))
+
+    def test_status_code_must_be_http_prefixed(self) -> None:
+        """别把正文里出现的 502 当成状态码。"""
+        self.assertFalse(grok.is_upstream_down("调用 grok-4.7 失败：502000 tokens"))
+
+
 class BuildPayloadTest(unittest.TestCase):
     def test_uses_responses_shape(self) -> None:
         body = grok.build_payload("grok-4.7", "data:image/jpeg;base64,AAA")

@@ -95,6 +95,19 @@ def model_chain(primary: str, extras: list[str] | None = None) -> list[str]:
     return chain
 
 
+UPSTREAM_DOWN_RE = re.compile(r"HTTP\s+(50[0-4])\b")
+
+
+def is_upstream_down(message: str) -> bool:
+    """失败报文是不是「中转站上游整家挂了」。
+
+    实测 22:23 与 22:41 两单：grok-4.7 回 502，换 grok-4.6 还是 502，每次都要
+    等 100 秒上下才肯回，一单白搭 3~4 分钟。两个模型走的是同一家上游，整家挂的
+    时候换号没有意义；只有 5xx 才算，401/403 是 key 的问题、由调用方单独处理。
+    """
+    return bool(UPSTREAM_DOWN_RE.search(message or ""))
+
+
 def build_hints(candidates: list, limit: int = 8) -> list[str]:
     """把候选整理成给 Grok 看的清单：账号优先，其次标题。
 

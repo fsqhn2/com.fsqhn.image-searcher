@@ -2643,6 +2643,25 @@ class ImageSearcherPlugin(MaiBotPlugin):
             finally:
                 session.close()
 
+        def quick_probe(name: str) -> bool:
+            """换备用模型之前先花几秒探一下它是不是也挂了。
+
+            整家中转站上游故障时两个模型会一起回 502，而每次失败要等 100 秒上下：
+            实测 22:23 与 22:41 两单各白等 3~4 分钟，整单拖到 325 秒。这里用 8 个
+            token 的极小请求探活，几秒就能判定；探不通就直接放弃，不再排第二次长等。
+            探得通说明只是主模型单独挂了，照旧换过去跑完整检索。
+            """
+            body = {
+                "model": name,
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+                "max_output_tokens": 8,
+            }
+            try:
+                call(body, 20)
+                return True
+            except Exception:  # noqa: BLE001 - 探活失败只意味着放弃备选
+                return False
+
         # 每个模型各等一次完整超时。中转站现在跑一轮带图的 X 检索要 100 秒上下
         # （实测 grok-4.6 118.8 秒才回、grok-4.7 超 120），超时给到 210 秒才稳；
         # 原来还有一次「短超时补一次」，实测没救回过任何一单，只是又白占 60 秒，删了。
@@ -2677,6 +2696,17 @@ class ImageSearcherPlugin(MaiBotPlugin):
                     (requests.exceptions.Timeout, requests.exceptions.ConnectionError, HttpError),
                 ):
                     break
+                # 5xx 是上游整家挂了：两个模型走同一家中转站，多半一起 502。换之前
+                # 先花几秒探一下下一个模型的死活，探不通就直接放弃，别再排一次上百秒
+                # 的长等——实测那样把单次检索从 2 分钟拖到 325 秒。
+                if grok.is_upstream_down(message) and index + 1 < len(attempts):
+                    following = attempts[index + 1][0]
+                    if await asyncio.to_thread(quick_probe, following):
+                        self._vlog("Grok %s 上游 5xx，但 %s 探活正常，继续换过去", name, following)
+                    else:
+                        info["error"] = f"{name} 与 {following} 都不可用（上游 5xx）"
+                        self._vlog("Grok 上游 5xx，探活 %s 也不通，放弃换模型", following)
+                        break
             if index + 1 < len(attempts):
                 next_name = attempts[index + 1][0]
                 if next_name == name:
