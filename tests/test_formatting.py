@@ -978,7 +978,10 @@ class GrokMissTest(unittest.TestCase):
 
     def test_miss_line_appended(self) -> None:
         text = formatting._best_block(self._make())
-        self.assertIn("Grok 也拿这张图去 X 搜过，没撞见原帖", text)
+        # 交代只能有一次：这句在未找到分支里已经写过，末尾不再补同义的「没撞见原帖」。
+        self.assertIn("Grok 在 X 上搜过，没有找到对应的账号或帖子。", text)
+        self.assertNotIn("没撞见原帖", text)
+        self.assertEqual(text.count("Grok"), 1)
 
     def test_not_added_when_grok_has_a_result(self) -> None:
         text = formatting._best_block(self._make(tier="account"))
@@ -1147,6 +1150,61 @@ class DowngradedNearMissTest(unittest.TestCase):
         task.status = "done"
         task.outcome = self._near_miss_outcome()
         return task
+
+
+class GrokQuietOnceTest(unittest.TestCase):
+    """Grok 空手那句只许出现一次，且不能跟「最近的一条」自相矛盾。"""
+
+    def _task(self, outcome: SearchOutcome) -> SearchTask:
+        task = SearchTask(task_id="s-test", stream_id="s1", user_id="u1")
+        task.status = "done"
+        task.outcome = outcome
+        return task
+
+    def test_not_found_says_it_once(self) -> None:
+        """s-20261111-0847-24c4：两行连着说同一件事。"""
+        outcome = SearchOutcome(
+            status="not_found",
+            candidates=[
+                Candidate(engine="yandex", url="https://example.com/a", distance=30, status="mismatch")
+            ],
+            grok={"ok": True, "tier": "none", "handle": "", "reason": "图无文字水印"},
+        )
+        text = formatting.build_text_summary(
+            self._task(outcome), command="麦麦寻人", show_reference=True, limit=3
+        )
+        self.assertEqual(text.count("Grok 在 X 上搜过"), 1)
+        self.assertNotIn("没撞见原帖", text)
+
+    def test_pick_beyond_nearest_is_not_called_nearest(self) -> None:
+        """视觉挑中那条距离 30、全局最近 25 时，不能还标「最接近的一条」。"""
+        picked = Candidate(
+            engine="yandex",
+            url="https://wtftime.ru/articles/149142/",
+            image_url="https://img2.wtftime.ru/store/2024/12/18/Cdd3RsoZ.jpg",
+            distance=30,
+            status="suspect",
+            platform="wtftime.ru",
+            note="视觉复核：疑似同一个人，但那是 wtftime.ru 上的页面、不是作者主页（指纹距离 30，超过阈值 8），仅供参考",
+        )
+        nearer = Candidate(
+            engine="lens",
+            url="https://gamek.vn/chiem-nguong/",
+            image_url="https://gamek.mediacdn.vn/photo.png",
+            distance=25,
+            status="mismatch",
+        )
+        outcome = SearchOutcome(
+            status="not_found",
+            candidates=[picked, nearer],
+            vision={"ok": True, "checked": 15, "downgraded": 1, "reason": "同款红色服饰"},
+        )
+        text = formatting.build_text_summary(
+            self._task(outcome), command="麦麦寻人", show_reference=True, limit=3
+        )
+        self.assertIn("最近的一条指纹距离 25", text)
+        self.assertIn("视觉挑中的那条", text)
+        self.assertNotIn("👉 最接近的一条", text)
 
 
 class ResultPresentationTest(unittest.TestCase):
@@ -1452,6 +1510,28 @@ class PaywallTest(unittest.TestCase):
             "kind": "teaser",
             "same_period": False,
             "when": "2026-11-10",
+        }
+        text = formatting._best_block(outcome)
+        self.assertNotIn("免费预告", text)
+        self.assertNotIn("顺带看到", text)
+
+    def test_teaser_same_post_with_photo_suffix_is_dropped(self) -> None:
+        """结论给的是 /photo/1，预告给的是同一条帖子，后缀不同也得认作同一帖。"""
+        outcome = self._paid_case()
+        outcome.best = Candidate(
+            engine="lens",
+            url="https://x.com/oioioi525/status/2106399214397988987/photo/1",
+            platform="X (Twitter)",
+            handle="@oioioi525",
+            name="ran3",
+            distance=18,
+            status="vision",
+        )
+        outcome.paywall["teaser"] = {
+            "url": "https://x.com/oioioi525/status/2106399214397988987",
+            "kind": "teaser",
+            "same_period": True,
+            "when": "2026-10-03",
         }
         text = formatting._best_block(outcome)
         self.assertNotIn("免费预告", text)

@@ -416,6 +416,15 @@ def _vision_pick_line(outcome: SearchOutcome) -> str:
             label = "页面标了来源的那条"
     if pick is None:
         pick = min(picks, key=lambda item: item.distance if item.distance is not None else 999)
+    if label == "最接近的一条":
+        nearest = min(
+            (item.distance for item in outcome.candidates if item.distance is not None),
+            default=None,
+        )
+        if nearest is not None and pick.distance is not None and pick.distance > nearest:
+            # 上一句刚写「最近的一条指纹距离 25」，这里再摆一条 30 的说是「最接近
+            # 的一条」，两行并排就自相矛盾（实测 s-20261111-0847-24c4）。
+            label = "视觉挑中的那条"
     where = pick.platform or pick.source or pick.engine
     gap = f"，指纹距离 {pick.distance}" if pick.distance is not None else ""
     return f"👉 {label}（{where}{gap}）\n{pick.url}"
@@ -445,6 +454,9 @@ def _vision_downgrade_line(outcome: SearchOutcome, vision: dict | None) -> str:
             notes.append(text)
     if notes:
         tail = "；".join(notes[:2])
+        if count > min(len(notes), 2):
+            # 写「挑出 3 条」却只列 2 条，读起来像漏了一条。
+            tail += "等"
     else:
         tail = "落点在图库站、商品页这类页面，或账号最近没发过这张图；其中最近的一条可能就包含这张图"
     return f"视觉复核挑出 {count} 条，但都不能当原帖：{tail}。"
@@ -460,7 +472,7 @@ def _best_block(outcome: SearchOutcome, *, skip_grok: bool = False, detail: bool
     extra.extend(_repost_author_lines(outcome, detail=detail))
     extra.extend(_paywall_lines(outcome))
     extra.extend(_gallery_source_lines(outcome))
-    if not skip_grok:
+    if not skip_grok and GROK_QUIET_NOTE not in text:
         miss = _grok_miss_line(outcome)
         if miss:
             extra.append(miss)
@@ -599,8 +611,14 @@ def _account_state_note(state: str) -> str:
 
 
 def _bare_url(url: str) -> str:
-    """比两条链接是不是同一页时用：去掉查询串（utm 参数经常不一样）。"""
-    return str(url or "").split("?", 1)[0].rstrip("/").lower()
+    """比两条链接是不是同一页时用：去掉查询串与照片序号。
+
+    X 的同一条帖子有 ``/status/<id>``、``/status/<id>/photo/1``、``/video/1``
+    几种写法，不归一就看不出是同一页（实测 s-20261110-2122-4035：结论给的是
+    ``/photo/1``，免费预告又把同一条帖子写了一遍）。
+    """
+    text = str(url or "").split("?", 1)[0].rstrip("/")
+    return re.sub(r"/(photo|video)/\d+$", "", text).rstrip("/").lower()
 
 
 def _squash_handle(text: str) -> str:
@@ -802,7 +820,7 @@ def _best_block_core(outcome: SearchOutcome, *, skip_grok: bool = False, detail:
             elif grok.get("error"):
                 lines.append(f"Grok 找人没做成：{grok['error']}")
             else:
-                lines.append("Grok 在 X 上搜过，没有找到对应的账号或帖子。")
+                lines.append(GROK_QUIET_NOTE)
         if avatars:
             sites = "、".join(dict.fromkeys(item.platform for item in avatars if item.platform))
             where = f"（{sites}）" if sites else ""
@@ -951,6 +969,9 @@ SLOW_PING_TEXT = "这图有点难找，我需要细细对比，再稍等下哦�
 # 回复页反查（顺着 X 回复去摸原帖）跑起来时补一句，免得这几十秒看着像卡住。
 # 预算 60 秒，最坏两轮 2 分钟，按这个写。
 TRACE_PING_TEXT = "已经找到蛛丝马迹了，正在顺藤摸瓜找原帖，大概还要 1 分钟（最多 2 分钟）。"
+# Grok 跑过但空手的交代。只该出现一次：未找到分支里写过之后，_best_block 末尾
+# 不能再补一句同义的话（实测 s-20261111-0847-24c4 两行连着说同一件事）。
+GROK_QUIET_NOTE = "Grok 在 X 上搜过，没有找到对应的账号或帖子。"
 
 
 def eta_full() -> str:
