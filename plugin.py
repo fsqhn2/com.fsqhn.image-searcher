@@ -2007,7 +2007,14 @@ class ImageSearcherPlugin(MaiBotPlugin):
             # 全量下载验证太慢；取 2 倍配置条数，足够覆盖最相关的前几条。
             normal = max(1, section.verify_top_n) * 2 if name == "lens" else max(1, section.verify_top_n)
             limit = max(1, int(section.deep_verify_top_n), normal) if deep else normal
-            targets.extend(items[:limit])
+            picked = items[:limit]
+            if name == "saucenao":
+                # verify_candidate 见到「match + 有相似度」就直接原样返回，SauceNAO
+                # 的候选正好长这样，等于一次都没验。照片路线下先清掉这个标签，
+                # 逼它真去下载缩略图比指纹（缩略图在 saucenao 自己域名下，能取）。
+                for item in picked:
+                    item.status = "unverified"
+            targets.extend(picked)
             if not social_enabled:
                 continue
             # 原帖基本都在社交平台上：X、微博、小红书这些站点的候选即使排在
