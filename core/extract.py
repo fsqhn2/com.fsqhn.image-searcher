@@ -287,6 +287,24 @@ _FORUM_HOSTS = (
     "namu.wiki",
 )
 
+# 已经停服关站的站点：落在这上面的候选不该当结论，用户点开只会看到空白页。
+# bcy.net（半次元）2023-07-12 停止运营并关闭服务器，实测域名已无法连接。
+DEAD_HOSTS = {
+    "bcy.net": "半次元",
+}
+
+
+def dead_site(url: str = "", source: str = "") -> str:
+    """这个落点是不是已经关站的站点；是的话返回站点名。"""
+    host = (urlparse(url).netloc or source or "").strip().lower()
+    host = host.rsplit("@", 1)[-1].split(":")[0]
+    if not host:
+        return ""
+    for token, name in DEAD_HOSTS.items():
+        if host == token or host.endswith("." + token):
+            return name
+    return ""
+
 
 def is_forum_page(url: str = "", source: str = "") -> bool:
     """这个链接是不是论坛 / 社区帖。是的话标题只能当标题，不能当名字。"""

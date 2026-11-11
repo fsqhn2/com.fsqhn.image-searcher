@@ -6,7 +6,7 @@ import re
 from urllib.parse import urlparse
 
 from .engines import Candidate, is_avatar_hit
-from .extract import is_avatar_image, is_forum_page, split_repost_title
+from .extract import dead_site, is_avatar_image, is_forum_page, split_repost_title
 from .tasks import SearchOutcome, SearchTask
 from . import gallery, paywall
 
@@ -53,7 +53,11 @@ def _route_line(outcome: SearchOutcome) -> str:
 
 def _identity_lines(candidate: Candidate, *, detail: bool = True) -> list[str]:
     label = candidate.platform
-    if not (candidate.handle or "").strip() and gallery.is_repost_site(
+    dead = dead_site(candidate.url, candidate.platform)
+    if dead:
+        # 站点已经关站，链接点开只会是空的（半次元 2023-07 停服）。
+        label = f"{label}（{dead}已关站，这条打不开）"
+    if not dead and not (candidate.handle or "").strip() and gallery.is_repost_site(
         candidate.url, candidate.platform
     ):
         # 图集站/搬运页不是作者主页，光写「平台：galleryepic.com」会让人以为图就发在那儿

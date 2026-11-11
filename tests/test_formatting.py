@@ -923,6 +923,21 @@ class ForumTitleTest(unittest.TestCase):
 class RepostModelNameTest(unittest.TestCase):
     """图集站标题里的名字是站方标注的模特名，不是作者账号名。"""
 
+    def test_dead_site_is_labelled(self) -> None:
+        """落在关站的站上要说清点不开，别让人以为是正常出处。"""
+        item = Candidate(
+            engine="saucenao",
+            url="https://bcy.net/illust/detail/104171",
+            similarity=62.6,
+            status="match",
+            platform="bcy.net",
+            name="肆海",
+        )
+        item.finalize()
+        outcome = SearchOutcome(status="ok", best=item, candidates=[item])
+        text = formatting._best_block(outcome)
+        self.assertIn("半次元已关站", text)
+
     def _make_best(self, name: str, handle: str = "") -> SearchOutcome:
         item = Candidate(
             engine="lens",

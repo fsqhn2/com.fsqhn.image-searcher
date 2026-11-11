@@ -49,6 +49,7 @@ from .core.engines import (
     verify_candidate,
 )
 from .core.extract import (
+    dead_site,
     dedupe_accounts,
     is_pixiv_platform,
     is_repost_page,
@@ -2108,7 +2109,11 @@ class ImageSearcherPlugin(MaiBotPlugin):
 
     @staticmethod
     def _pick_best(ordered: list[Candidate], prefer_pixiv: bool = False) -> Candidate | None:
-        matches = [item for item in ordered if item.status == "match"]
+        matches = [
+            item
+            for item in ordered
+            if item.status == "match" and not dead_site(item.url, item.platform)
+        ]
         if not matches:
             return None
         if prefer_pixiv:

@@ -31,6 +31,34 @@ class PluginImportTest(unittest.TestCase):
         module = import_plugin()
         self.assertTrue(hasattr(module, "ImageSearcherPlugin"))
 
+    def test_pick_best_skips_dead_site(self) -> None:
+        """半次元已关站，落在那上面的候选不能当结论（s-20261111-1403-e15a）。"""
+        module = import_plugin()
+        from core.engines import Candidate
+
+        dead = Candidate(
+            engine="saucenao",
+            url="https://bcy.net/illust/detail/104171",
+            similarity=62.6,
+            status="match",
+            platform="bcy.net",
+            name="肆海",
+        )
+        live = Candidate(
+            engine="saucenao",
+            url="https://www.pixiv.net/member_illust.php?mode=medium&illust_id=70349455",
+            similarity=62.1,
+            status="match",
+            platform="pixiv.net",
+            name="ばむけろ399",
+        )
+        for item in (dead, live):
+            item.finalize()
+        best = module.ImageSearcherPlugin._pick_best([dead, live])
+        self.assertIsNotNone(best)
+        self.assertEqual(best.url, live.url)
+        self.assertIsNone(module.ImageSearcherPlugin._pick_best([dead]))
+
     def test_repost_handles_include_non_x_candidates(self) -> None:
         """号挂在图集站标题里时也要收：s-20261111-1028-1063 整条线因此没跑。"""
         module = import_plugin()

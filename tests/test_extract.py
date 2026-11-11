@@ -12,6 +12,7 @@ from core import extract  # noqa: E402
 from core.extract import (  # noqa: E402
     account_key,
     canonical_account_url,
+    dead_site,
     dedupe_accounts,
     extract_identity,
     is_avatar_image,
@@ -78,6 +79,17 @@ class ExtractIdentityTest(unittest.TestCase):
         )
         self.assertEqual(name, "□카🕯")
         self.assertEqual(handle, "@YuMIkAnime")
+
+
+class DeadSiteTest(unittest.TestCase):
+    """关站的站不能当结论：半次元 2023-07 停服，链接点开是空页。"""
+
+    def test_half_dimension_is_dead(self) -> None:
+        self.assertEqual(dead_site("https://bcy.net/illust/detail/104171"), "半次元")
+        self.assertEqual(dead_site("", "bcy.net"), "半次元")
+
+    def test_live_site_is_not_dead(self) -> None:
+        self.assertEqual(dead_site("https://www.pixiv.net/member_illust.php?id=1"), "")
 
 
 class AccountPageTest(unittest.TestCase):
