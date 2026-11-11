@@ -6,7 +6,7 @@ import re
 from urllib.parse import urlparse
 
 from .engines import Candidate, is_avatar_hit
-from .extract import is_avatar_image, is_forum_page
+from .extract import is_avatar_image, is_forum_page, repost_model_name
 from .tasks import SearchOutcome, SearchTask
 from . import gallery, paywall
 
@@ -67,9 +67,18 @@ def _identity_lines(candidate: Candidate, *, detail: bool = True) -> list[str]:
                 note = note.split("：", 1)[0]
         lines.append(f"🔍 匹配：{note}")
     if candidate.name:
-        # 论坛帖的「名字」其实是帖子标题，写清楚，免得当成作者名。
-        label = "📄 标题" if is_forum_page(candidate.url) else "👤 名字"
-        lines.append(f"{label}：{candidate.name}")
+        name = candidate.name
+        if gallery.is_repost_site(candidate.url, candidate.platform):
+            # 图集站标题里常写着「Model Misa Daidai (@xidaidai)」，账号抽走后
+            # 只剩一对空括号，直接当名字摆出来又长又怪。
+            name = repost_model_name(name)
+        if name != candidate.name.strip() and not (candidate.handle or "").strip():
+            # 认出了站方标注的模特名，但它不是作者本人的账号名，得说明白。
+            lines.append(f"👤 名字：{name}（图集站标注的模特名）")
+        else:
+            # 论坛帖的「名字」其实是帖子标题，写清楚，免得当成作者名。
+            label = "📄 标题" if is_forum_page(candidate.url) else "👤 名字"
+            lines.append(f"{label}：{name}")
     if candidate.handle:
         # B 站的 BV 号是「视频号」，不是账号。写成「账号：BV1xx…」会让人以为
         # 有这么一个用户，去搜还搜不到——它跟 UID 一样只是定位用的编号。

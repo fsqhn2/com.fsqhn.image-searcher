@@ -366,6 +366,23 @@ def x_title_name(title: str = "") -> str:
     return found.group("name").strip() if found else text
 
 
+_MODEL_PREFIX_RE = re.compile(r"^\s*(?:the\s+)?(?:model|cosplayer|coser|cosplay\s+model)\s*[:：]?\s+", re.I)
+_EMPTY_PAREN_RE = re.compile(r"\s*[(（]\s*[)）]\s*$")
+
+
+def repost_model_name(title: str = "") -> str:
+    """图集站标题里的模特名。
+
+    cosplayrule34 的标题是 ``Model Misa Daidai (@xidaidai)``，账号被抽走后
+    只剩 ``Model Misa Daidai ()``：直接当名字摆出来又长又带一对空括号。
+    """
+    raw = (title or "").strip()
+    text = _EMPTY_PAREN_RE.sub("", raw)
+    text = _MODEL_PREFIX_RE.sub("", text)
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    return text or raw
+
+
 def extract_identity(url: str, title: str = "") -> tuple[str, str]:
     """返回 (名字, 账号)。
 

@@ -920,6 +920,35 @@ class ForumTitleTest(unittest.TestCase):
         self.assertIn("👤 名字：NERU", formatting._best_block(outcome))
 
 
+class RepostModelNameTest(unittest.TestCase):
+    """图集站标题里的名字是站方标注的模特名，不是作者账号名。"""
+
+    def _make_best(self, name: str, handle: str = "") -> SearchOutcome:
+        item = Candidate(
+            engine="lens",
+            url="https://cosplayrule34.com/us/post/102074",
+            distance=0,
+            status="match",
+            platform="cosplayrule34.com",
+            name=name,
+            handle=handle,
+        )
+        item.finalize()
+        return SearchOutcome(status="ok", best=item, candidates=[item])
+
+    def test_model_name_is_cleaned_and_labelled(self) -> None:
+        text = formatting._best_block(self._make_best("Model Misa Daidai ()"))
+        self.assertIn("👤 名字：Misa Daidai（图集站标注的模特名）", text)
+        self.assertNotIn("()", text)
+
+    def test_name_with_handle_is_still_cleaned(self) -> None:
+        text = formatting._best_block(
+            self._make_best("Model Misa Daidai ()", "@xidaidai")
+        )
+        self.assertIn("👤 名字：Misa Daidai", text)
+        self.assertIn("🆔 账号：@xidaidai", text)
+
+
 class PaidGuessTest(unittest.TestCase):
     """付费内容线索：给主页、X、IG，但必须说清不是原帖。"""
 
