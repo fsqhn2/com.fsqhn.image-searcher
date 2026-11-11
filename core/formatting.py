@@ -6,7 +6,7 @@ import re
 from urllib.parse import urlparse
 
 from .engines import Candidate, is_avatar_hit
-from .extract import is_avatar_image, is_forum_page, repost_model_name
+from .extract import is_avatar_image, is_forum_page, split_repost_title
 from .tasks import SearchOutcome, SearchTask
 from . import gallery, paywall
 
@@ -67,13 +67,16 @@ def _identity_lines(candidate: Candidate, *, detail: bool = True) -> list[str]:
                 note = note.split("：", 1)[0]
         lines.append(f"🔍 匹配：{note}")
     if candidate.name:
-        name = candidate.name
+        name, extra = candidate.name, ""
         if gallery.is_repost_site(candidate.url, candidate.platform):
-            # 图集站标题里常写着「Model Misa Daidai (@xidaidai)」，账号抽走后
-            # 只剩一对空括号，直接当名字摆出来又长又怪。
-            name = repost_model_name(name)
-        if name != candidate.name.strip() and not (candidate.handle or "").strip():
-            # 认出了站方标注的模特名，但它不是作者本人的账号名，得说明白。
+            # 图集站标题常写成「Xidaidai – Aemeath 18+ Cosplay, 18 Photos」：
+            # 整条当名字摆出来，用户看到的是一串英文。切成名字 + 套图两行。
+            name, extra = split_repost_title(candidate.name)
+        if extra:
+            # 名字是站方标注的模特名，不是作者本人的账号名，得说明白。
+            lines.append(f"👤 名字：{name}（图集站标注的模特名）")
+            lines.append(f"📦 套图：{extra}")
+        elif name != candidate.name.strip() and not (candidate.handle or "").strip():
             lines.append(f"👤 名字：{name}（图集站标注的模特名）")
         else:
             # 论坛帖的「名字」其实是帖子标题，写清楚，免得当成作者名。

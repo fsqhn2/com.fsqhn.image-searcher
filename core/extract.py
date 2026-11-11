@@ -368,6 +368,13 @@ def x_title_name(title: str = "") -> str:
 
 _MODEL_PREFIX_RE = re.compile(r"^\s*(?:the\s+)?(?:model|cosplayer|coser|cosplay\s+model)\s*[:：]?\s+", re.I)
 _EMPTY_PAREN_RE = re.compile(r"\s*[(（]\s*[)）]\s*$")
+_ANY_EMPTY_PAREN_RE = re.compile(r"[(（]\s*[)）]")
+_REPOST_SEP_RE = re.compile(r"\s+(?:[–—|]|-|:)\s+|\s*[：]\s*")
+_IN_COSPLAY_RE = re.compile(r"\s+in\s+cosplay\s+", re.I)
+_PHOTO_COUNT_RE = re.compile(r"(?:set\s+of\s+)?(\d+)\s*photos?\b", re.I)
+# 后半截得像个套图说明（写着 cosplay / photos 之类），否则可能只是角色名
+# （"Nahida – Genshin Impact" 前半截是角色不是模特）。
+_SET_HINT_RE = re.compile(r"cosplay|photo|picture|album|image|set\b", re.I)
 
 
 def repost_model_name(title: str = "") -> str:
@@ -381,6 +388,42 @@ def repost_model_name(title: str = "") -> str:
     text = _MODEL_PREFIX_RE.sub("", text)
     text = re.sub(r"\s{2,}", " ", text).strip()
     return text or raw
+
+
+def split_repost_title(title: str = "") -> tuple[str, str]:
+    """图集站标题切成（模特名, 套图说明）。
+
+    galleryepic 的标题是 ``Xidaidai – Aemeath 18+ Cosplay (Wuthering Waves), 18
+    Photos``：整条当名字摆出来，用户看到的是一串英文。名字就在分隔符前那截。
+
+    切不出来、或者切出来的尾巴太碎（``Aemeath from ...``）就当没有：宁可不
+    说，也别把半截标题当成套图信息。
+    """
+    raw = (title or "").strip()
+    text = _EMPTY_PAREN_RE.sub("", raw)
+    had_prefix = bool(_MODEL_PREFIX_RE.match(text))
+    text = _MODEL_PREFIX_RE.sub("", text)
+    text = _ANY_EMPTY_PAREN_RE.sub(" ", text)
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    name, extra = text, ""
+    for pattern in (_IN_COSPLAY_RE, _REPOST_SEP_RE):
+        parts = pattern.split(text, maxsplit=1)
+        if len(parts) == 2:
+            name, extra = parts[0].strip(), parts[1].strip()
+            break
+    else:
+        # 没有分隔符时退一步看逗号，但前半截得像个人名（词少、不带句读）。
+        if ", " in text:
+            head, tail = text.split(", ", 1)
+            if head and len(head.split()) <= 4:
+                name, extra = head.strip(), tail.strip()
+    if not extra or not _SET_HINT_RE.search(extra) or extra.endswith(("...", "…")):
+        extra = ""
+    if extra:
+        return name, _PHOTO_COUNT_RE.sub(r"\1 张", extra)
+    # 切不出套图说明时，只有标题自带「Model X」前缀才敢认这个名字；否则整条
+    # 原样返回（"Nahida – Genshin Impact" 的 Nahida 是角色，不是模特）。
+    return (name if had_prefix and name else raw), ""
 
 
 def extract_identity(url: str, title: str = "") -> tuple[str, str]:

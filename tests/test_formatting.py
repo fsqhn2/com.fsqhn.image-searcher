@@ -948,6 +948,20 @@ class RepostModelNameTest(unittest.TestCase):
         self.assertIn("👤 名字：Misa Daidai", text)
         self.assertIn("🆔 账号：@xidaidai", text)
 
+    def test_title_is_split_into_name_and_set(self) -> None:
+        """1063 那单：整条英文标题当名字摆着，切成名字 + 套图两行。"""
+        text = formatting._best_block(
+            self._make_best("Xidaidai – Aemeath 18+ Cosplay (Wuthering Waves), 18 Photos")
+        )
+        self.assertIn("👤 名字：Xidaidai（图集站标注的模特名）", text)
+        self.assertIn("📦 套图：Aemeath 18+ Cosplay (Wuthering Waves), 18 张", text)
+
+    def test_character_name_is_not_taken_as_model(self) -> None:
+        """「Nahida – Genshin Impact」前半截是角色，不能当模特名。"""
+        text = formatting._best_block(self._make_best("Nahida – Genshin Impact"))
+        self.assertNotIn("模特名", text)
+        self.assertIn("Nahida – Genshin Impact", text)
+
 
 class PaidGuessTest(unittest.TestCase):
     """付费内容线索：给主页、X、IG，但必须说清不是原帖。"""
