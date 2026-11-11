@@ -53,6 +53,7 @@ from .core.extract import (
     dedupe_accounts,
     is_pixiv_platform,
     is_repost_page,
+    is_request_post,
     is_social_platform,
     is_x_platform,
     is_x_post_page,
@@ -1673,6 +1674,15 @@ class ImageSearcherPlugin(MaiBotPlugin):
             # 也只是说明这张图在这一页出现过。顺回去找到原帖，能确定就换掉。
             reply_hint = await self._resolve_x_list_page(candidates, stream_id)
 
+        # 命中的是「求出处」帖时不能当结论：发帖人自己也在找这张图，那页只是
+        # 「别人也在问」的证据。实测 s-20261111-1611-db40 距离 0 命中司机社一个
+        # 「有没有大佬知道这个远旅的动图出自哪里-求出处」的帖子，被当成出处回了群，
+        # 用户点进去看到的是别人在求图。降成 suspect 留在「更多」里，并写明原因。
+        for item in candidates:
+            if item.status in {"match", "vision"} and is_request_post(item.title):
+                item.status = "suspect"
+                item.note = "命中的是求图帖（发帖人也在找出处），不能当原帖"
+
         ordered = self._rank(candidates, names, prefer_pixiv=sauce is not None)
         # 同一个账号常被 Lens、Yandex、百度一起撞见：只留质量最好的那条，
         # 免得参考区里同一个号重复列三遍。
@@ -2151,7 +2161,11 @@ class ImageSearcherPlugin(MaiBotPlugin):
         matches = [
             item
             for item in ordered
-            if item.status == "match" and not dead_site(item.url, item.platform)
+            if item.status == "match"
+            and not dead_site(item.url, item.platform)
+            # 双保险：主流程已经把求图帖降成 suspect，这里再挡一次，免得以后
+            # 有别的路径把 status 又提回 match。
+            and not is_request_post(item.title)
         ]
         if not matches:
             return None

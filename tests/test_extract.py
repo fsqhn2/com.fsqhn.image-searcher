@@ -213,6 +213,21 @@ class PlatformTest(unittest.TestCase):
         self.assertFalse(extract.is_forum_page("https://galleryepic.com/a"))
         self.assertFalse(extract.is_forum_page(""))
 
+    def test_request_posts(self) -> None:
+        """求图帖不是出处：实测那单距离 0 命中「求出处」帖，被当成结论回了群。"""
+        self.assertTrue(
+            extract.is_request_post("有没有大佬知道这个远旅的动图出自哪里- 求出处- 司机社")
+        )
+        self.assertTrue(extract.is_request_post("求这个2D动画的出处- 求出处- 司机社"))
+        self.assertTrue(extract.is_request_post("这是哪部番的角色"))
+        self.assertTrue(extract.is_request_post("Who is this? found on pinterest"))
+        # 正常帖子不能被误杀：标题里带「求」不代表是求图帖。
+        self.assertFalse(extract.is_request_post("天宮こころ GIF"))
+        self.assertFalse(extract.is_request_post("Kokoro Amamiya, virtual YouTuber, Nijisanji"))
+        self.assertFalse(extract.is_request_post("ミミ on X: \"in da void\""))
+        self.assertFalse(extract.is_request_post(""))
+        self.assertFalse(extract.is_request_post("   "))
+
     def test_x_page_kind(self) -> None:
         """只有 status/<id> 能当原帖，主页和转发/回复列表页都不行。"""
         self.assertEqual(extract.x_page_kind("https://x.com/NERUchi890/status/2117586176714612824"), "post")

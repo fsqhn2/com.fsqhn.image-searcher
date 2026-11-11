@@ -306,6 +306,28 @@ def dead_site(url: str = "", source: str = "") -> str:
     return ""
 
 
+# 「求出处」类帖子：发帖人自己也在找这张图。页面标题就是一句问句，真正的答案
+# （如果有）只在正文或回帖里。把它当出处发出去，用户点进去看到的是「有人知道吗」。
+# 实测 2026-11-11 那单距离 0 命中司机社「有没有大佬知道这个远旅的动图出自哪里-
+# 求出处」，被当成结论回了群，而正确答案是 pixiv 上一个画师的 GIF。
+_REQUEST_POST_RE = re.compile(
+    r"求出处|求原图|求这张图|求此图|求出处帖|"
+    r"有没有(?:大佬|人|大神)?知道|有人知道这|这是哪[部个里]|出自哪|"
+    r"who is (?:this|she)|where(?:'s| is) this from|what anime",
+    re.I,
+)
+
+
+def is_request_post(title: str = "") -> bool:
+    """这条候选是不是「求出处 / 求原图」的求助帖。
+
+    只认标题。这类页面的标题本身就是问句，认标题比认站点可靠：同一个论坛既有人
+    求图也有人发图，按域名一刀切会把正常帖一起毙掉。
+    """
+    text = (title or "").strip()
+    return bool(text) and bool(_REQUEST_POST_RE.search(text))
+
+
 def is_forum_page(url: str = "", source: str = "") -> bool:
     """这个链接是不是论坛 / 社区帖。是的话标题只能当标题，不能当名字。"""
     host = (urlparse(url).netloc or source or "").strip().lower()
