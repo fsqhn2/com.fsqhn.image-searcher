@@ -1790,6 +1790,32 @@ class RepostAuthorTest(unittest.TestCase):
         self.assertIn("@Purugear", more)
         self.assertIn("没找到这张", more)
 
+    def test_first_reply_says_x_has_nothing(self) -> None:
+        """首次回复要一句话说清「X 上没有」，但不点名翻了哪几个号。"""
+        outcome = SearchOutcome(
+            status="ok",
+            best=self._site_best(),
+            repost_author={"status": "none", "scanned": ["xidaidai"], "failed": []},
+        )
+        first = formatting._best_block(outcome)
+        self.assertIn("候选里那几个 X 号都翻过，没有这一张", first)
+        self.assertNotIn("xidaidai", first)
+
+    def test_dirty_scan_value_is_not_shown_as_handle(self) -> None:
+        """图集页编号被当成 handle 收进来（"UID 1856233540"），不能写成 @UID …。"""
+        outcome = SearchOutcome(
+            status="ok",
+            best=self._site_best(),
+            repost_author={
+                "status": "none",
+                "scanned": ["xidaidai", "UID 1856233540"],
+                "failed": [],
+            },
+        )
+        more = formatting._best_block(outcome, detail=True)
+        self.assertIn("@xidaidai", more)
+        self.assertNotIn("UID 1856233540", more)
+
     def test_failed_lookup_is_not_written_as_absent(self) -> None:
         """某个号这次没翻成，要单独说，不能混进「都没有」。"""
         outcome = SearchOutcome(

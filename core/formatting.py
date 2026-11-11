@@ -12,6 +12,10 @@ from . import gallery, paywall
 
 AI_FLAG_THRESHOLD = 0.75
 
+# X 账号只可能是这些字符，长度 1~15。搬运站反查的 scanned 里混进过图集页编号
+# （"UID 1856233540"），写进文案会变成看不懂的东西。
+_REPOST_HANDLE_RE = re.compile(r"^[A-Za-z0-9_]{2,15}$")
+
 # B 站视频号：BV 开头加一串大小写字母数字，例如 BV16m4y1E7Tf。
 _BV_RE = re.compile(r"^BV[0-9A-Za-z]{8,}$")
 
@@ -172,6 +176,23 @@ def _fans_text(count: int) -> str:
     return str(count)
 
 
+def _repost_handles(info: dict, key: str) -> list[str]:
+    """搬运站反查里那些号：挡掉「UID 1856233540」这类脏值。
+
+    实测 s-20261111-1207-2c38 的落盘里扫过 "UID 1856233540"——那是图集页里的
+    编号，不是账号；写进文案会变成「翻过 @UID 1856233540」这种看不懂的东西。
+    """
+    out: list[str] = []
+    for item in info.get(key) or []:
+        text = str(item).strip().lstrip("@")
+        if text and text.isdigit():
+            continue
+        if not _REPOST_HANDLE_RE.match(text):
+            continue
+        out.append(text)
+    return out
+
+
 def _repost_author_lines(outcome: SearchOutcome, *, detail: bool = False) -> list[str]:
     """命中搬运站之后有没有接着翻候选里的 X 号，翻到了什么。
 
@@ -181,25 +202,23 @@ def _repost_author_lines(outcome: SearchOutcome, *, detail: bool = False) -> lis
     """
     info = outcome.repost_author or {}
     status = str(info.get("status") or "")
-    scanned = [
-        str(item).strip().lstrip("@")
-        for item in (info.get("scanned") or [])
-        if str(item).strip()
-    ]
+    scanned = _repost_handles(info, "scanned")
     if status == "hit":
         handle = str(info.get("handle") or "").strip().lstrip("@")
         if not handle:
             return []
         return [f"🔎 结论是翻出来的：搬运站那条只是转贴，@{handle} 自己的带图帖里有这张"]
-    if status != "none" or not scanned or not detail:
+    if status != "none" or not scanned:
         return []
     names = "、".join(f"@{item}" for item in scanned[:3])
-    failed = [
-        str(item).strip().lstrip("@")
-        for item in (info.get("failed") or [])
-        if str(item).strip()
-    ]
+    failed = _repost_handles(info, "failed")
     tail = f"（{'、'.join('@' + item for item in failed[:2])} 那次没翻成）" if failed else ""
+    if not detail:
+        # 首次回复只给结论。少了这一句，用户看到图集站会以为插件根本没去 X 找
+        # （实测 s-20261111-1207-2c38 丘浩南直接问「我还以为会反查到 x」）；
+        # 但「翻了哪几个号」属于怎么找的，仍然只在「更多」里出现。
+        miss = "（有几个号这次没翻成）" if failed else ""
+        return [f"🔎 候选里那几个 X 号都翻过，没有这一张{miss}"]
     return [
         f"🔎 也翻过候选里 {names} 自己的带图帖和搜索，没找到这张{tail}；"
         "这几个号只看得到最近发的那批"

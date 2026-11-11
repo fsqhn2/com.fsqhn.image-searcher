@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import re
 import time
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
@@ -100,6 +101,8 @@ _COMMAND_PATTERN = build_command_pattern([COMMAND, *ALIASES])
 _MORE_PATTERN = build_more_pattern(["更多", "more"])
 # 只含媒体占位符的消息（如 "[image]"），用于接住等待中的单图消息
 _CAPTURE_PATTERN = r"^(?:\[[^\]]*\]\s*)+$"
+# X 账号只可能是这些字符；图集页编号会挂成 handle（"UID 1856233540"），别去翻它。
+_X_HANDLE_RE = re.compile(r"^[A-Za-z0-9_]{2,15}$")
 
 
 # ---------------------------------------------------------------------------
@@ -3867,6 +3870,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
         for item in ordered:
             handle = (item.handle or "").strip().lstrip("@")
             if not handle or handle.isdigit():
+                continue
+            # 图集页的编号会挂成 handle（"UID 1856233540"），翻它纯粹浪费预算。
+            if not _X_HANDLE_RE.match(handle):
                 continue
             lower = handle.lower()
             if lower in seen or lower == blocked:
