@@ -1654,7 +1654,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
                     item.note = "插画路线参考，未做指纹比对"
             candidates = [item for name in names for item in grouped.get(name, [])]
         else:
-            await self._verify(candidates, grouped, names, target_hash)
+            await self._verify(
+                candidates, grouped, names, target_hash, include_sauce=True
+            )
             # X 的回复页/转发页会把「她回复的、她转的」帖子一起列出来：指纹对上了
             # 也只是说明这张图在这一页出现过。顺回去找到原帖，能确定就换掉。
             reply_hint = await self._resolve_x_list_page(candidates, stream_id)
@@ -1982,14 +1984,23 @@ class ImageSearcherPlugin(MaiBotPlugin):
         grouped: dict[str, list[Candidate]],
         names: list[str],
         target_hash: int | None,
+        *,
+        include_sauce: bool = False,
     ) -> None:
+        """下载候选图比指纹。
+
+        ``include_sauce`` 只在照片路线传 True：插画路线下 SauceNAO 自带相似度
+        就够定论；可一旦路线判成照片，它那 60% 的阈值就和 75% 的插画阈值打架——
+        s-20261111-1403-e15a 那条 62.6% 既不够插画、又被当照片命中，结果是
+        一张相似但不相干的图。照片路线让它也过一遍指纹，假的当场掉下去。
+        """
         section = self.config.plugin
         deep = bool(section.deep_scan)
         targets: list[Candidate] = []
         social_extra: list[Candidate] = []
         social_enabled = bool(getattr(section, "social_verify_all", False))
         for name in names:
-            if name == "saucenao":
+            if name == "saucenao" and not include_sauce:
                 continue
             items = grouped.get(name) or []
             # Lens 会把 visual_matches 与 exact_matches 一起返回，条数可能几十条，
