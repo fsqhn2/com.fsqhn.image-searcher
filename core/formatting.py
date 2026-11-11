@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from urllib.parse import urlparse
 
-from .engines import Candidate, is_avatar_hit
+from .engines import Candidate, downgrade_kind, is_avatar_hit
 from .extract import dead_site, is_avatar_image, is_forum_page, split_repost_title
 from .tasks import SearchOutcome, SearchTask
 from . import gallery, paywall
@@ -470,6 +470,35 @@ def _vision_pick_line(outcome: SearchOutcome) -> str:
     return f"👉 {label}（{where}{gap}）\n{pick.url}"
 
 
+def _downgraded_pick_line(outcome: SearchOutcome) -> str:
+    """搬运页、求图帖这类降级线索：把原因和链接直接摆到结论里。
+
+    结论写的是「没找到原作者」，但「这张图还出现在哪」本身有用：只写一句没找到，
+    群里还得自己翻参考区（s-20261111-2327-5138 命中游民星空那篇囧图合集，就是
+    这么被当成出处发出去的）。视觉降级那条另有 _vision_pick_line，这里不重复。
+    """
+    best = outcome.best
+    pool = [
+        item
+        for item in outcome.candidates
+        if downgrade_kind(item) in {"repost", "request"} and (item.url or "").strip()
+    ]
+    if (
+        best is not None
+        and downgrade_kind(best) in {"repost", "request"}
+        and (best.url or "").strip()
+    ):
+        pick = best
+    elif pool:
+        pick = min(pool, key=lambda item: item.distance if item.distance is not None else 999)
+    else:
+        return ""
+    where = pick.platform or pick.source or pick.engine
+    gap = f"，指纹距离 {pick.distance}" if pick.distance is not None else ""
+    reason = (pick.note or "").strip() or "这条不能当原帖"
+    return f"👉 {reason}（{where}{gap}）\n{pick.url}"
+
+
 def _vision_downgrade_line(outcome: SearchOutcome, vision: dict | None) -> str:
     """视觉挑中又被降级时的那句说明。
 
@@ -772,14 +801,11 @@ def _best_block_core(outcome: SearchOutcome, *, skip_grok: bool = False, detail:
         and not same_as_conclusion
     )
     grok_lines = _grok_lines(grok, skip_mark=skip_mark)
-    # 视觉挑中的那条被降级成疑似后，这单其实等于「没找到」：一条 BV 号或转发页
-    # 不该摆成结论。降级原因和链接由下面的未找到分支统一给出。
-    degraded = (
-        best is not None
-        and best.status == "suspect"
-        and (best.note or "").startswith("视觉复核")
-    )
-    solid = best is not None and not degraded
+    # 被降级的那条不能当结论：视觉挑中的落点不是原帖、搬运页上确实有这张图但那
+    # 是转载、命中的是别人在求图的帖子，三种都算「没找到」。降级原因和链接由下面
+    # 的未找到分支统一给出。
+    downgraded = best is not None and bool(downgrade_kind(best))
+    solid = best is not None and not downgraded
     # 帖子档高于视觉档：帖子能点开对照，视觉只是模型判断，所以先给帖子。
     if grok.get("tier") == "post" and not skip_grok:
         if best is not None and best.status == "vision":
@@ -801,6 +827,9 @@ def _best_block_core(outcome: SearchOutcome, *, skip_grok: bool = False, detail:
                 grok_lines.append(f"视觉复核了 {vision['checked']} 张候选，没有发现同一个人。")
         elif vision.get("error"):
             grok_lines.append(f"视觉复核没做完：{vision['error']}")
+        clue = _downgraded_pick_line(outcome)
+        if clue:
+            grok_lines.append(clue)
         return "\n".join(grok_lines)
     if not solid:
         compared = sum(1 for item in outcome.candidates if item.distance is not None)
@@ -809,14 +838,14 @@ def _best_block_core(outcome: SearchOutcome, *, skip_grok: bool = False, detail:
             key=lambda item: item.distance or 0,
             default=None,
         )
-        # 视觉挑中又降级的条目上面已经单独说明并给了链接，不再算进「同角色或
-        # 同款服装」——同一批图不能既说「像同一个人」又说「不是这张照片」。
+        # 降级的条目上面已经单独说明并给了链接，不再算进「同角色或同款服装」——
+        # 同一批图不能既说「像同一个人」又说「不是这张照片」。
         suspects = [
             item
             for item in outcome.candidates
             if item.status == "suspect"
             and not is_avatar_hit(item)
-            and not (item.note or "").startswith("视觉复核")
+            and not downgrade_kind(item)
         ]
         avatars = [
             item
@@ -840,6 +869,10 @@ def _best_block_core(outcome: SearchOutcome, *, skip_grok: bool = False, detail:
             lines.append(f"已比对 {compared} 条候选，都没到阈值。")
         else:
             lines.append("候选图都没能取到或解码，无法验证。")
+        # 上一句说「原因见下」，这里就得真给出来：搬运页/求图帖那条连同链接一起摆。
+        clue = _downgraded_pick_line(outcome)
+        if clue:
+            lines.append(clue)
         vision = outcome.vision or {}
         if vision.get("ok") and vision.get("checked"):
             if vision.get("downgraded"):

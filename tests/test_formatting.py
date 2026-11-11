@@ -6,7 +6,7 @@ import json
 import unittest
 
 from core import formatting
-from core.engines import Candidate
+from core.engines import Candidate, downgrade_kind
 from core.formatting import (
     build_engine_forward_nodes,
     build_forward_nodes,
@@ -1208,6 +1208,69 @@ class DowngradedNearMissTest(unittest.TestCase):
         task.status = "done"
         task.outcome = self._near_miss_outcome()
         return task
+
+
+class DowngradedByKindTest(unittest.TestCase):
+    """降级来源记在字段里：搬运页、求图帖都不算「找到了」，但链接要留在结论里。"""
+
+    def _repost_best(self) -> Candidate:
+        best = Candidate(
+            engine="lens",
+            url="https://www.gamersky.com/ent/202601/13451846.shtml",
+            platform="gamersky.com",
+            name="弟弟中考换亲姐cos委托提出严厉批评的囧图|游民星空",
+            distance=3,
+            status="suspect",
+            downgrade="repost",
+            note="搬运页命中：这页上确实有这张图，但那是转载，不是作者发的",
+        )
+        best.finalize()
+        return best
+
+    def test_repost_hit_is_not_a_conclusion(self) -> None:
+        """s-20261111-2327-5138：命中游民星空囧图合集，不能当出处报出去。"""
+        best = self._repost_best()
+        outcome = SearchOutcome(status="ok", best=best, candidates=[best])
+        text = formatting._best_block(outcome)
+        self.assertIn("未找到可靠出处", text)
+        self.assertNotIn("👤 名字：弟弟中考换亲姐", text)
+        self.assertIn("搬运页命中", text)
+        self.assertIn("https://www.gamersky.com/ent/202601/13451846.shtml", text)
+
+    def test_request_post_is_not_a_conclusion(self) -> None:
+        """0.7.93 把求图帖降成 suspect，文案这边也得跟着走「未找到」。"""
+        item = Candidate(
+            engine="lens",
+            url="https://www.sijishe.com/thread-1611",
+            platform="sijishe.com",
+            distance=0,
+            status="suspect",
+            downgrade="request",
+            note="命中的是求图帖（发帖人也在找出处），不能当原帖",
+        )
+        item.finalize()
+        outcome = SearchOutcome(status="ok", best=item, candidates=[item])
+        text = formatting._best_block(outcome)
+        self.assertIn("未找到可靠出处", text)
+        self.assertIn("求图帖", text)
+        self.assertIn("sijishe.com/thread-1611", text)
+
+    def test_field_wins_over_note_prefix(self) -> None:
+        item = Candidate(engine="lens", status="suspect", downgrade="repost", note="视觉复核：随便写")
+        self.assertEqual(downgrade_kind(item), "repost")
+
+    def test_old_record_falls_back_to_note_prefix(self) -> None:
+        """老会话记录没有 downgrade 字段，仍旧按 note 前缀认视觉复核。"""
+        item = Candidate(
+            engine="lens",
+            status="suspect",
+            note="视觉复核：疑似同一个人，但那是转发页（指纹距离 0），仅供参考",
+        )
+        self.assertEqual(downgrade_kind(item), "vision")
+
+    def test_plain_hit_has_no_kind(self) -> None:
+        item = Candidate(engine="lens", status="match", note="指纹一致（距离 2）")
+        self.assertEqual(downgrade_kind(item), "")
 
 
 class RepostPlatformLabelTest(unittest.TestCase):

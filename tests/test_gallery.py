@@ -46,6 +46,23 @@ class RepostSiteTest(unittest.TestCase):
         self.assertTrue(gallery.is_repost_site("https://cosplayrule34.com/us/post/102074"))
         self.assertFalse(gallery.is_gallery_site("https://galleryepic.com/en/cosplay/9768"))
 
+    def test_joke_roundups_count_as_repost(self):
+        """s-20261111-2327-5138：命中游民星空一篇「囧图」日更合集。
+
+        那页是把网上的图扒下来重发的，指不到作者；插件原来不认它，连图上水印
+        都没读，直接把合集页当出处回了群。
+        """
+        self.assertTrue(
+            gallery.is_repost_site("https://www.gamersky.com/ent/202601/13451846.shtml", "gamersky.com")
+        )
+        # 命中记录里给的是图片域名，平台写的才是主站，两个都得认。
+        self.assertTrue(
+            gallery.is_repost_site(
+                "https://img1.gamersky.com/image2026/01/20260101_ls_red_141_1/134_S.jpg"
+            )
+        )
+        self.assertFalse(gallery.is_repost_site("https://notgamersky.com/a"))
+
     def test_author_pages_are_not_repost(self):
         self.assertFalse(gallery.is_repost_site("https://x.com/Sakana_Yudan/status/2118497064795729951"))
         self.assertFalse(gallery.is_repost_site("https://www.instagram.com/p/DQo68QHkx0G/"))

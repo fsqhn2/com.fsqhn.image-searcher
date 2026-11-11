@@ -81,6 +81,11 @@ class Candidate:
     # 命中的是站点账号头像/图标，不是帖子原图。单独立字段：视觉复核对同一个候选
     # 降级时会改写 note，靠 note 前缀认头像会漏，挑参考图就会挑到 40×40 的头像。
     avatar: bool = False
+    # 被降级的来源：vision=视觉复核挑中但不能当原帖，repost=搬运页命中又反查不到
+    # 原作者，request=命中的是别人在求图的帖子。以前只靠 note 前缀认「视觉复核」，
+    # 再加一种降级就得改五处字符串比对，漏一处就会出现「说不能当原帖、又按找到了
+    # 展示」。老记录没有这个字段，downgrade_kind() 仍退回前缀判断。
+    downgrade: str = ""
 
     def finalize(self) -> "Candidate":
         """补全平台与身份字段。"""
@@ -110,6 +115,32 @@ def is_avatar_hit(item: Candidate) -> bool:
     if (item.note or "").startswith(AVATAR_NOTE):
         return True
     return is_avatar_image(item.image_url)
+
+
+# 视觉复核降级的 note 前缀。`downgrade` 字段是后来加的，老记录只有 note。
+VISION_DOWNGRADE_PREFIX = "视觉复核"
+
+
+def downgrade_kind(item: Candidate | None) -> str:
+    """这条候选是不是被降级过，以及因为什么：vision / repost / request / 空。
+
+    命中距离再近也不算「找到了」的三种情况都走这里：视觉复核挑中的落点不是原帖、
+    搬运页上确实有这张图但那是转载、命中的是别人在求图的帖子。文案侧按这个字段
+    决定要不要走「未找到」分支——以前只认 note 里有没有「视觉复核」几个字，
+    新加的两种降级写进去也对不上，回复里仍按找到了展示。
+    """
+    if item is None:
+        return ""
+    # 只有 suspect 才算降级：视觉复核命中时 status 是 vision、note 同样以「视觉复核」
+    # 开头，那是结论不是降级，按前缀一概而论会把「同一个人」也算成没找到。
+    if item.status != "suspect":
+        return ""
+    kind = str(getattr(item, "downgrade", "") or "").strip()
+    if kind:
+        return kind
+    if (item.note or "").startswith(VISION_DOWNGRADE_PREFIX):
+        return "vision"
+    return ""
 
 
 def _timeout(seconds: float) -> tuple[float, float]:

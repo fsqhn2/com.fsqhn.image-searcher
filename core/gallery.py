@@ -43,6 +43,10 @@ REPOST_HOSTS = (
     # （cosplayrule34「Model Misa Daidai (@xidaidai)」）。它们同样不是作者主页。
     "galleryepic.com",
     "cosplayrule34.com",
+    # 游戏站的「囧图」「每日一囧」这类日更合集：整篇都是网上扒来的图，页面本身
+    # 指不到作者。实测 s-20261111-2327-5138 命中游民星空一篇囧图合集，指纹距离 3
+    # （基本就是同一张），但反查候选里的两个 X 号都没翻到，落点仍是搬运。
+    "gamersky.com",
 )
 
 # 这些路径不是账号名。

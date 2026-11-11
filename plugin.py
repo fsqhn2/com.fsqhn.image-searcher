@@ -1681,6 +1681,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
         for item in candidates:
             if item.status in {"match", "vision"} and is_request_post(item.title):
                 item.status = "suspect"
+                item.downgrade = "request"
                 item.note = "命中的是求图帖（发帖人也在找出处），不能当原帖"
 
         ordered = self._rank(candidates, names, prefer_pixiv=sauce is not None)
@@ -1867,6 +1868,21 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 best = self._promote_repost_author(best, repost_author)
         # 结论里的账号核一下死活：被封的号 handle 会被释放，只剩数字 ID 能对上人。
         best = await self._check_best_account(best, vision_info)
+
+        # 反查没命中、落点仍是搬运站/图集页时，那条不能算「找到了」：指纹对得上只
+        # 说明这页上有这张图，页面本身是转载。实测 s-20261111-2327-5138 命中游民
+        # 星空一篇囧图合集，候选里两个 X 号都翻不到作者，原样当结论发出去，看着
+        # 就像找到了出处。降成线索，链接留在参考区。
+        if (
+            best is not None
+            and best.status == "match"
+            and not (best.handle or "").strip()
+            and is_repost_site(best.url or "", best.platform or "")
+        ):
+            self._vlog("搬运页命中但没反查到原作者，降级成线索：%s", best.platform or best.url)
+            best.status = "suspect"
+            best.downgrade = "repost"
+            best.note = "搬运页命中：这页上确实有这张图，但那是转载，不是作者发的"
 
         # 结论落到人身上之后，再去她自己的付费页确认这一期卖在哪。图包里的图
         # 公开渠道搜不到，Patreon／FANBOX 的公开列表是唯一能给到底的地方。
@@ -2370,6 +2386,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
             verdict = vision.verdict_of(candidate.handle, candidate.platform, candidate.url, candidate.name)
             if verdict != vision.VERDICT_VISION:
                 candidate.status = "suspect"
+                candidate.downgrade = "vision"
                 candidate.note = vision.DOWNGRADE_NOTES[verdict].format(
                     gap=gap,
                     platform=candidate.platform or "这个站点",
