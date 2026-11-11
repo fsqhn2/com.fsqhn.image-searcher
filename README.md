@@ -360,7 +360,7 @@ fake_ip_ranges = ["198.18.0.0/15"]
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `min_similarity` | 60 | 低于这个相似度直接丢，不当候选 |
+| `min_similarity` | 75 | 低于这个相似度只算疑似，不当结论（与插画阈值一致） |
 | `route_similarity` | 75 | 达到就算插画命中，切插画路线 |
 | `db` | `999` | 全量检索用的库 |
 | `db_strict` | `5,6,21,24` | 收紧时用的库（pixiv / twitter / anime-pictures / anime） |

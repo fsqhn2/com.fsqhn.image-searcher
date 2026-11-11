@@ -125,7 +125,7 @@ max_results = 3
 [saucenao]
 enabled = true
 keys = []
-min_similarity = 60
+min_similarity = 75
 # 相似度达到该值即判定「这张是插画」，切到 priority_drawn；纯像素统计做不到这件事，
 # 用 SauceNAO 是否命中来反推最可靠。
 route_similarity = 75

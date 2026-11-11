@@ -31,6 +31,15 @@ class PluginImportTest(unittest.TestCase):
         module = import_plugin()
         self.assertTrue(hasattr(module, "ImageSearcherPlugin"))
 
+    def test_sauce_default_threshold_matches_drawing_route(self) -> None:
+        """SauceNAO 的命中阈值要和插画阈值一致：低于 75% 既不算插画也不算命中。
+
+        s-20261111-1403-e15a 那条 62.6% 就是两个阈值打架的产物——不够插画、
+        又被当照片命中，结论给出一张相似但不相干的图。
+        """
+        module = import_plugin()
+        self.assertEqual(module.SauceNaoConfig().min_similarity, 75)
+
     def test_pick_best_skips_dead_site(self) -> None:
         """半次元已关站，落在那上面的候选不能当结论（s-20261111-1403-e15a）。"""
         module = import_plugin()

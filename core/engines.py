@@ -523,7 +523,7 @@ class SauceNaoEngine:
         pool: KeyPool,
         proxy: str = "",
         timeout: float = 30.0,
-        min_similarity: float = 60.0,
+        min_similarity: float = 75.0,
         db_full: str = "999",
         db_strict: str = "5,6,21,24",
         policy_enabled: bool = False,

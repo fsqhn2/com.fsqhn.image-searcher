@@ -219,9 +219,9 @@ class SauceNaoConfig(EngineConfig):
     __ui_icon__ = "images"
 
     min_similarity: int = Field(
-        default=60,
-        description="相似度低于这个分数只算疑似，不会当权威结果。",
-        json_schema_extra=_ui("最低相似度（%）", "建议 60。调高更严格、候选更少。"),
+        default=75,
+        description="相似度低于这个分数只算疑似，不会当权威结果。和判定插画的阈值保持一致：低于 75% 既不算插画，也不该当照片的命中。",
+        json_schema_extra=_ui("最低相似度（%）", "默认 75，与插画阈值一致。调高更严格、候选更少。"),
         ge=0,
         le=100,
     )
@@ -1654,9 +1654,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
                     item.note = "插画路线参考，未做指纹比对"
             candidates = [item for name in names for item in grouped.get(name, [])]
         else:
-            await self._verify(
-                candidates, grouped, names, target_hash, include_sauce=True
-            )
+            await self._verify(candidates, grouped, names, target_hash)
             # X 的回复页/转发页会把「她回复的、她转的」帖子一起列出来：指纹对上了
             # 也只是说明这张图在这一页出现过。顺回去找到原帖，能确定就换掉。
             reply_hint = await self._resolve_x_list_page(candidates, stream_id)
@@ -1984,37 +1982,21 @@ class ImageSearcherPlugin(MaiBotPlugin):
         grouped: dict[str, list[Candidate]],
         names: list[str],
         target_hash: int | None,
-        *,
-        include_sauce: bool = False,
     ) -> None:
-        """下载候选图比指纹。
-
-        ``include_sauce`` 只在照片路线传 True：插画路线下 SauceNAO 自带相似度
-        就够定论；可一旦路线判成照片，它那 60% 的阈值就和 75% 的插画阈值打架——
-        s-20261111-1403-e15a 那条 62.6% 既不够插画、又被当照片命中，结果是
-        一张相似但不相干的图。照片路线让它也过一遍指纹，假的当场掉下去。
-        """
         section = self.config.plugin
         deep = bool(section.deep_scan)
         targets: list[Candidate] = []
         social_extra: list[Candidate] = []
         social_enabled = bool(getattr(section, "social_verify_all", False))
         for name in names:
-            if name == "saucenao" and not include_sauce:
+            if name == "saucenao":
                 continue
             items = grouped.get(name) or []
             # Lens 会把 visual_matches 与 exact_matches 一起返回，条数可能几十条，
             # 全量下载验证太慢；取 2 倍配置条数，足够覆盖最相关的前几条。
             normal = max(1, section.verify_top_n) * 2 if name == "lens" else max(1, section.verify_top_n)
             limit = max(1, int(section.deep_verify_top_n), normal) if deep else normal
-            picked = items[:limit]
-            if name == "saucenao":
-                # verify_candidate 见到「match + 有相似度」就直接原样返回，SauceNAO
-                # 的候选正好长这样，等于一次都没验。照片路线下先清掉这个标签，
-                # 逼它真去下载缩略图比指纹（缩略图在 saucenao 自己域名下，能取）。
-                for item in picked:
-                    item.status = "unverified"
-            targets.extend(picked)
+            targets.extend(items[:limit])
             if not social_enabled:
                 continue
             # 原帖基本都在社交平台上：X、微博、小红书这些站点的候选即使排在
