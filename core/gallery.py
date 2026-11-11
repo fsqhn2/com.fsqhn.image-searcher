@@ -39,6 +39,10 @@ REPOST_HOSTS = (
     "bbs.nga.cn",
     "ngabbs.com",
     "5ch.net",
+    # 图集 / 盗图站：页面自己不标来源，标题里却常把模特的号写出来
+    # （cosplayrule34「Model Misa Daidai (@xidaidai)」）。它们同样不是作者主页。
+    "galleryepic.com",
+    "cosplayrule34.com",
 )
 
 # 这些路径不是账号名。

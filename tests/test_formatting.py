@@ -1152,6 +1152,34 @@ class DowngradedNearMissTest(unittest.TestCase):
         return task
 
 
+class RepostPlatformLabelTest(unittest.TestCase):
+    """落在图集 / 搬运站又没有账号时，平台那行得说清这不是作者主页。"""
+
+    def test_gallery_page_is_marked(self) -> None:
+        item = Candidate(
+            engine="lens",
+            url="https://galleryepic.com/en/cosplay/9768",
+            status="match",
+            platform="galleryepic.com",
+            distance=0,
+            note="指纹一致（距离 0）",
+        )
+        text = formatting._best_block(SearchOutcome(status="ok", best=item, candidates=[item]))
+        self.assertIn("搬运/图集站，不是作者主页", text)
+
+    def test_x_post_is_not_marked(self) -> None:
+        item = Candidate(
+            engine="grok",
+            url="https://x.com/someone/status/1",
+            status="match",
+            platform="X (Twitter)",
+            handle="@someone",
+            distance=0,
+        )
+        text = formatting._best_block(SearchOutcome(status="ok", best=item, candidates=[item]))
+        self.assertNotIn("不是作者主页", text)
+
+
 class GrokQuietOnceTest(unittest.TestCase):
     """Grok 空手那句只许出现一次，且不能跟「最近的一条」自相矛盾。"""
 

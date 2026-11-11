@@ -31,6 +31,34 @@ class PluginImportTest(unittest.TestCase):
         module = import_plugin()
         self.assertTrue(hasattr(module, "ImageSearcherPlugin"))
 
+    def test_repost_handles_include_non_x_candidates(self) -> None:
+        """号挂在图集站标题里时也要收：s-20261111-1028-1063 整条线因此没跑。"""
+        module = import_plugin()
+        from core.engines import Candidate
+
+        class Stub:
+            _REPOST_AUTHOR_LIMIT = 2
+
+        ordered = [
+            Candidate(
+                engine="lens",
+                url="https://galleryepic.com/en/cosplay/9768",
+                status="match",
+                platform="galleryepic.com",
+                distance=0,
+            ),
+            Candidate(
+                engine="lens",
+                url="https://cosplayrule34.com/us/post/102074",
+                status="match",
+                platform="cosplayrule34.com",
+                distance=0,
+                handle="@xidaidai",
+            ),
+        ]
+        handles = module.ImageSearcherPlugin._repost_x_handles(Stub(), ordered, ordered[0])
+        self.assertEqual(handles, ["xidaidai"])
+
     def test_paywall_helpers_wired(self) -> None:
         module = import_plugin()
         plugin_class = module.ImageSearcherPlugin

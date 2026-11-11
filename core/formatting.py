@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 from .engines import Candidate, is_avatar_hit
 from .extract import is_avatar_image, is_forum_page
 from .tasks import SearchOutcome, SearchTask
-from . import paywall
+from . import gallery, paywall
 
 AI_FLAG_THRESHOLD = 0.75
 
@@ -48,7 +48,14 @@ def _route_line(outcome: SearchOutcome) -> str:
 
 
 def _identity_lines(candidate: Candidate, *, detail: bool = True) -> list[str]:
-    lines = [f"🌐 平台：{candidate.platform}"]
+    label = candidate.platform
+    if not (candidate.handle or "").strip() and gallery.is_repost_site(
+        candidate.url, candidate.platform
+    ):
+        # 图集站/搬运页不是作者主页，光写「平台：galleryepic.com」会让人以为图就发在那儿
+        # （实测 s-20261111-1028-1063 丘浩南直接问「不是原作者的页面吧」）。
+        label = f"{label}（搬运/图集站，不是作者主页）"
+    lines = [f"🌐 平台：{label}"]
     if candidate.note:
         note = candidate.note
         if not detail and candidate.status == "match":

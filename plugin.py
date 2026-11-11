@@ -3865,14 +3865,16 @@ class ImageSearcherPlugin(MaiBotPlugin):
         blocked = (best.handle or "").strip().lstrip("@").lower() if best is not None else ""
         found: list[str] = []
         for item in ordered:
-            if not self._is_x(item):
-                continue
             handle = (item.handle or "").strip().lstrip("@")
             if not handle or handle.isdigit():
                 continue
             lower = handle.lower()
             if lower in seen or lower == blocked:
                 continue
+            # 以前只收落在 X 上的候选；实测 s-20261111-1028-1063 那个号挂在图集站
+            # 的标题里（cosplayrule34「Model Misa Daidai (@xidaidai)」），整条
+            # 线因此没跑，结论停在 galleryepic 上。号出现在哪一页不重要，能不能
+            # 在它的带图帖里翻到这张才是判据。
             seen.add(lower)
             found.append(handle)
             if len(found) >= self._REPOST_AUTHOR_LIMIT:

@@ -40,6 +40,12 @@ class RepostSiteTest(unittest.TestCase):
     def test_gallery_hosts_also_count(self):
         self.assertTrue(gallery.is_repost_site("https://4play.to/koleksi/235/1847"))
 
+    def test_image_farm_hosts_count_as_repost(self):
+        """s-20261111-1028-1063：结论停在 galleryepic，用户一眼问「不是作者页吧」。"""
+        self.assertTrue(gallery.is_repost_site("https://galleryepic.com/en/cosplay/9768"))
+        self.assertTrue(gallery.is_repost_site("https://cosplayrule34.com/us/post/102074"))
+        self.assertFalse(gallery.is_gallery_site("https://galleryepic.com/en/cosplay/9768"))
+
     def test_author_pages_are_not_repost(self):
         self.assertFalse(gallery.is_repost_site("https://x.com/Sakana_Yudan/status/2118497064795729951"))
         self.assertFalse(gallery.is_repost_site("https://www.instagram.com/p/DQo68QHkx0G/"))
