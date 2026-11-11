@@ -210,15 +210,13 @@ def _repost_author_lines(outcome: SearchOutcome, *, detail: bool = False) -> lis
         return [f"🔎 结论是翻出来的：搬运站那条只是转贴，@{handle} 自己的带图帖里有这张"]
     if status != "none" or not scanned:
         return []
+    if not detail:
+        # 首次回复只给结论。「翻过哪几个号」属于怎么找的，只在「更多」里出现
+        # （2026-11-11 丘浩南确认维持原设计）。
+        return []
     names = "、".join(f"@{item}" for item in scanned[:3])
     failed = _repost_handles(info, "failed")
     tail = f"（{'、'.join('@' + item for item in failed[:2])} 那次没翻成）" if failed else ""
-    if not detail:
-        # 首次回复只给结论。少了这一句，用户看到图集站会以为插件根本没去 X 找
-        # （实测 s-20261111-1207-2c38 丘浩南直接问「我还以为会反查到 x」）；
-        # 但「翻了哪几个号」属于怎么找的，仍然只在「更多」里出现。
-        miss = "（有几个号这次没翻成）" if failed else ""
-        return [f"🔎 候选里那几个 X 号都翻过，没有这一张{miss}"]
     return [
         f"🔎 也翻过候选里 {names} 自己的带图帖和搜索，没找到这张{tail}；"
         "这几个号只看得到最近发的那批"
