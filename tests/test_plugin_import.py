@@ -40,6 +40,72 @@ class PluginImportTest(unittest.TestCase):
         module = import_plugin()
         self.assertEqual(module.SauceNaoConfig().min_similarity, 75)
 
+    def test_watermark_reread_defaults_on(self) -> None:
+        """「原图再读一次水印」是独立开关，默认开。
+
+        s-20261111-1403-e15a 那单图上写着 KWATERIN，前两条读水印的线都没落到，
+        这道兜底本该救回来，却因为开关藏在「拼图读到东西」的分支里被一起跳过。
+        """
+        module = import_plugin()
+        self.assertTrue(module.VisionConfig().watermark_reread)
+
+    def test_should_reread_watermark_when_composite_read_nothing(self) -> None:
+        """拼图一个字都没读出来时，兜底重读照样要跑——这就是 1403 那单的翻车点。"""
+        module = import_plugin()
+        self.assertTrue(
+            module.ImageSearcherPlugin._should_reread_watermark(
+                vision_enabled=True,
+                reread_enabled=True,
+                had_best=False,
+                watermark_post="",
+                grok_post="",
+            )
+        )
+
+    def test_should_reread_watermark_skips_when_watermark_already_landed(self) -> None:
+        """水印号已经翻到本人发的帖子，就不必再多花一次视觉调用。"""
+        module = import_plugin()
+        self.assertFalse(
+            module.ImageSearcherPlugin._should_reread_watermark(
+                vision_enabled=True,
+                reread_enabled=True,
+                had_best=False,
+                watermark_post="https://x.com/kwaterin/status/1",
+                grok_post="",
+            )
+        )
+
+    def test_should_reread_watermark_skips_when_grok_already_landed(self) -> None:
+        """Grok 已经给出帖子地址，同样收工。"""
+        module = import_plugin()
+        self.assertFalse(
+            module.ImageSearcherPlugin._should_reread_watermark(
+                vision_enabled=True,
+                reread_enabled=True,
+                had_best=False,
+                watermark_post="",
+                grok_post="https://x.com/kwaterin/status/1",
+            )
+        )
+
+    def test_should_reread_watermark_skips_when_hit_or_switched_off(self) -> None:
+        """有结论就不兜底；开关关掉也不兜底。"""
+        module = import_plugin()
+        cases = [
+            dict(vision_enabled=True, reread_enabled=True, had_best=True),
+            dict(vision_enabled=True, reread_enabled=False, had_best=False),
+            dict(vision_enabled=False, reread_enabled=True, had_best=False),
+        ]
+        for case in cases:
+            with self.subTest(**case):
+                self.assertFalse(
+                    module.ImageSearcherPlugin._should_reread_watermark(
+                        watermark_post="",
+                        grok_post="",
+                        **case,
+                    )
+                )
+
     def test_pick_best_skips_dead_site(self) -> None:
         """半次元已关站，落在那上面的候选不能当结论（s-20261111-1403-e15a）。"""
         module = import_plugin()

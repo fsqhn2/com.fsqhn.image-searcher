@@ -369,6 +369,20 @@ class VisionConfig(PluginConfigBase):
             "默认开。每单最多试十来个写法，而且必须指纹对得上才采用；关掉就只认读出来的原号。",
         ),
     )
+    watermark_reread: bool = Field(
+        default=True,
+        description=(
+            "水印兜底重读：拼图和 Grok 都没读出可用水印（或者读出来的号翻遍带图帖都不是"
+            "这张图）时，最后再把原图单独交给视觉模型读一遍。拼图里每格只有 320 像素，"
+            "手写体小字常被压没；原图能看清。读到账号照样核账号、翻带图帖，只有那个号"
+            "自己的帖子里真有这张图才算命中。"
+        ),
+        json_schema_extra=_ui(
+            "水印兜底重读（原图）",
+            "默认开。拼图和 Grok 两条线都没落下结论时才跑，每单最多多一次视觉调用；"
+            "关掉就只认拼图和 Grok 读出来的水印。",
+        ),
+    )
     x_from_name: bool = Field(
         default=True,
         description=(
@@ -1750,16 +1764,41 @@ class ImageSearcherPlugin(MaiBotPlugin):
                         upload,
                         allow_variants=not had_best,
                     )
-                    # 拼图里 TARGET 格只有 320px，小字水印常被压没或读歪（ac88
-                    # 那次把 Moliww 读成 Miharu）。两条线都没落地时，用原图单独
-                    # 再读一次；读到新号照样核账号、翻带图帖。
-                    if (
-                        not had_best
-                        and not vision_info.get("watermark_post")
-                        and upload
-                        and config.vision.enabled
-                    ):
-                        await self._reread_watermark(vision_info, grok_info, upload)
+                # 第三道兜底：拼图、Grok 两条读水印的线都扑街时，用原图单独再读一次。
+                #
+                # 拼图里 TARGET 格只有 320px，手写体小字常被压没（实测同一张纳西妲
+                # cos：拼图那版模型回空串，原图版读出 @Sakana_Yudan）；Grok 一侧也
+                # 可能读空或者干脆崩掉。s-20261111-1403-e15a 更典型：图右下角清清
+                # 楚楚写着 KWATERIN（@kwaterin），拼图一个字没读出来，而那次重读还
+                # 挂在上一个 if 里，被一起跳过了——图上写着答案，插件却说没找到。
+                #
+                # 所以它单独成一道、由 vision.watermark_reread 控制：只看「整轮没有
+                # 结论、两条水印线都没落地」，不再看拼图有没有读到东西。
+                if self._should_reread_watermark(
+                    vision_enabled=bool(config.vision.enabled),
+                    reread_enabled=bool(config.vision.watermark_reread),
+                    had_best=had_best,
+                    watermark_post=str((vision_info or {}).get("watermark_post") or ""),
+                    grok_post=str((grok_info or {}).get("post_url") or ""),
+                ):
+                    if vision_info is None:
+                        # 拼图那一轮自己就炸了，连结果 dict 都没留下：补个空壳，
+                        # 后面的水印核对链路照原样接。ok=False 且 checked=0，
+                        # 呈现层不会因此多出「视觉复核」那一段。
+                        vision_info = {
+                            "ok": False,
+                            "checked": 0,
+                            "picked": [],
+                            "picked_images": [],
+                            "downgraded": 0,
+                            "reason": "",
+                            "model": "",
+                            "error": "",
+                            "elapsed": 0.0,
+                            "sources": [],
+                            "watermark": "",
+                        }
+                    await self._reread_watermark(vision_info, grok_info, upload)
                 if not had_best and vision_info and vision_info.get("picked"):
                     ordered = dedupe_accounts(self._rank(candidates, names))
                     # 模型可能一次报好几格，取指纹距离最近的那条当结论——距离近说明
@@ -3133,6 +3172,34 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 f"({item.get('state')}{'，命中' if item.get('post') else ''})"
                 for item in results
             ),
+        )
+
+    @staticmethod
+    def _should_reread_watermark(
+        *,
+        vision_enabled: bool,
+        reread_enabled: bool,
+        had_best: bool,
+        watermark_post: str,
+        grok_post: str,
+    ) -> bool:
+        """要不要跑「原图再读一次水印」这道兜底。
+
+        前提三条：开关都打开、整轮没有结论、前面两条读水印的线也都没落地
+        （``watermark_post`` 和 ``grok_post`` 都为空）。
+
+        特意**不看拼图有没有读到水印文本**：读到但没核到图，同样算没落地；
+        一个字都没读到，更该再试一次。s-20261111-1403-e15a 就是这么翻车的——
+        图右下角写着 ``KWATERIN``（对应 @kwaterin），拼图一个字没读出来，
+        而旧代码把重读挂在了「拼图读到东西」的分支里，于是连着被跳过，
+        最后报了个「未找到」，图上写着答案插件却说没有。
+        """
+        return bool(
+            vision_enabled
+            and reread_enabled
+            and not had_best
+            and not (watermark_post or "").strip()
+            and not (grok_post or "").strip()
         )
 
     async def _reread_watermark(
