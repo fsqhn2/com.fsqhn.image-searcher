@@ -264,10 +264,14 @@ class PluginImportTest(unittest.TestCase):
                     )
                 )
 
-    def test_watermark_tiles_defaults_on(self) -> None:
-        """整图读不出水印时切块再读，是独立开关，默认开。"""
+    def test_watermark_tiles_defaults_off(self) -> None:
+        """切块读默认关：六块要四十秒，还最容易读出假号。
+
+        实测 s-20261112-0858-c44f 那单切块读出 MURUA／MIRUI／idcNothinglose
+        三个号，一个都没核上，却花了 50 秒；整图那边早就读到了真号。
+        """
         module = import_plugin()
-        self.assertTrue(module.VisionConfig().watermark_tiles)
+        self.assertFalse(module.VisionConfig().watermark_tiles)
 
     def test_signature_hunt_defaults_on(self) -> None:
         """标题署名反查是独立开关，默认开。"""
