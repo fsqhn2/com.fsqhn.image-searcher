@@ -887,6 +887,13 @@ class XGuessTest(unittest.TestCase):
         text = formatting._best_block(self._make_outcome(with_grok=True))
         self.assertNotIn("疑似同一个人的 X", text)
 
+    def test_checked_posts_says_she_has_no_such_post(self) -> None:
+        """标题认到号、但翻过她的带图帖没这张：要说清翻过了。"""
+        outcome = self._make_outcome()
+        outcome.x_guess = dict(outcome.x_guess or {}, checked_posts=True)
+        text = formatting._best_block(outcome)
+        self.assertIn("带图帖里翻过，没有这张", text)
+
 
 class ForumTitleTest(unittest.TestCase):
     """论坛帖的标题不能写成「名字」：inven 那单发了串韩文帖子标题出去。"""

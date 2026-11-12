@@ -286,7 +286,10 @@ def _x_guess_lines(outcome: SearchOutcome) -> list[str]:
         lines.append(f"从候选 {platform} 的标题「{title}」里认出这个名字，X 上确认账号存在。")
     else:
         lines.append(f"从候选 {platform} 的标题里认出这个名字，X 上确认账号存在。")
-    lines.append("只是同一个人可能用的号，不是这张图的原帖。")
+    if guess.get("checked_posts"):
+        lines.append("她自己最近的带图帖里翻过，没有这张——只能算同一个人可能用的号，不是这张图的原帖。")
+    else:
+        lines.append("只是同一个人可能用的号，不是这张图的原帖。")
     return lines
 
 

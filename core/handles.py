@@ -83,6 +83,15 @@ _SIG_LABEL = re.compile(
 _SIG_JP = re.compile(
     r"(?:コスプレイヤー|レイヤー|撮影|モデル|被写体)\s*[:：]?\s*@?([A-Za-z0-9_.\-]{2,24})"
 )
+# 泄漏站／搬运站的合集页常把「这套图是谁的」直接写在标题里：
+# 「推特lazycataw（仅有足）」「Твиттер: lazycataw (только в Instagram)」。
+# 这跟「by XXX」一样是明确的署名，只是换了中日俄三种写法。
+# 实测 s-20261113-0106-ed9a：lens 四条候选里有三条标题写着推特lazycataw，
+# 插件一个名字都没抽出来，于是一路落到「没找到」。
+_SIG_TWITTER = re.compile(
+    r"(?:推特|twitter|твиттер)(?!\s*[./])\s*[:：]?\s*@?([A-Za-z0-9_][A-Za-z0-9_.\-]{2,23})",
+    re.I,
+)
 
 # 这些词长得像名字，其实是平台名、泛称或者句子里顺手带上的一般词。
 _SIG_STOP = _STOP | {
@@ -119,7 +128,7 @@ def signature_names(texts: list[str], limit: int = 3) -> list[str]:
             continue
         for match in _SIG_AT.finditer(raw):
             buckets[0].append(match.group(1))
-        for pattern in (_SIG_LABEL, _SIG_JP):
+        for pattern in (_SIG_LABEL, _SIG_JP, _SIG_TWITTER):
             for match in pattern.finditer(raw):
                 buckets[1].append(match.group(1))
         for match in _SIG_BY.finditer(raw):

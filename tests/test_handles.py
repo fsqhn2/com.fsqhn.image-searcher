@@ -246,6 +246,22 @@ class SignatureNameTest(unittest.TestCase):
         self.assertEqual(handles.signature_names(["coser: Sakana"]), ["Sakana"])
         self.assertEqual(handles.signature_names(["Credit to @Moliww"]), ["Moliww"])
 
+    def test_twitter_prefix_forms(self) -> None:
+        """泄漏站合集页把「这套是谁的」写在标题里（s-20261113-0106-ed9a）。"""
+        self.assertEqual(
+            handles.signature_names(["推特lazycataw（仅有足） - Hentai Gallery"]),
+            ["lazycataw"],
+        )
+        self.assertEqual(
+            handles.signature_names(["Твиттер: lazycataw (только в Instagram)"]),
+            ["lazycataw"],
+        )
+        self.assertEqual(handles.signature_names(["Twitter: @foo_bar"]), ["foo_bar"])
+
+    def test_twitter_domain_is_not_a_signature(self) -> None:
+        """`twitter.com/xxx` 是网址，不能把 com 当成人名抽出来。"""
+        self.assertEqual(handles.signature_names(["twitter.com/lazycataw/x"]), [])
+
     def test_generic_by_is_lowest_priority(self) -> None:
         found = handles.signature_names(["posted by someone", "cosplay by KURU"])
         self.assertEqual(found[0], "KURU")

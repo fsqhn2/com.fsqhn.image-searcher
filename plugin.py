@@ -2061,11 +2061,16 @@ class ImageSearcherPlugin(MaiBotPlugin):
         # 里抽不出号、图上水印也读不到时，标题里这个名字往往就是唯一剩下的入口：
         # 拿它去检索 X 账号，再翻那个号自己的带图帖比指纹，对上了才换结论。
         signature_author: dict[str, Any] | None = None
+        signature_seen: dict[str, Any] | None = None
         if (
             upload
             and bool(getattr(config.vision, "signature_hunt", True))
             and (
                 best is None
+                # 视觉命中只是「模型说同一个人」，还没核实过，别让它一个人挡住
+                # 标题这条硬线索：ed9a 那单就是被视觉猜的 @sleamPM 挡住的，而
+                # lens 三条候选的标题里都写着「推特lazycataw」。
+                or best.status == "vision"
                 or (
                     best.status == "match"
                     and not (best.handle or "").strip()
@@ -2085,6 +2090,10 @@ class ImageSearcherPlugin(MaiBotPlugin):
             elif signature_author and signature_author.get("status") == "author":
                 # 认得出是谁、但翻不到这张：结论给作者，别判成「没找到」。
                 best = self._promote_cross_author(best, signature_author)
+            elif signature_author and signature_author.get("status") == "seen":
+                # 号确实存在、名字也对得上，只是她最近的带图帖里没有这张：
+                # 当线索留着，别丢掉——ed9a 那单就能靠这条落到 @lazycataw。
+                signature_seen = signature_author
         # 同一张图落在普通网页上（搬运站/图集页，页面上没有账号）时别停在那儿：
         # 候选里出现过的 X 号挨个翻一遍，谁自己的帖子里有这张图谁就是结论。
         repost_author: dict[str, Any] | None = None
@@ -2179,13 +2188,29 @@ class ImageSearcherPlugin(MaiBotPlugin):
         if (
             upload
             and ordered
-            and not (grok_info or {}).get("handle")
+            and not (grok_info or {}).get("tier") in {"post", "account"}
             and not (best is not None and self._is_x(best))
         ):
             try:
                 x_guess = await self._hunt_x_handle(ordered)
             except Exception as error:  # noqa: BLE001 - 猜号失败不影响已经搜到的结果
                 self.ctx.logger.warning("疑似 X 账号推断失败：%s", error)
+
+        # 标题署名已经认到号、只是翻不到这张时，把那个号当线索挂出去：
+        # 它比「从一堆标题里蒙一个」硬得多（名字对得上、账号也核过），
+        # 不提的话用户只能看到一句「没找到」。
+        if x_guess is None and signature_seen and str(signature_seen.get("handle") or ""):
+            x_guess = {
+                "handle": str(signature_seen.get("handle") or ""),
+                "followers": int(signature_seen.get("followers") or 0),
+                "source_title": str(signature_seen.get("source_title") or ""),
+                "source_platform": str(signature_seen.get("platform") or "X (Twitter)"),
+                "source_url": str(signature_seen.get("source_url") or ""),
+                "checked_posts": True,
+            }
+            self._vlog(
+                "署名线索：@%s（翻过她的带图帖，没有这张）", x_guess["handle"]
+            )
 
         # 付费内容线索：搬运站和泄露站按名字建页，有页就说明这个人确实在做
         # OnlyFans。它同样不改 best，只多给一个可以核对的号。
@@ -4997,6 +5022,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
         }
         probes = 0
         seen_note = ""
+        seen_info: dict[str, Any] | None = None
         anchors = [
             item
             for item in (hints or [])
@@ -5076,6 +5102,23 @@ class ImageSearcherPlugin(MaiBotPlugin):
                         else "",
                     }
                 seen_note = str(holder.get("watermark_note") or "")
+                source = next(
+                    (item for item in rows if name.lower() in self._name_text(item).lower()),
+                    None,
+                )
+                seen_info = {
+                    "status": "seen",
+                    "name": name,
+                    "handle": resolved,
+                    "x_name": x_name,
+                    "followers": int(info.get("followers") or 0),
+                    "reason": seen_note,
+                    "platform": str(source.platform or "") if source is not None else "",
+                    "source_url": source.url if source is not None else "",
+                    "source_title": " ".join((source.title or source.name or "").split())[:60]
+                    if source is not None
+                    else "",
+                }
         # 交叉验证：图上水印读到、并且核到存在的号，如果跟标题署名是同一个名字，
         # 两个独立来源就指向同一个人。她自己的帖子里翻不到这张（删过帖、或者本来
         # 就在付费图包里）不影响「作者是谁」——1710 那单水印明明读出 @kuru_xox，
@@ -5099,6 +5142,8 @@ class ImageSearcherPlugin(MaiBotPlugin):
                     "x_name": str(anchor.get("name") or ""),
                     "user_id": str(anchor.get("user_id") or ""),
                 }
+        if seen_info:
+            return seen_info
         if seen_note:
             return {"status": "seen", "name": names[0], "reason": seen_note}
         return None
