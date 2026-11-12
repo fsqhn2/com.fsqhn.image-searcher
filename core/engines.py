@@ -250,6 +250,8 @@ class LensEngine:
         self.timeout = timeout
         self.retries = max(0, int(retries))
         self.retry_delay = max(0.0, float(retry_delay))
+        # 上一枪走的是哪家：空结果兜底要据此判断「Serper 是不是已经试过了」。
+        self._last_channel = ""
 
     def _pick_key(self) -> tuple[str, KeyPool]:
         """先拿 SerpAPI 的 key，它那边一个都拿不到才用 Serper 顶。"""
@@ -263,14 +265,20 @@ class LensEngine:
         return "", self.pool
 
     def search(self, raw: bytes, image_url: str = "", stream_id: str = "") -> list[Candidate]:
-        """空返回或上传失败时换一次上传重试。
+        """空返回或上传失败时换一次上传重试，仍为空再让 Serper 补一枪。
 
         SerpAPI 的 google_lens 有两种失败都不代表「网上没有这张图」：
         一是同一张图随机返回 0 条（实测 6 次里 3 次为空，命中时恰好是同图原帖），
         二是图片上传接口偶发失败。两种都重试，有结果就立刻返回。
+
+        三次都空的情况真实发生过（s-20261112-1250-f895：当天别的单 lens 都是
+        59~60 条，那一单 0 条，48 条候选全来自 Yandex／百度／SauceNAO）。所以重试完
+        仍为空、且这一轮没走过 Serper 时，用 Serper 的 Lens 再补一次——它一次扣
+        3 次额度，只在最后补一枪，不参与轮询。
         """
         items: list[Candidate] = []
         last_error: EngineError | None = None
+        self._last_channel = ""
         for attempt in range(self.retries + 1):
             try:
                 items = self._search_once(raw, image_url)
@@ -282,6 +290,17 @@ class LensEngine:
                 return items
             if attempt < self.retries:
                 time.sleep(self.retry_delay)
+        # 补一枪 Serper：只在主路全空、且上面没走过它的时候。它自己失败就静默收场，
+        # 不能把「SerpAPI 返回空」改写成「引擎报错」。
+        if not items and self.serper_pool is not None and self._last_channel != "serper":
+            key = self.serper_pool.acquire()
+            if key:
+                try:
+                    items = self._search_serper(key, raw, image_url, self.serper_pool)
+                except EngineError:
+                    items = []
+        if items:
+            return items
         if last_error is not None:
             raise last_error
         return items
@@ -291,7 +310,9 @@ class LensEngine:
         if not key:
             raise EngineError("没有可用的检索 key（未配置或全部冷却）")
         if is_serper_key(key):
+            self._last_channel = "serper"
             return self._search_serper(key, raw, image_url, pool)
+        self._last_channel = "serpapi"
 
         session = make_session(self.proxy)
         try:

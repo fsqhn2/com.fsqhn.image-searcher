@@ -1236,6 +1236,7 @@ class DowngradedByKindTest(unittest.TestCase):
         self.assertNotIn("👤 名字：弟弟中考换亲姐", text)
         self.assertIn("搬运页命中", text)
         self.assertIn("https://www.gamersky.com/ent/202601/13451846.shtml", text)
+        self.assertIn("仅能找到其他网站的转发，并未能找到原始出处", text)
 
     def test_request_post_is_not_a_conclusion(self) -> None:
         """0.7.93 把求图帖降成 suspect，文案这边也得跟着走「未找到」。"""
@@ -1254,6 +1255,7 @@ class DowngradedByKindTest(unittest.TestCase):
         self.assertIn("未找到可靠出处", text)
         self.assertIn("求图帖", text)
         self.assertIn("sijishe.com/thread-1611", text)
+        self.assertNotIn("仅能找到其他网站的转发", text)
 
     def test_field_wins_over_note_prefix(self) -> None:
         item = Candidate(engine="lens", status="suspect", downgrade="repost", note="视觉复核：随便写")

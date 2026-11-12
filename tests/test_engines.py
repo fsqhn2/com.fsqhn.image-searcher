@@ -407,6 +407,37 @@ class LensSerperFallbackTest(unittest.TestCase):
         key, _ = engine._pick_key()
         self.assertEqual(key, "")
 
+    def test_empty_result_falls_back_to_serper(self) -> None:
+        """s-20261112-1250-f895：SerpAPI 重试完仍空，用 Serper 的 Lens 补一枪。"""
+        from core.keypool import KeyPool
+
+        engine = LensEngine(KeyPool(["serpapi-key"]), serper_pool=KeyPool(["a" * 40]), retries=0)
+        engine._search_once = lambda raw, image_url="": []  # type: ignore[assignment]
+        used: list[str] = []
+
+        def fake_serper(key: str, raw: bytes, image_url: str = "", pool=None):
+            used.append(key)
+            return [Candidate(engine="lens", url="https://x.com/foo/status/1")]
+
+        engine._search_serper = fake_serper  # type: ignore[assignment]
+        items = engine.search(b"img")
+        self.assertEqual(used, ["a" * 40])
+        self.assertEqual(len(items), 1)
+
+    def test_serper_failure_keeps_result_empty(self) -> None:
+        """Serper 自己失败时不能把「SerpAPI 返回空」改写成引擎报错。"""
+        from core.engines import EngineError
+        from core.keypool import KeyPool
+
+        engine = LensEngine(KeyPool(["serpapi-key"]), serper_pool=KeyPool(["a" * 40]), retries=0)
+        engine._search_once = lambda raw, image_url="": []  # type: ignore[assignment]
+
+        def boom(key: str, raw: bytes, image_url: str = "", pool=None):
+            raise EngineError("Serper Lens 返回 HTTP 500")
+
+        engine._search_serper = boom  # type: ignore[assignment]
+        self.assertEqual(engine.search(b"img"), [])
+
 
 class LensRetryTest(unittest.TestCase):
     """Lens 对同一张图会随机返回 0 条，空返回必须重试，有结果就立刻停。"""

@@ -226,7 +226,7 @@ Serper（https://serper.dev）跟 SerpAPI **不是一家公司**，key 也不通
 它干两件事：
 
 - **网页检索**：按名字去 X 找账号、按 `id=` 后面的名字去十个平台查主页。SerpAPI 那几把 key 都不可用时自动改用它。
-- **Lens 替补**：SerpAPI 额度用完或全部冷却时，Lens 改走 Serper 顶上。
+- **Lens 替补**：SerpAPI 额度用完、全部冷却，或者重试完仍返回 0 条时，Lens 改走 Serper 顶上。
 
 ```toml
 [serper]
@@ -402,7 +402,7 @@ fake_ip_ranges = ["198.18.0.0/15"]
 |---|---|---|
 | `enabled` | true | 总开关。key 留空即自然不参与，不必特意关 |
 | `keys` | 空 | Serper 的 40 位 key，可填多个轮询 |
-| `lens_fallback` | true | SerpAPI 全部不可用时，让 Lens 改用 Serper 顶上（一次扣 3 次额度） |
+| `lens_fallback` | true | SerpAPI 不可用或返回 0 条时，让 Lens 改用 Serper 顶上（一次扣 3 次额度） |
 | `upload` | true | 允许把图传到 uguu.se 换直链；关掉等于 Serper 不碰 Lens，网页检索不受影响 |
 
 网页检索（按名字搜 X、按 `id=` 的名字查各平台）永远先走 SerpAPI，它那边全都不可用才轮到 Serper；两家都是 Google 后端，结果一样，所以只要有一家跑通就收工，返回空也认，不会拿另一家再花一次额度。

@@ -216,12 +216,13 @@ class SerperConfig(PluginConfigBase):
     lens_fallback: bool = Field(
         default=True,
         description=(
-            "SerpAPI 那几把 key 都用完或全部冷却时，让 Lens 改用 Serper 顶上。"
+            "两种情况下让 Lens 改用 Serper 顶上：SerpAPI 那几把 key 都用完或全部冷却；"
+            "或者 SerpAPI 重试完仍返回 0 条（它会对同一张图随机抽空，实测 6 次里 3 次空）。"
             "一次扣 3 次 Serper 额度，还要先把图传到公网图床，比 SerpAPI 慢几秒。"
         ),
         json_schema_extra=_ui(
             "允许 Serper 替补 Lens",
-            "默认开。只有 SerpAPI 全部不可用时才会轮到它。",
+            "默认开。SerpAPI 不可用或返回空时才会轮到它。",
         ),
     )
     upload: bool = Field(
