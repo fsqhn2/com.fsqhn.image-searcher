@@ -1,0 +1,61 @@
+name: Release
+
+# 推 v* 标签时自动打包并发 GitHub Release。
+# 市场只读 Release，不读裸 tag；这里保证两者永远同时出现。
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 校验标签与 manifest 版本一致
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME#v}"
+          VER=$(python3 -c "import json;print(json.load(open('_manifest.json'))['version'])")
+          echo "标签版本: $TAG"
+          echo "manifest 版本: $VER"
+          if [ "$TAG" != "$VER" ]; then
+            echo "::error::标签 $GITHUB_REF_NAME 与 _manifest.json 的 version ($VER) 不一致"
+            exit 1
+          fi
+
+      - name: 打包
+        run: |
+          set -euo pipefail
+          NAME="com.fsqhn.image-searcher"
+          PKG="${NAME}-${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          rsync -a \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='config.toml' \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            --exclude='*.zip' \
+            --exclude='dist' \
+            ./ "dist/${NAME}/"
+          ( cd dist && zip -qr "${PKG}.zip" "${NAME}" )
+          echo "打包结果："
+          ls -l dist
+          unzip -l "dist/${PKG}.zip" | tail -3
+
+      - name: 发布 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" dist/*.zip \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag \
+          || gh release upload "$GITHUB_REF_NAME" dist/*.zip --clobber
