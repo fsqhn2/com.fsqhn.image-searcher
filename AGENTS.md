@@ -144,6 +144,12 @@ core/maibot_compat.py  能力返回值解包
 | 部分 CDN 直接封服务器 IP（`cdn.donmai.us` 403、`lookaside.instagram.com` 返回非图片） | 只能标「未验证」放参考区 |
 | Sightengine 单次 `genai` 计 5 ops | 只在低置信分支调用 |
 
+## 疑难案例台账
+
+逐单记录在 [docs/cases.md](docs/cases.md)：哪一单、现象是什么、卡在哪一步、改了什么、哪个版本好的。
+
+「踩过的坑」写规律，这张表写事实。**每处理一单疑难图，必须往台账追加一行台账和一段逐单记录**，不然同一类毛病复发时只能重新翻一遍日志。用户发图时会带单号（`s-YYYYMMDD-HHMM-xxxx`）、正确答案和一句现象，先按 `docs/cases.md` 末尾的「排查一单的顺序」走。
+
 ## 踩过的坑
 
 1. **像素统计判不了「照片 vs 绘制」**：试过六组特征全部无法分开。已删掉 `core/imagetype.py`，不要重造。

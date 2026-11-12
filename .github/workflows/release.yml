@@ -42,6 +42,7 @@ jobs:
             --exclude='__pycache__' \
             --exclude='*.pyc' \
             --exclude='*.zip' \
+            --exclude='docs' \
             --exclude='dist' \
             ./ "dist/${NAME}/"
           ( cd dist && zip -qr "${PKG}.zip" "${NAME}" )
