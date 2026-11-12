@@ -153,6 +153,22 @@ class PluginImportTest(unittest.TestCase):
         module = import_plugin()
         self.assertTrue(module.VisionConfig().deep_trace)
 
+    def test_id_name_search_defaults_on(self) -> None:
+        """按 id= 的名字查各平台是独立开关，默认开。"""
+        module = import_plugin()
+        self.assertTrue(module.VisionConfig().id_name_search)
+
+    def test_watermark_reread_runs_before_id_name(self) -> None:
+        """先读水印（含候选图与切块），再拿 id= 的名字去各平台。
+
+        顺序反了的话，水印还没读出来就没有名字可查。
+        """
+        module = import_plugin()
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        reread = source.index("await self._reread_watermark(")
+        hunt = source.index("await self._hunt_from_id_name(")
+        self.assertLess(reread, hunt)
+
     def test_watermark_candidates_prefers_closest_images(self) -> None:
         """按指纹距离挑候选图：判死的、没图链的都不读，越像越先读。
 

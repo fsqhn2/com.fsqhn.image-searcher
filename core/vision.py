@@ -515,6 +515,19 @@ def reason_of(text: str) -> str:
 # 水印里像 X 账号的部分：@abc123，或者整串就是个裸账号。
 _WATERMARK_HANDLE = re.compile(r"@([A-Za-z0-9_]{2,15})")
 _WATERMARK_BARE = re.compile(r"[A-Za-z0-9_]{3,15}")
+
+# 中文平台习惯把 ID 写成 ``id=某某``、``id:某某``、``id.某某``，前面还可能带个 @。
+# 直接拿 _WATERMARK_HANDLE 去匹配会先撞上 ``@id``，把 ``id`` 当成账号——实测
+# s-20261112-0858-c44f 图上写着 ``Reng♡ @id.NothingLose``，取号取成 ``id``，
+# 又因为 ``@id`` 前面刚被 Grok 读过、判了「还是它、不重复核」，整图那次结果就
+# 这么丢了，最后报未找到。
+_WATERMARK_ID_PREFIX = re.compile(
+    r"@?\s*\bid\s*[=:.：]\s*([A-Za-z0-9_]{3,15})",
+    re.I,
+)
+# 小字里 ``id=`` 的等号常被读成 c，``id=NothingLose`` 就成了 ``idcNothingLose``。
+# 只在紧挨着的时候才认这个 c，免得 ``id cosplay`` 也被当成账号。
+_WATERMARK_IDC = re.compile(r"@?\s*\bidc([A-Za-z0-9_]{4,15})", re.I)
 # 模型说「没有」的各种写法。水印常常小到只有一个像素高，它照样会回一句「看不清」，
 # 这种不能当成「读到了一个 ID」。
 _WATERMARK_EMPTY = (
@@ -575,21 +588,66 @@ def watermark_of(text: str) -> str:
     return value[:40]
 
 
+def id_name_from_watermark(text: str) -> str:
+    """水印里 ``id=`` 后面那个名字，没有就返回空串。
+
+    中文平台习惯这么标 ID（``@id=NothingLee``），这一截往往是本名而不是 X 的
+    handle，得拿去别的平台找人对。
+    """
+    value = str(text or "").strip()
+    if not value:
+        return ""
+    for pattern in (_WATERMARK_ID_PREFIX, _WATERMARK_IDC):
+        match = pattern.search(value)
+        if match:
+            return match.group(1)
+    return ""
+
+
 def handle_from_watermark(text: str) -> str:
     """从水印文本里取 X 账号，取不到返回空串。
 
     只认两种：明写的 ``@xxx``，或者整串就是一个裸账号。中文名、夹杂描述的一律
     不猜——按拼音或近似拼写去试探，等于给错人。
     """
+    found = handles_from_watermark(text)
+    return found[0] if found else ""
+
+
+def handles_from_watermark(text: str, limit: int = 3) -> list[str]:
+    """从水印文本里取出所有像账号的候选，按可信度排序。
+
+    一条水印里常常不止一个写法：``Reng♡ @id.NothingLose`` 既有 ``@id`` 这个
+    半截，也有 ``id=`` 后面真正的名字。只取第一个会取到 ``@id``——它前面刚被
+    另一个来源核过，于是整条被当成「还是它」丢掉，答案就在眼前却报未找到。
+    所以这里把候选都列出来，由调用方逐个去核。
+
+    ``id=`` / ``id:`` / ``id.`` 后面那截排最前：中文平台习惯这么写 ID，它比
+    前面的 ``@id`` 半截更可能是真的。
+    """
     value = str(text or "").strip()
     if not value:
-        return ""
-    match = _WATERMARK_HANDLE.search(value)
-    if match:
-        return match.group(1)
+        return []
+    found: list[str] = []
+
+    def add(candidate: str) -> None:
+        name = (candidate or "").strip().strip(".").strip()
+        low = name.lower()
+        if len(name) < 3 or name.isdigit() or low in _WATERMARK_PLATFORMS:
+            return
+        if name not in found:
+            found.append(name)
+
+    for pattern in (_WATERMARK_ID_PREFIX, _WATERMARK_IDC):
+        for match in pattern.finditer(value):
+            add(match.group(1))
+    for match in _WATERMARK_HANDLE.finditer(value):
+        add(match.group(1))
+    # 点号分隔的写法（@id.NothingLose）拆开再试一次尾巴，x 的 handle 不能带点。
+    for chunk in re.split(r"[@\s]+", value):
+        if "." in chunk:
+            add(chunk.rsplit(".", 1)[-1])
     bare = value.strip().strip("@").strip()
-    if not _WATERMARK_BARE.fullmatch(bare):
-        return ""
-    if bare.isdigit() or bare.lower() in _WATERMARK_PLATFORMS:
-        return ""
-    return bare
+    if _WATERMARK_BARE.fullmatch(bare):
+        add(bare)
+    return found[: max(1, limit)]

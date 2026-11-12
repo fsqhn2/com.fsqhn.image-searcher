@@ -85,6 +85,66 @@ class HandlesFromSearchTest(unittest.TestCase):
         self.assertEqual(identity.handles_from_search(None), [])
 
 
+class ProfilesFromSearchTest(unittest.TestCase):
+    def test_picks_profiles_across_platforms(self) -> None:
+        """id= 那种名字多是中文平台 ID，一次检索把各平台主页都捞出来。"""
+        payload = {
+            "organic_results": [
+                {
+                    "title": "NothingLose (@nothinglose) · Instagram",
+                    "link": "https://www.instagram.com/nothinglose/",
+                    "snippet": "cosplay",
+                },
+                {
+                    "title": "nothinglose",
+                    "link": "https://www.tiktok.com/@nothinglose",
+                    "snippet": "",
+                },
+                {
+                    "title": "NothingLose的微博",
+                    "link": "https://weibo.com/u/7788990011",
+                    "snippet": "",
+                },
+                {
+                    "title": "NothingLose | Patreon",
+                    "link": "https://www.patreon.com/nothinglose",
+                    "snippet": "",
+                },
+            ]
+        }
+        found = identity.profiles_from_search(payload)
+        got = {(row["platform"], row["handle"]) for row in found}
+        self.assertIn(("Instagram", "nothinglose"), got)
+        self.assertIn(("TikTok", "nothinglose"), got)
+        self.assertIn(("微博", "7788990011"), got)
+        self.assertIn(("Patreon", "nothinglose"), got)
+
+    def test_skips_single_post_and_redirect_pages(self) -> None:
+        payload = {
+            "organic_results": [
+                {"title": "post", "link": "https://www.instagram.com/p/Cxyz123/", "snippet": ""},
+                {"title": "share", "link": "https://www.facebook.com/profile.php?id=1", "snippet": ""},
+                {"title": "x 首页", "link": "https://x.com/home", "snippet": ""},
+            ]
+        }
+        self.assertEqual(identity.profiles_from_search(payload), [])
+
+    def test_same_handle_twice_only_once(self) -> None:
+        payload = {
+            "organic_results": [
+                {"title": "a", "link": "https://x.com/NothingLose", "snippet": ""},
+                {"title": "b", "link": "https://twitter.com/nothinglose", "snippet": ""},
+            ]
+        }
+        found = identity.profiles_from_search(payload)
+        self.assertEqual(len(found), 1)
+
+    def test_empty_name_or_key_gives_nothing(self) -> None:
+        self.assertEqual(identity.search_profiles("", "key"), [])
+        self.assertEqual(identity.search_profiles("NothingLose", ""), [])
+        self.assertEqual(identity.profiles_from_search(None), [])
+
+
 class NameMatchesTest(unittest.TestCase):
     def test_same_name_with_spacing_and_underscores(self) -> None:
         self.assertTrue(identity.name_matches("纸悦Etsu_ko", "纸悦 Etsu_ko"))

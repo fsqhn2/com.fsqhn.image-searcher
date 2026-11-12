@@ -438,6 +438,20 @@ class VisionConfig(PluginConfigBase):
             "每单最多一次网页检索、两个候选号，找不到就照旧按没找到写。",
         ),
     )
+    id_name_search: bool = Field(
+        default=True,
+        description=(
+            "水印里写着「id=某某」时，拿这个名字去各平台找主页。这种写法多是中文平台"
+            "的 ID（微博、小红书），X 上常常查无此号；一路检索把 X、Instagram、TikTok、"
+            "微博、Patreon、Reddit、Bilibili、Facebook、YouTube、小红书的主页都捞出来，"
+            "X 上找到号就翻它自己的带图帖比指纹。不核上图的只写成线索。"
+        ),
+        json_schema_extra=_ui(
+            "按 id= 的名字查各平台",
+            "默认开。只在整轮没有结论、水印里又读到 id= 时才跑；一次网页检索（捞不到"
+            "主页时最多两次），X 上最多核两个号。外国平台只给线索，不当结论。",
+        ),
+    )
     repost_author: bool = Field(
         default=True,
         description=(
@@ -1880,6 +1894,37 @@ class ImageSearcherPlugin(MaiBotPlugin):
         # 图上水印核对到本人发过这张图时，这条就是结论：指纹对得上、又是本人
         # 亲手发的帖，比「视觉说是同一个人」硬得多。
         best = self._promote_watermark_hit(best, vision_info)
+        # 图上写着「id=某某」时，那个名字往往不是 X 的 handle（中文平台的写法，
+        # X 上常查无此号）。拿它去各平台捞一次主页：X 上的翻号比指纹，命中就换
+        # 结论；其余平台只记线索。只在整轮还没结论、水印又没落地时才跑。
+        id_name = vision.id_name_from_watermark(str((vision_info or {}).get("watermark") or ""))
+        # 只在整轮还没有结论时跑；「落点是搬运页、页面上没有账号」也算没结论——
+        # 那种页反正撑不起「就是她发的」，正好让这个名字去别的平台找找。
+        id_unresolved = best is None or (
+            best.status == "match"
+            and not (best.handle or "").strip()
+            and not self._is_x(best)
+        )
+        if (
+            upload
+            and id_name
+            and id_unresolved
+            and vision_info is not None
+            and not str(vision_info.get("watermark_post") or "")
+            and bool(getattr(config.vision, "id_name_search", True))
+        ):
+            try:
+                id_name_info = await self._hunt_from_id_name(id_name, upload)
+            except Exception as error:  # noqa: BLE001 - 查不到不影响别的兜底
+                self.ctx.logger.warning("按 id= 的名字查各平台失败：%s", error)
+                id_name_info = None
+            if id_name_info:
+                vision_info["watermark_id_name"] = id_name
+                if id_name_info.get("profiles"):
+                    vision_info["watermark_profiles"] = id_name_info["profiles"]
+                if id_name_info.get("status") == "hit":
+                    vision_info["watermark_id_hit"] = str(id_name_info.get("post") or "")
+                    best = self._promote_id_name(best, id_name_info)
         # 结论只到「同一个人」、落点又认不了图（微博这类站只给 UID）时，顺着名字
         # 去 X 上找这个号核图：命中就把结论换成那条帖子，没命中只记一句供呈现用。
         x_identity: dict[str, Any] | None = None
@@ -3240,14 +3285,18 @@ class ImageSearcherPlugin(MaiBotPlugin):
         按近似拼写再找（仍要指纹对得上）。
         """
         readings: list[dict[str, Any]] = []
-        raw = str(vision_info.get("watermark") or "").strip()
-        handle = vision.handle_from_watermark(raw)
-        if handle:
-            readings.append({"source": "vision", "raw": raw, "handle": handle})
-        other_raw = str((grok_info or {}).get("watermark") or "").strip()
-        other_handle = vision.handle_from_watermark(other_raw)
-        if other_handle and all(item["handle"].lower() != other_handle.lower() for item in readings):
-            readings.append({"source": "grok", "raw": other_raw, "handle": other_handle})
+        seen: set[str] = set()
+
+        def collect(raw_text: str, source: str) -> None:
+            for index, handle in enumerate(vision.handles_from_watermark(raw_text)):
+                if handle.lower() in seen:
+                    continue
+                seen.add(handle.lower())
+                label = source if index == 0 else f"{source}(候选{index + 1})"
+                readings.append({"source": label, "raw": raw_text, "handle": handle})
+
+        collect(str(vision_info.get("watermark") or "").strip(), "vision")
+        collect(str((grok_info or {}).get("watermark") or "").strip(), "grok")
         if not readings:
             return
 
@@ -3424,28 +3473,22 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 "、".join(str(item.distance) for item in candidates[: len(loaded)]),
             )
 
-        if prefer_candidates and loaded:
-            # 命中搬运页：水印几乎只在转载的那张图上，先读它，别把额度花在原图。
-            for label, raw in loaded:
-                if await read(raw, label):
-                    return
-            if tiles_on and await read_tiles(loaded[0][1], loaded[0][0]):
+        # 先把整图都读完，再动切块：切块一块一调用，慢（实测六块四十多秒）而且
+        # 最容易读出假号——s-20261112-0858-c44f 六块读出 MURUA、MIRUI、
+        # idcNothinglose 三个号，一个都没核上。整图只要读到，就轮不到切块。
+        whole = list(loaded)
+        if not prefer_candidates:
+            whole = [("原图", upload)] + whole
+        else:
+            whole = whole + [("原图", upload)]
+        for label, raw in whole:
+            if await read(raw, label if label != "原图" else ""):
                 return
-            if await read(upload, ""):
+        if not tiles_on:
+            return
+        for label, raw in whole:
+            if await read_tiles(raw, label if label != "原图" else "原图"):
                 return
-            if tiles_on and await read_tiles(upload, "原图"):
-                return
-            return
-
-        if await read(upload, ""):
-            return
-        if tiles_on and await read_tiles(upload, "原图"):
-            return
-        for label, raw in loaded:
-            if await read(raw, label):
-                return
-        if tiles_on and loaded and await read_tiles(loaded[0][1], loaded[0][0]):
-            return
 
     # 分块最多读这么多块。2×3 正好六块，再多就说明前面几块都没戏，继续读只是烧额度。
     _WATERMARK_TILE_LIMIT = 6
@@ -3499,31 +3542,39 @@ class ImageSearcherPlugin(MaiBotPlugin):
             self._vlog("重读水印没成%s：%s", where, info.get("error") or "-")
             return False
         raw = str(info.get("watermark") or "").strip()
-        handle = vision.handle_from_watermark(raw)
-        if not handle:
+        handles = vision.handles_from_watermark(raw)
+        if not handles:
             self._vlog("重读水印%s：文字=%s，没读出账号", where, raw or "-")
             return False
-        if handle.lower() in known:
-            self._vlog("重读水印%s：还是 @%s，不重复核", where, handle)
+        fresh = [handle for handle in handles if handle.lower() not in known]
+        if not fresh:
+            self._vlog("重读水印%s：还是 @%s，不重复核", where, "、@".join(handles))
             return False
-        reading = await self._verify_watermark_reading(
-            {
-                "source": f"vision-{label}" if label else "vision-original",
-                "raw": raw,
-                "handle": handle,
-            },
-            verify if verify is not None else source,
-            True,
-        )
-        readings.append(reading)
-        for key in ("handle", "fixed"):
-            # 核出来的真实写法也算见过，免得下一块读到同一个号又核一遍。
-            value = str(reading.get(key) or "").strip().lower()
-            if value:
-                known.add(value)
-        vision_info["watermark_readings"] = readings
-        self._apply_watermark_primary(vision_info, readings)
-        return bool(str(reading.get("post") or "").strip())
+        landed = False
+        for index, handle in enumerate(fresh):
+            reading = await self._verify_watermark_reading(
+                {
+                    "source": f"vision-{label}" if label else "vision-original",
+                    "raw": raw,
+                    "handle": handle,
+                },
+                verify if verify is not None else source,
+                True,
+            )
+            readings.append(reading)
+            for key in ("handle", "fixed"):
+                # 核出来的真实写法也算见过，免得下一块读到同一个号又核一遍。
+                value = str(reading.get(key) or "").strip().lower()
+                if value:
+                    known.add(value)
+            vision_info["watermark_readings"] = readings
+            self._apply_watermark_primary(vision_info, readings)
+            if str(reading.get("post") or "").strip():
+                landed = True
+                break
+            if index + 1 < len(fresh):
+                self._vlog("重读水印%s：@%s 没对上，接着试同一条水印里的下一个写法", where, handle)
+        return landed
 
     async def _verify_watermark_reading(
         self,
@@ -4599,6 +4650,100 @@ class ImageSearcherPlugin(MaiBotPlugin):
             distance=distance,
             status="match",
             note=f"标题里署名 {name}，@{handle} 自己的带图帖里有这张图（距离 {distance}）",
+        )
+
+    # 按 id= 的名字查各平台时，X 上最多核这么多个号（每次都要翻它自己的带图帖，
+    # 一个号几秒，多了会把单子拖长）。
+    _ID_NAME_PROBE_LIMIT = 2
+
+    async def _hunt_from_id_name(self, name: str, upload: bytes | None) -> dict[str, Any] | None:
+        """图上写着 ``id=某某``：拿这个名字去各平台找主页，X 上的再翻号核图。
+
+        s-20261112-0858-c44f 这单整图读出 ``Reng♡ @id.NothingLose``，机器人自己的
+        「理解图片」把同一处读成 ``@id=NothingLee``——``id=`` 是中文平台的写法，X 上
+        查 nothinglose／NothingLee 全是 404。所以这一步不只搜 X：一次网页检索把
+        X、Instagram、TikTok、微博、Patreon、Reddit、Bilibili、Facebook、YouTube、
+        小红书的主页都捞出来；能核图验真的只有 X（翻号自己的带图帖比指纹），其余
+        平台只当线索写一行，绝不因为名字像就改结论。
+        """
+        wanted = (name or "").strip()
+        if not upload or not wanted:
+            return None
+        pool = self._pools.get("lens")
+        api_key = pool.acquire() if pool else ""
+        if not api_key:
+            self._vlog("按 id= 的名字查各平台：没有可用的 SerpAPI key，跳过")
+            return None
+
+        def fetch() -> list[dict[str, str]]:
+            return identity.search_profiles(wanted, api_key, self._proxy())
+
+        try:
+            profiles = await asyncio.wait_for(asyncio.to_thread(fetch), timeout=50)
+        except Exception as error:  # noqa: BLE001 - 查不到就当没这一步
+            self._vlog("按 id= 的名字查各平台失败：%s", str(error)[:80])
+            return None
+        self._vlog(
+            "按 id= 的名字查各平台：%s → %s",
+            wanted,
+            "、".join(f"{row.get('platform')}/{row.get('handle')}" for row in profiles) or "没有主页",
+        )
+        result: dict[str, Any] = {
+            "name": wanted,
+            "profiles": profiles,
+            "status": "seen" if profiles else "",
+        }
+        x_rows = [row for row in profiles if row.get("platform") == "X"]
+        for row in x_rows[: self._ID_NAME_PROBE_LIMIT]:
+            probe = str(row.get("handle") or "")
+            info = await self._profile(probe)
+            if not info:
+                continue
+            x_name = str(info.get("name") or "")
+            resolved = str(info.get("screen_name") or probe)
+            if not (
+                identity.name_matches(wanted, x_name)
+                or identity.name_matches(wanted, resolved)
+            ):
+                self._vlog("id= %s 搜到的 @%s（%s）对不上，丢掉", wanted, resolved, x_name or "-")
+                continue
+            self._vlog("id= %s 对上 X：@%s（%s），翻带图帖比指纹", wanted, resolved, x_name or "-")
+            holder: dict[str, Any] = {}
+            await self._check_watermark_post(resolved, upload, holder)
+            post = str(holder.get("watermark_post") or "")
+            if not post:
+                continue
+            result.update(
+                {
+                    "status": "hit",
+                    "handle": resolved,
+                    "x_name": x_name,
+                    "followers": int(info.get("followers") or 0),
+                    "post": post,
+                    "distance": int(holder.get("watermark_distance") or 0),
+                }
+            )
+            return result
+        return result
+
+    def _promote_id_name(self, best: Candidate | None, info: dict[str, Any]) -> Candidate | None:
+        """``id=`` 那个名字在 X 上核到了这张图，那条帖子就是结论。"""
+        post = str(info.get("post") or "")
+        handle = str(info.get("handle") or "").strip().lstrip("@")
+        if not post or not handle:
+            return best
+        name = str(info.get("name") or "")
+        distance = int(info.get("distance") or 0)
+        self._vlog("id= 名字反查命中，升成结论：%s → @%s %s（距离 %s）", name, handle, post, distance)
+        return Candidate(
+            engine="idname",
+            url=post,
+            platform="X (Twitter)",
+            handle="@" + handle,
+            name=str(info.get("x_name") or ""),
+            distance=distance,
+            status="match",
+            note=f"图上写着 id={name}，@{handle} 自己的带图帖里有这张图（距离 {distance}）",
         )
 
     # 从候选标题猜账号时最多验这么多个名字。别名列表常常挤在某一条搬运站

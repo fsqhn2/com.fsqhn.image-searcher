@@ -224,3 +224,118 @@ def search_x_handles(
     if payload.get("error"):
         raise IdentityError(str(payload["error"])[:80])
     return handles_from_search(payload, limit=limit)
+
+
+# 一条检索结果里能落地的平台主页。顺序就是展示优先级：X 排头，因为只有 X 能
+# 顺着主页翻带图帖核对原图，其他平台这里只当线索。
+_PROFILE_PATTERNS: tuple[tuple[str, re.Pattern[str], frozenset[str]], ...] = (
+    ("X", re.compile(r"(?:x|twitter)\.com/([A-Za-z0-9_]{2,20})", re.I), NOISE_HANDLES),
+    (
+        "Instagram",
+        re.compile(r"instagram\.com/([A-Za-z0-9_.]{2,30})", re.I),
+        frozenset({"p", "reel", "reels", "explore", "accounts", "tv", "stories", "share"}),
+    ),
+    ("TikTok", re.compile(r"tiktok\.com/@([A-Za-z0-9_.]{2,30})", re.I), frozenset()),
+    (
+        "微博",
+        re.compile(r"weibo\.(?:com|cn)/(?:u/|profile/)?(\d{4,20})", re.I),
+        frozenset(),
+    ),
+    (
+        "Patreon",
+        re.compile(r"patreon\.com/(?:user\?u=)?([A-Za-z0-9_-]{2,30})", re.I),
+        frozenset({"join", "posts", "login", "home"}),
+    ),
+    ("Reddit", re.compile(r"reddit\.com/(?:u|user)/([A-Za-z0-9_-]{3,20})", re.I), frozenset()),
+    ("Bilibili", re.compile(r"space\.bilibili\.com/(\d{4,20})", re.I), frozenset()),
+    (
+        "Facebook",
+        re.compile(r"facebook\.com/([A-Za-z0-9_.]{3,30})", re.I),
+        frozenset({"profile.php", "pages", "groups", "watch", "reel", "share", "login"}),
+    ),
+    ("YouTube", re.compile(r"youtube\.com/@([A-Za-z0-9_.-]{2,30})", re.I), frozenset()),
+    ("小红书", re.compile(r"xiaohongshu\.com/user/profile/([0-9a-f]{10,40})", re.I), frozenset()),
+)
+
+
+def profiles_from_search(payload: Any, limit: int = 6) -> list[dict[str, str]]:
+    """从检索结果里挑各平台主页，同一平台同一号只留一条。
+
+    只认链接里长得像主页的那一截：``instagram.com/p/xxx`` 是单张图、
+    ``facebook.com/profile.php`` 是跳转页，都不算主页。返回项固定三个字段
+    （platform / handle / url），交给上层决定要不要去核图。
+    """
+    if not isinstance(payload, dict):
+        return []
+    found: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in payload.get("organic_results") or []:
+        if not isinstance(item, dict):
+            continue
+        link = str(item.get("link") or "")
+        text = " ".join(
+            str(item.get(key) or "")
+            for key in ("title", "link", "snippet", "displayed_link")
+        )
+        for platform, pattern, noise in _PROFILE_PATTERNS:
+            for handle in pattern.findall(text):
+                key = (platform, handle.lower())
+                if handle.lower() in noise or key in seen:
+                    continue
+                seen.add(key)
+                found.append(
+                    {
+                        "platform": platform,
+                        "handle": handle,
+                        "url": link or f"https://{platform.lower()}.com/{handle}",
+                    }
+                )
+                if len(found) >= max(1, limit):
+                    return found
+    return found
+
+
+def search_profiles(
+    name: str,
+    api_key: str,
+    proxy: str = "",
+    timeout: float = 30.0,
+    limit: int = 6,
+    fallback: bool = True,
+) -> list[dict[str, str]]:
+    """图上写着 ``id=某某`` → 各平台同名主页。只出线索，不替人认人。
+
+    这类写法多是中文平台的 ID（微博、小红书），X 上往往查无此号，所以一次检索
+    把各平台主页都捞出来：先按「名字 + cosplay」搜，一条主页都没捞到再退回裸名字
+    搜一次（同名的人会变多，但总比空手强）。真正的结论仍要回到翻号核图那一步。
+    """
+    name = (name or "").strip()
+    if not name or not api_key:
+        return []
+    queries = [f'"{name}" cosplay']
+    if fallback:
+        queries.append(f'"{name}"')
+    session = requests.Session()
+    if proxy:
+        session.proxies.update({"http": proxy, "https": proxy})
+    try:
+        for index, query in enumerate(queries):
+            response = session.get(
+                "https://serpapi.com/search.json",
+                params={"engine": "google", "q": query, "num": "20", "api_key": api_key},
+                timeout=timeout,
+            )
+            if response.status_code != 200:
+                raise IdentityError(f"网页检索 HTTP {response.status_code}")
+            try:
+                payload = response.json()
+            except ValueError as error:
+                raise IdentityError("网页检索回的不是 JSON") from error
+            if payload.get("error"):
+                raise IdentityError(str(payload["error"])[:80])
+            found = profiles_from_search(payload, limit=limit)
+            if found or index == len(queries) - 1:
+                return found
+    finally:
+        session.close()
+    return []

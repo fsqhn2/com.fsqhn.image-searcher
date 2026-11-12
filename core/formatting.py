@@ -665,6 +665,24 @@ def _vision_watermark_line(outcome: SearchOutcome) -> str:
                 )
             else:
                 lines.append(f"🔎 Grok 读到的水印不一样：{other}{tail}，两个都别当结论")
+    # 水印里写着「id=某某」时，那个名字在各平台捞到的同名主页。名字是从图上读来的，
+    # 同名的号不一定是本人，所以这一行永远标「只是线索」，也不超过三个：一串链接
+    # 摆得像结论，反而把人引到错的地方去。
+    profiles = [
+        item for item in (vision.get("watermark_profiles") or []) if isinstance(item, dict)
+    ]
+    id_name = str(vision.get("watermark_id_name") or "").strip()
+    if profiles and id_name and not str(vision.get("watermark_id_hit") or "").strip():
+        labels: list[str] = []
+        for item in profiles[:3]:
+            platform = str(item.get("platform") or "网页").strip()
+            handle = str(item.get("handle") or "").strip()
+            labels.append(f"{platform} {handle}".strip())
+        more = f" 等 {len(profiles)} 个" if len(profiles) > 3 else ""
+        lines.append(
+            f"🔎 图上写着 id={id_name}：搜到同名主页 {'、'.join(labels)}{more}"
+            "（只是线索，没核到这张图）"
+        )
     return "\n".join(lines)
 
 

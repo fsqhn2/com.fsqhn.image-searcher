@@ -184,6 +184,53 @@ class WatermarkTest(unittest.TestCase):
     def test_handle_needs_at_least_two_chars(self):
         self.assertEqual(vision.handle_from_watermark("@sss mn ms"), "sss")
 
+    def test_handle_from_id_writing(self):
+        """``id=`` 那截才是账号，别把 id 本身当人（s-20261112-0858-c44f）。"""
+        self.assertEqual(vision.handle_from_watermark("Reng♡ @id.NothingLose"), "NothingLose")
+        self.assertEqual(vision.handle_from_watermark("@id=NothingLee"), "NothingLee")
+        self.assertEqual(vision.handle_from_watermark("id：Moliww"), "Moliww")
+
+    def test_handle_from_id_read_as_c(self):
+        """小字里等号被读成 c（``idcNothinglose``），照样取后面那截。"""
+        self.assertEqual(vision.handle_from_watermark("Reng @idcNothinglose"), "Nothinglose")
+
+    def test_handles_from_watermark_keeps_all(self):
+        """一条水印出多个候选，只跳过试过的那个，别把整条丢掉。"""
+        found = vision.handles_from_watermark("@MURUA @MIRUI @id.NothingLose")
+        self.assertIn("NothingLose", found)
+        self.assertGreaterEqual(len(found), 2)
+
+    def test_id_name_from_watermark(self):
+        self.assertEqual(vision.id_name_from_watermark("Reng♡ @id.NothingLose"), "NothingLose")
+        self.assertEqual(vision.id_name_from_watermark("@idcNothinglose"), "Nothinglose")
+        self.assertEqual(vision.id_name_from_watermark("@kuru_xox"), "")
+        self.assertEqual(vision.id_name_from_watermark(""), "")
+
+    def test_watermark_id_profiles_line(self):
+        """按 id= 搜到的同名主页：写成线索，不写成结论。"""
+        outcome = SearchOutcome()
+        outcome.vision = {
+            "watermark": "Reng♡ @id.NothingLose",
+            "watermark_id_name": "NothingLose",
+            "watermark_profiles": [
+                {"platform": "Instagram", "handle": "nothinglose", "url": "https://instagram.com/nothinglose"},
+            ],
+        }
+        text = formatting._best_block(outcome)
+        self.assertIn("图上写着 id=NothingLose", text)
+        self.assertIn("Instagram nothinglose", text)
+        self.assertIn("只是线索", text)
+
+    def test_watermark_id_profiles_hidden_after_hit(self):
+        """名字核到图了就由结论说话，不再补一句「没核到」。"""
+        outcome = SearchOutcome()
+        outcome.vision = {
+            "watermark_id_name": "NothingLose",
+            "watermark_id_hit": "https://x.com/nothinglose/status/1",
+            "watermark_profiles": [{"platform": "X", "handle": "nothinglose", "url": "https://x.com/nothinglose"}],
+        }
+        self.assertNotIn("没核到这张图", formatting._best_block(outcome))
+
     def test_watermark_line_shown(self):
         outcome = SearchOutcome()
         outcome.vision = {"watermark": "@sssmnms", "watermark_url": "https://x.com/sssmnms"}
