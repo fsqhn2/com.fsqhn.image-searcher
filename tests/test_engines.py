@@ -271,6 +271,28 @@ class ReferenceCandidatesTest(unittest.TestCase):
         self.assertEqual(pool[0], best)
         self.assertIn(avatar, pool)
 
+    def test_far_candidates_dropped_when_max_distance_given(self) -> None:
+        """2504：距离 27 的同款球衣不该当参考图，超出上限整组丢掉。"""
+        far = Candidate(engine="baidu", url="https://example.com/f", image_url="https://img/f.jpg", distance=27, status="suspect")
+        self.assertEqual(reference_candidates(None, [far], max_distance=12), [])
+
+    def test_unknown_distance_dropped_when_max_distance_given(self) -> None:
+        """没算出距离（图没下载下来）的候选同样不能当参考图。"""
+        unknown = Candidate(engine="baidu", url="https://example.com/u", image_url="https://img/u.jpg", distance=None, status="suspect")
+        self.assertEqual(reference_candidates(None, [unknown], max_distance=12), [])
+
+    def test_max_distance_keeps_close_one_and_orders_by_vision_pick(self) -> None:
+        near = Candidate(engine="lens", url="https://example.com/n", image_url="https://img/n.jpg", distance=11, status="suspect")
+        picked = Candidate(engine="lens", url="https://example.com/p", image_url="https://img/p.jpg", distance=12, status="suspect")
+        far = Candidate(engine="lens", url="https://example.com/f", image_url="https://img/f.jpg", distance=27, status="suspect")
+        pool = reference_candidates(None, [far, near, picked], ["https://img/p.jpg"], max_distance=12)
+        self.assertEqual(pool, [picked, near])
+
+    def test_max_distance_ignored_when_best_found(self) -> None:
+        """有结论时参考图就是结论那张，不受距离门槛影响。"""
+        best = Candidate(engine="lens", url="https://x.com/a/status/1", distance=0, status="match")
+        self.assertEqual(reference_candidates(best, [], max_distance=12), [best])
+
 
 class SerperLensTest(unittest.TestCase):
     """Serper 的 Lens 是替补：只收公网链接，结果字段跟 SerpAPI 完全不同。"""
@@ -437,6 +459,42 @@ class LensSerperFallbackTest(unittest.TestCase):
 
         engine._search_serper = boom  # type: ignore[assignment]
         self.assertEqual(engine.search(b"img"), [])
+
+    def test_serper_fallback_leaves_a_note(self) -> None:
+        """2504：替补那枪过去全静默，事后分不清「没补成」和「补了 0 条」。"""
+        from core.keypool import KeyPool
+
+        notes: list[str] = []
+        engine = LensEngine(
+            KeyPool(["serpapi-key"]),
+            serper_pool=KeyPool(["a" * 40]),
+            retries=0,
+            note=notes.append,
+        )
+        engine._search_once = lambda raw, image_url="": []  # type: ignore[assignment]
+        engine._search_serper = lambda key, raw, image_url="", pool=None: []  # type: ignore[assignment]
+        self.assertEqual(engine.search(b"img"), [])
+        self.assertTrue(any("补出 0 条" in line for line in notes), notes)
+
+    def test_serper_failure_note_says_why(self) -> None:
+        from core.engines import EngineError
+        from core.keypool import KeyPool
+
+        notes: list[str] = []
+        engine = LensEngine(
+            KeyPool(["serpapi-key"]),
+            serper_pool=KeyPool(["a" * 40]),
+            retries=0,
+            note=notes.append,
+        )
+        engine._search_once = lambda raw, image_url="": []  # type: ignore[assignment]
+
+        def boom(key: str, raw: bytes, image_url: str = "", pool=None):
+            raise EngineError("Serper Lens 需要公网图片链接，图床没换成")
+
+        engine._search_serper = boom  # type: ignore[assignment]
+        engine.search(b"img")
+        self.assertTrue(any("Serper 补枪失败" in line and "图床" in line for line in notes), notes)
 
 
 class LensRetryTest(unittest.TestCase):

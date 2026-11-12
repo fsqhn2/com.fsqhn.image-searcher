@@ -37,6 +37,7 @@ from .core.commands import build_command_pattern, build_more_pattern, split_forc
 from .core.config import migrate_legacy_sections
 from .core.engines import (
     ENGINES_VERSION,
+    REFERENCE_MAX_DISTANCE,
     BaiduEngine,
     Candidate,
     EngineError,
@@ -1248,6 +1249,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 config.lens.retries,
                 config.lens.retry_delay,
                 serper_pool=lens_serper_pool,
+                note=self._vlog,
             ),
             "yandex": YandexEngine(global_proxy, section.engine_timeout),
             "baidu": BaiduEngine(global_proxy, section.engine_timeout),
@@ -1582,11 +1584,23 @@ class ImageSearcherPlugin(MaiBotPlugin):
     ) -> tuple[str, str]:
         """给结果配图：多个候选并发下载，按优先级取第一张成功的。
 
-        best 为空（没找到可靠出处）时照样给一张参考图，方便用户核对是不是同一张：
-        视觉方案挑中的那张排最前，其次才是指纹距离最近的。候选全失败时退回用户
-        原图；没有原图（比如重放磁盘恢复的任务）就返回空。
+        best 为空（没找到可靠出处）时，只有「像得够近」的候选才配图：距离超过
+        ``REFERENCE_MAX_DISTANCE`` 的一律不配，免得群里出现「参考图…不是同一张」
+        这种自相矛盾的交代（2504 那单给了张距离 27 的同款球衣）。一张都没过线时
+        宁可不配图，也不退回用户原图凑数。
         """
-        pool = reference_candidates(best, ordered, picked)
+        pool = reference_candidates(
+            best,
+            ordered,
+            picked,
+            max_distance=None if best is not None else REFERENCE_MAX_DISTANCE,
+        )
+        if best is None and not pool:
+            self._vlog(
+                "参考图：没有距离 ≤%s 的候选（或没算出距离），这单不配参考图",
+                REFERENCE_MAX_DISTANCE,
+            )
+            return "", ""
         urls: list[str] = []
         for item in pool:
             if item is None:

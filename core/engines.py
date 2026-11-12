@@ -242,16 +242,28 @@ class LensEngine:
         retries: int = 2,
         retry_delay: float = 1.5,
         serper_pool: KeyPool | None = None,
+        note: Callable[[str], None] | None = None,
     ) -> None:
         self.pool = pool
         # Serper 是一把独立的池：只有 SerpAPI 那边全不可用时才轮到它，不参与轮询。
         self.serper_pool = serper_pool
+        # 替补那一枪过去是静默的，事后完全查不出「没补成」还是「补了 0 条」。
+        self._note = note
         self.proxy = proxy
         self.timeout = timeout
         self.retries = max(0, int(retries))
         self.retry_delay = max(0.0, float(retry_delay))
         # 上一枪走的是哪家：空结果兜底要据此判断「Serper 是不是已经试过了」。
         self._last_channel = ""
+
+    def _say(self, message: str, *args: Any) -> None:
+        """写一行日志；没接日志回调时静默（单测和探针脚本里没有 ctx）。"""
+        if self._note is None:
+            return
+        try:
+            self._note(message % args if args else message)
+        except Exception:  # noqa: BLE001 - 日志写不出去不能影响检索
+            pass
 
     def _pick_key(self) -> tuple[str, KeyPool]:
         """先拿 SerpAPI 的 key，它那边一个都拿不到才用 Serper 顶。"""
@@ -290,15 +302,20 @@ class LensEngine:
                 return items
             if attempt < self.retries:
                 time.sleep(self.retry_delay)
-        # 补一枪 Serper：只在主路全空、且上面没走过它的时候。它自己失败就静默收场，
-        # 不能把「SerpAPI 返回空」改写成「引擎报错」。
+        # 补一枪 Serper：只在主路全空、且上面没走过它的时候。它自己失败也要留一句
+        # 日志——不然事后分不清「没补成」和「补了 0 条」。
         if not items and self.serper_pool is not None and self._last_channel != "serper":
             key = self.serper_pool.acquire()
             if key:
                 try:
                     items = self._search_serper(key, raw, image_url, self.serper_pool)
-                except EngineError:
+                except EngineError as exc:
                     items = []
+                    self._say("Serper 补枪失败：%s", str(exc)[:120])
+                else:
+                    self._say("Serper 补枪：补出 %s 条", len(items))
+            else:
+                self._say("Serper 池里没有可用的 key，这次没补枪")
         if items:
             return items
         if last_error is not None:
@@ -875,10 +892,19 @@ def detect_ai(
 # ---------------------------------------------------------------------------
 
 
+REFERENCE_MAX_DISTANCE = 12
+"""没找到出处时，参考图最多允许差这么多位。
+
+超过这条线就不是同一张了：s-20261112-2026-2504 给了张距离 27 的同款球衣，
+群里只能补一句「不是同一张」，看着像插件认错了人。宁可不配图。
+"""
+
+
 def reference_candidates(
     best: Candidate | None,
     ordered: list[Candidate],
     picked: list[str] | tuple[str, ...] = (),
+    max_distance: int | None = None,
 ) -> list[Candidate]:
     """挑参考图时的候选顺序。
 
@@ -886,12 +912,22 @@ def reference_candidates(
     比一条指纹距离更小、但模型没认过的图更有对照价值；其次按距离从近到远排。
     头像命中的一律跳掉：那是账号头像，距离常常是 0，拿来当参考图会写成
     「距离 0，不是同一张」这种自相矛盾的话，页面里还看不到它。
+
+    ``max_distance`` 只在「没找到」时传：距离超线、或者根本没算出距离的候选
+    一律不进参考图——没算出距离的图连「像不像」都说不清，配出来只会误导。
     """
     if best is not None:
         return [best, *ordered]
     picks = set(picked or ())
+    pool = [item for item in ordered if not is_avatar_hit(item)]
+    if max_distance is not None:
+        pool = [
+            item
+            for item in pool
+            if item.distance is not None and int(item.distance) <= max_distance
+        ]
     return sorted(
-        (item for item in ordered if not is_avatar_hit(item)),
+        pool,
         key=lambda item: (
             0 if item.image_url and item.image_url in picks else 1,
             item.distance is None,
