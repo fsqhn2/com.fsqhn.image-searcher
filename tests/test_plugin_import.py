@@ -158,6 +158,71 @@ class PluginImportTest(unittest.TestCase):
         module = import_plugin()
         self.assertTrue(module.VisionConfig().id_name_search)
 
+    def test_id_name_runs_when_vision_picked_someone(self) -> None:
+        """视觉已经给了「同一个人」时，id= 那一步仍要跑。
+
+        s-20261112-0925-cad4：视觉命中 1 条、结论落到微博 UID，而图上写着
+        id=NaohingLace，那一步因为「已经有结论」被整条跳过。
+        """
+        module = import_plugin()
+        decide = module.ImageSearcherPlugin._should_search_id_name
+        self.assertTrue(
+            decide(
+                enabled=True,
+                has_upload=True,
+                names=["NaohingLace"],
+                watermark_post="",
+                best_status="vision",
+                best_is_x=False,
+            )
+        )
+
+    def test_id_name_skipped_when_watermark_already_verified(self) -> None:
+        module = import_plugin()
+        decide = module.ImageSearcherPlugin._should_search_id_name
+        self.assertFalse(
+            decide(
+                enabled=True,
+                has_upload=True,
+                names=["NaohingLace"],
+                watermark_post="https://x.com/someone/status/1",
+                best_status="vision",
+                best_is_x=False,
+            )
+        )
+        # 结论已经是指纹对上的 X 帖，也不用再查。
+        self.assertFalse(
+            decide(
+                enabled=True,
+                has_upload=True,
+                names=["NaohingLace"],
+                watermark_post="",
+                best_status="match",
+                best_is_x=True,
+            )
+        )
+        # 开关关掉、没有名字、没有图，都不跑。
+        self.assertFalse(
+            decide(
+                enabled=False,
+                has_upload=True,
+                names=["NaohingLace"],
+                watermark_post="",
+                best_status="",
+                best_is_x=False,
+            )
+        )
+        self.assertFalse(
+            decide(
+                enabled=True,
+                has_upload=True,
+                names=[],
+                watermark_post="",
+                best_status="",
+                best_is_x=False,
+            )
+        )
+
     def test_watermark_reread_runs_before_id_name(self) -> None:
         """先读水印（含候选图与切块），再拿 id= 的名字去各平台。
 

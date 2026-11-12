@@ -1896,30 +1896,48 @@ class ImageSearcherPlugin(MaiBotPlugin):
         best = self._promote_watermark_hit(best, vision_info)
         # 图上写着「id=某某」时，那个名字往往不是 X 的 handle（中文平台的写法，
         # X 上常查无此号）。拿它去各平台捞一次主页：X 上的翻号比指纹，命中就换
-        # 结论；其余平台只记线索。只在整轮还没结论、水印又没落地时才跑。
-        id_name = vision.id_name_from_watermark(str((vision_info or {}).get("watermark") or ""))
-        # 只在整轮还没有结论时跑；「落点是搬运页、页面上没有账号」也算没结论——
-        # 那种页反正撑不起「就是她发的」，正好让这个名字去别的平台找找。
-        id_unresolved = best is None or (
-            best.status == "match"
-            and not (best.handle or "").strip()
-            and not self._is_x(best)
-        )
-        if (
-            upload
-            and id_name
-            and id_unresolved
-            and vision_info is not None
-            and not str(vision_info.get("watermark_post") or "")
-            and bool(getattr(config.vision, "id_name_search", True))
+        # 结论；其余平台只记线索。
+        #
+        # 读法不只一种：整图、各块、Grok 常把同一处读成不同写法（s-20261112-0925-cad4
+        # 里整图读 NaohingLace、中左读 idcNothinglose、机器人自己的「理解图片」读
+        # id=NothingLee），只拿最后一个去问，等于把别的读法丢了。两个名字为限，
+        # 省着花检索额度。
+        id_names: list[str] = []
+        readings = [
+            str((vision_info or {}).get("watermark") or ""),
+            str((vision_info or {}).get("watermark_text") or ""),
+            str((grok_info or {}).get("watermark") or ""),
+        ]
+        readings += [
+            str(item.get("raw") or "")
+            for item in ((vision_info or {}).get("watermark_readings") or [])
+            if isinstance(item, dict)
+        ]
+        for reading in readings:
+            found = vision.id_name_from_watermark(reading)
+            if found and found not in id_names:
+                id_names.append(found)
+        id_names = id_names[: self._ID_NAME_LIMIT]
+        # 水印已经核到那条帖子时不必再查；其余情况（视觉命中、微博只给 UID、
+        # 落在搬运页上）都还得查——c44f／cad4 两单就是卡在这儿：视觉先给了个
+        # 「同一个人」，名字那一步整条被跳过。
+        if self._should_search_id_name(
+            enabled=bool(getattr(config.vision, "id_name_search", True)),
+            has_upload=bool(upload and vision_info is not None),
+            names=id_names,
+            watermark_post=str((vision_info or {}).get("watermark_post") or ""),
+            best_status=str(best.status if best is not None else ""),
+            best_is_x=bool(best is not None and self._is_x(best)),
         ):
             try:
-                id_name_info = await self._hunt_from_id_name(id_name, upload)
+                id_name_info = await self._hunt_from_id_name(id_names, upload)
             except Exception as error:  # noqa: BLE001 - 查不到不影响别的兜底
                 self.ctx.logger.warning("按 id= 的名字查各平台失败：%s", error)
                 id_name_info = None
             if id_name_info:
-                vision_info["watermark_id_name"] = id_name
+                vision_info["watermark_id_name"] = str(
+                    id_name_info.get("name") or id_names[0]
+                )
                 if id_name_info.get("profiles"):
                     vision_info["watermark_profiles"] = id_name_info["profiles"]
                 if id_name_info.get("status") == "hit":
@@ -4655,8 +4673,39 @@ class ImageSearcherPlugin(MaiBotPlugin):
     # 按 id= 的名字查各平台时，X 上最多核这么多个号（每次都要翻它自己的带图帖，
     # 一个号几秒，多了会把单子拖长）。
     _ID_NAME_PROBE_LIMIT = 2
+    # 一次最多拿几个「id=」读法去问，按水印里出现的先后取。
+    _ID_NAME_LIMIT = 2
 
-    async def _hunt_from_id_name(self, name: str, upload: bytes | None) -> dict[str, Any] | None:
+    @classmethod
+    def _should_search_id_name(
+        cls,
+        *,
+        enabled: bool,
+        has_upload: bool,
+        names: list[str],
+        watermark_post: str,
+        best_status: str,
+        best_is_x: bool,
+    ) -> bool:
+        """水印里那个 ``id=`` 名字该不该拿去各平台查。
+
+        只要水印还没核到帖子就值得查：视觉命中「同一个人」、微博只给 UID、落在
+        搬运页上都算。s-20261112-0925-cad4 就是视觉先给了个命中，这一步整条被
+        跳过，图上写着 ``id=NaohingLace`` 却没人去各平台找。
+        只有「结论已经是指纹对上的 X 帖」才不必再查。
+        """
+        if not enabled or not has_upload or not names:
+            return False
+        if str(watermark_post or "").strip():
+            return False
+        if str(best_status or "") == "match" and best_is_x:
+            return False
+        return True
+
+
+    async def _hunt_from_id_name(
+        self, names: list[str], upload: bytes | None
+    ) -> dict[str, Any] | None:
         """图上写着 ``id=某某``：拿这个名字去各平台找主页，X 上的再翻号核图。
 
         s-20261112-0858-c44f 这单整图读出 ``Reng♡ @id.NothingLose``，机器人自己的
@@ -4665,31 +4714,36 @@ class ImageSearcherPlugin(MaiBotPlugin):
         X、Instagram、TikTok、微博、Patreon、Reddit、Bilibili、Facebook、YouTube、
         小红书的主页都捞出来；能核图验真的只有 X（翻号自己的带图帖比指纹），其余
         平台只当线索写一行，绝不因为名字像就改结论。
+
+        ``names`` 是同一处水印的几种读法（整图、各块、Grok 可能读得不一样），
+        按顺序问，问到有主页就停；一个都没有就返回空 profiles。
         """
-        wanted = (name or "").strip()
+        wanted = [str(name or "").strip() for name in names if str(name or "").strip()]
         if not upload or not wanted:
             return None
         pool = self._pools.get("lens")
-        api_key = pool.acquire() if pool else ""
-        if not api_key:
+        if not pool:
             self._vlog("按 id= 的名字查各平台：没有可用的 SerpAPI key，跳过")
             return None
-
-        def fetch() -> list[dict[str, str]]:
-            return identity.search_profiles(wanted, api_key, self._proxy())
-
-        try:
-            profiles = await asyncio.wait_for(asyncio.to_thread(fetch), timeout=50)
-        except Exception as error:  # noqa: BLE001 - 查不到就当没这一步
-            self._vlog("按 id= 的名字查各平台失败：%s", str(error)[:80])
-            return None
-        self._vlog(
-            "按 id= 的名字查各平台：%s → %s",
-            wanted,
-            "、".join(f"{row.get('platform')}/{row.get('handle')}" for row in profiles) or "没有主页",
-        )
+        profiles: list[dict[str, str]] = []
+        used = ""
+        for name in wanted:
+            rows = await self._search_profiles_with_rotation(pool, name)
+            if rows:
+                profiles = rows
+                used = name
+                break
+        if not profiles:
+            used = wanted[0]
+            self._vlog("按 id= 的名字查各平台：%s 都没搜到主页", "、".join(wanted))
+        else:
+            self._vlog(
+                "按 id= 的名字查各平台：%s → %s",
+                used,
+                "、".join(f"{row.get('platform')}/{row.get('handle')}" for row in profiles),
+            )
         result: dict[str, Any] = {
-            "name": wanted,
+            "name": used,
             "profiles": profiles,
             "status": "seen" if profiles else "",
         }
@@ -4702,12 +4756,12 @@ class ImageSearcherPlugin(MaiBotPlugin):
             x_name = str(info.get("name") or "")
             resolved = str(info.get("screen_name") or probe)
             if not (
-                identity.name_matches(wanted, x_name)
-                or identity.name_matches(wanted, resolved)
+                identity.name_matches(used, x_name)
+                or identity.name_matches(used, resolved)
             ):
-                self._vlog("id= %s 搜到的 @%s（%s）对不上，丢掉", wanted, resolved, x_name or "-")
+                self._vlog("id= %s 搜到的 @%s（%s）对不上，丢掉", used, resolved, x_name or "-")
                 continue
-            self._vlog("id= %s 对上 X：@%s（%s），翻带图帖比指纹", wanted, resolved, x_name or "-")
+            self._vlog("id= %s 对上 X：@%s（%s），翻带图帖比指纹", used, resolved, x_name or "-")
             holder: dict[str, Any] = {}
             await self._check_watermark_post(resolved, upload, holder)
             post = str(holder.get("watermark_post") or "")
@@ -4725,6 +4779,37 @@ class ImageSearcherPlugin(MaiBotPlugin):
             )
             return result
         return result
+
+    async def _search_profiles_with_rotation(
+        self, pool: Any, name: str
+    ) -> list[dict[str, str]]:
+        """一次网页检索，key 用完了就换下一个。
+
+        现网两个 key，其中一个月额度已经用完（实测同一个名字一个回 429、另一个
+        正常）。不换 key 的话这一步会天天静默失败，看着就跟没这功能一样。
+        """
+        for _ in range(2):
+            key = pool.acquire()
+            if not key:
+                return []
+
+            def fetch(api_key: str = key) -> list[dict[str, str]]:
+                return identity.search_profiles(name, api_key, self._proxy(), fallback=False)
+
+            try:
+                rows = await asyncio.wait_for(asyncio.to_thread(fetch), timeout=40)
+            except Exception as error:  # noqa: BLE001 - 查不到就当没这一步
+                text = str(error)
+                if "429" in text or "401" in text or "403" in text:
+                    # 额度用完的 key 冷却久一点，别每单都拿它试一次。
+                    pool.mark_failure(key, 3600 if "429" in text else None)
+                    self._vlog("按 id= 的名字查各平台：key 额度不可用（%s），换下一个", text[:40])
+                    continue
+                self._vlog("按 id= 的名字查各平台失败：%s", text[:80])
+                return []
+            pool.mark_success(key)
+            return rows
+        return []
 
     def _promote_id_name(self, best: Candidate | None, info: dict[str, Any]) -> Candidate | None:
         """``id=`` 那个名字在 X 上核到了这张图，那条帖子就是结论。"""
