@@ -65,6 +65,87 @@ def extract(texts: list[str], limit: int = 6) -> list[str]:
     return found
 
 
+# 标题里的「署名」比随手抽单词可靠得多：搬运帖常把原作者名连动词一起抄下来
+# （「Vivian cosplay by KURU」），那是整条标题里唯一指向本人的部分。这里只负责
+# 认出这类明确写法，能不能用仍由插件联网核图决定。
+_SIG_AT = re.compile(r"(?<![A-Za-z0-9_])@([A-Za-z0-9_]{2,20})")
+_SIG_BY = re.compile(
+    r"\b(?:cosplay(?:ed)?|cos|costume|photo|photography|shot|pic(?:ture)?|art|edit)"
+    r"\s+by\s+([A-Za-z0-9_.\-]{3,24})",
+    re.I,
+)
+_SIG_GENERIC_BY = re.compile(r"\bby\s+([A-Za-z0-9_.\-]{3,24})", re.I)
+_SIG_LABEL = re.compile(
+    r"\b(?:coser|cosplayer|cn|model|credit|credit\s+to|photo|photography|photographer)"
+    r"\s*[:：]\s*@?([A-Za-z0-9_.\-]{2,24})",
+    re.I,
+)
+_SIG_JP = re.compile(
+    r"(?:コスプレイヤー|レイヤー|撮影|モデル|被写体)\s*[:：]?\s*@?([A-Za-z0-9_.\-]{2,24})"
+)
+
+# 这些词长得像名字，其实是平台名、泛称或者句子里顺手带上的一般词。
+_SIG_STOP = _STOP | {
+    "unknown", "anonymous", "unnamed", "nobody", "someone", "somebody",
+    "staff", "admin", "mod", "moderator", "editor", "owner", "original",
+    "artist", "artists", "photographer", "photographers", "credit", "credits",
+    "self", "myself", "yourself", "himself", "herself", "their", "them",
+    "that", "this", "these", "those", "there", "where", "when", "what",
+    "very", "just", "also", "then", "than", "only", "over", "under", "into",
+    "reddit", "twitter", "pixiv", "weibo", "bilibili", "tiktok", "insta",
+    "mods", "bots", "bot", "ai", "op", "nsfw", "sfw", "uncensored",
+}
+
+
+def _clean_signature(value: str) -> str:
+    return (value or "").strip().strip(".,;:!?)]}\"'“”‘’").strip("-_").strip()
+
+
+def signature_names(texts: list[str], limit: int = 3) -> list[str]:
+    """从标题里认出「这是谁作的」那种明确署名。
+
+    按可信度排序：``@handle`` 最硬，其次是 ``coser:``、``credit to`` 这类带标签
+    的写法，最后才是 ``by XXX``。抽出来的只是名字，能不能当账号用要联网去核——
+    核不到就退回，绝不因为名字像就改结论。
+
+    实测 s-20261112-0752-4fdf：reddit 那页的作者是搬运号，标题写着
+    「Vivian cosplay by KURU」，插件当时只从候选 URL 里抽 handle（抽到两个都不
+    是），标题里的 KURU 完全没用上，于是停在搬运页。
+    """
+    buckets: list[list[str]] = [[], [], [], []]
+    for text in texts:
+        raw = text or ""
+        if not raw:
+            continue
+        for match in _SIG_AT.finditer(raw):
+            buckets[0].append(match.group(1))
+        for pattern in (_SIG_LABEL, _SIG_JP):
+            for match in pattern.finditer(raw):
+                buckets[1].append(match.group(1))
+        for match in _SIG_BY.finditer(raw):
+            buckets[2].append(match.group(1))
+        for match in _SIG_GENERIC_BY.finditer(raw):
+            buckets[3].append(match.group(1))
+
+    seen: set[str] = set()
+    found: list[str] = []
+    for bucket in buckets:
+        for item in bucket:
+            name = _clean_signature(item)
+            low = name.lower()
+            if len(name) < 2 or low in _SIG_STOP or low.isdigit():
+                continue
+            if len(set(low)) <= 2:
+                continue
+            if low in seen:
+                continue
+            seen.add(low)
+            found.append(name)
+            if len(found) >= max(1, limit):
+                return found
+    return found
+
+
 def stem(handle: str) -> str:
     """去掉结尾的数字和下划线：kuukow002 → kuukow，kuuko_w → kuuko。"""
     return re.sub(r"[_\d]+$", "", (handle or "").lower())

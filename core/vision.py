@@ -105,8 +105,102 @@ WATERMARK_PROMPT = """请把这张图上出现的所有文字逐字抄下来。
 """
 
 
-def build_watermark_prompt() -> str:
-    return WATERMARK_PROMPT
+# 整图缩小读不出来时的第二道：把原图切成几块，每块单独放大去读。整图读水印
+# 失败不一定是分辨率不够——3073×4096 的图缩到 1600 长边，实测人眼仍能认出
+# 水印，模型却回空串。真正的问题是那行字在整幅画面里只占几千分之一，模型的
+# 注意力根本不会落到它身上。切成六块之后，同一行字在画面里大了一个数量级。
+#
+# 实测 s-20261112-0752-4fdf：图上手机边写着 @kuru_xox，整图读回来是「无」，
+# 而这张图在 reddit 上只是别人转的，插件因此停在搬运页上找不到作者。
+TILE_PROMPT_NOTE = """注意：这一张是从一张更大照片上裁下来的一块（{label}），只抄这一块里出现的文字。
+裁切边缘可能只剩半个字，看不清就留空，不要猜。"""
+
+TILE_ROWS = 3
+TILE_COLS = 2
+TILE_OVERLAP = 0.12
+TILE_MAX_SIDE = 1500
+TILE_MAX_UPSCALE = 2.5
+
+_ROW_NAMES = ("上", "中", "下")
+_COL_NAMES = ("左", "右")
+
+
+def build_watermark_prompt(*, label: str = "") -> str:
+    """读水印的 prompt。``label`` 非空表示这是分块读的某一块。"""
+    if not label:
+        return WATERMARK_PROMPT
+    return WATERMARK_PROMPT + "\n" + TILE_PROMPT_NOTE.format(label=label)
+
+
+def tile_boxes(
+    width: int,
+    height: int,
+    *,
+    rows: int = TILE_ROWS,
+    cols: int = TILE_COLS,
+    overlap: float = TILE_OVERLAP,
+) -> list[tuple[str, tuple[int, int, int, int]]]:
+    """把画布切成带重叠的小块，返回 [(标签, (left, top, right, bottom))]。
+
+    重叠是为了不把一行字正好切在缝上。标签写成「中左」这种位置词，日志里一眼
+    能看出是哪一块读出了东西。
+    """
+    rows = max(1, int(rows))
+    cols = max(1, int(cols))
+    width = max(1, int(width))
+    height = max(1, int(height))
+    box_w = width / cols
+    box_h = height / rows
+    pad_x = box_w * max(0.0, float(overlap))
+    pad_y = box_h * max(0.0, float(overlap))
+    boxes: list[tuple[str, tuple[int, int, int, int]]] = []
+    for row in range(rows):
+        for col in range(cols):
+            left = max(0, int(round(col * box_w - pad_x)))
+            top = max(0, int(round(row * box_h - pad_y)))
+            right = min(width, int(round((col + 1) * box_w + pad_x)))
+            bottom = min(height, int(round((row + 1) * box_h + pad_y)))
+            if right - left < 8 or bottom - top < 8:
+                continue
+            boxes.append((_tile_label(row, col, rows, cols), (left, top, right, bottom)))
+    return boxes
+
+
+def _tile_label(row: int, col: int, rows: int, cols: int) -> str:
+    if rows <= len(_ROW_NAMES) and cols <= len(_COL_NAMES):
+        if cols == 1:
+            return _ROW_NAMES[row]
+        return _ROW_NAMES[row] + _COL_NAMES[col]
+    return f"第{row * cols + col + 1}块"
+
+
+def tile_data_urls(
+    raw: bytes,
+    *,
+    rows: int = TILE_ROWS,
+    cols: int = TILE_COLS,
+    overlap: float = TILE_OVERLAP,
+    max_side: int = TILE_MAX_SIDE,
+) -> list[tuple[str, str]]:
+    """把原图切成几块，各自放大到能看清小字，返回 [(标签, data_url)]。
+
+    调用方一块一块发、读到账号就停，别一次把六块全送出去烧额度。
+    """
+    image = _decode(raw)
+    if image is None:
+        raise ValueError("图片解码失败")
+    out: list[tuple[str, str]] = []
+    for label, box in tile_boxes(image.width, image.height, rows=rows, cols=cols, overlap=overlap):
+        tile = image.crop(box)
+        width, height = tile.size
+        scale = float(max_side) / max(1, max(width, height))
+        scale = min(max(0.3, scale), TILE_MAX_UPSCALE)
+        if abs(scale - 1.0) > 0.02:
+            tile = tile.resize((max(1, int(width * scale)), max(1, int(height * scale))))
+        buffer = io.BytesIO()
+        tile.convert("RGB").save(buffer, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+        out.append((label, "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")))
+    return out
 
 
 def data_url_for(raw: bytes, *, max_side: int = 1600) -> tuple[str, int, int]:

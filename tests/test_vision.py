@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import random
@@ -672,6 +673,54 @@ class VisionDisplayTest(unittest.TestCase):
         outcome = SearchOutcome(status="not_found", candidates=[item])
         text = formatting._best_block(outcome)
         self.assertIn("同角色或同款服装", text)
+
+
+class WatermarkTileTest(unittest.TestCase):
+    """整图读不出水印时的分块：切得开、标签对、块里有内容。
+
+    s-20261112-0752-4fdf：图上手机边写着 @kuru_xox，整图那一次回「无」，
+    切成六块之后这一行字在画面里大了一个数量级才读得出来。
+    """
+
+    def test_portrait_split_into_six_labelled_tiles(self) -> None:
+        boxes = vision.tile_boxes(3073, 4096)
+        self.assertEqual(
+            [label for label, _ in boxes],
+            ["上左", "上右", "中左", "中右", "下左", "下右"],
+        )
+
+    def test_tiles_cover_whole_canvas(self) -> None:
+        """四角都要切到，别把边上的签名漏在块外面。"""
+        boxes = vision.tile_boxes(1000, 1500, rows=3, cols=2, overlap=0.1)
+        left = min(box[0] for _, box in boxes)
+        top = min(box[1] for _, box in boxes)
+        right = max(box[2] for _, box in boxes)
+        bottom = max(box[3] for _, box in boxes)
+        self.assertEqual((left, top), (0, 0))
+        self.assertEqual((right, bottom), (1000, 1500))
+
+    def test_neighbours_overlap_so_text_is_not_cut(self) -> None:
+        """相邻两块要搭接，免得一行字正好切在缝上。"""
+        boxes = vision.tile_boxes(1000, 1500, rows=3, cols=2, overlap=0.2)
+        self.assertGreater(boxes[0][1][2], boxes[1][1][0])
+
+    def test_tile_data_urls_encode_each_piece(self) -> None:
+        raw = _sample(7, (900, 1200))
+        tiles = vision.tile_data_urls(raw, rows=2, cols=2, max_side=400)
+        self.assertEqual(len(tiles), 4)
+        for _, url in tiles:
+            self.assertTrue(url.startswith("data:image/jpeg;base64,"))
+            image = Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1])))
+            self.assertLessEqual(max(image.size), 401)
+
+    def test_tile_prompt_carries_label(self) -> None:
+        """分块读的 prompt 要说明这是裁下来的一块，别让模型描述整幅画面。"""
+        self.assertEqual(vision.build_watermark_prompt(), vision.WATERMARK_PROMPT)
+        self.assertIn("中左", vision.build_watermark_prompt(label="中左"))
+
+    def test_undecodable_bytes_raise(self) -> None:
+        with self.assertRaises(ValueError):
+            vision.tile_data_urls(b"not an image")
 
 
 if __name__ == "__main__":

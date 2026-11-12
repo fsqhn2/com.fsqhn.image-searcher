@@ -181,3 +181,45 @@ class TypoVariantTest(unittest.TestCase):
     def test_limit_applies(self) -> None:
         self.assertLessEqual(len(handles.typo_variants("menruinyanko", limit=5)), 5)
 
+
+
+class SignatureNameTest(unittest.TestCase):
+    """标题里的明确署名：搬运帖常把原作者名连动词一起抄过来。
+
+    s-20261112-0752-4fdf 的标题是「Vivian cosplay by KURU」，KURU 就是原作者；
+    插件当时只从候选 URL 里抽 handle，抽到两个都不对，这一句完全没用上。
+    """
+
+    def test_reddit_credit_in_title(self) -> None:
+        self.assertEqual(
+            handles.signature_names(["Vivian cosplay by KURU : r/Vivian_Mains"]),
+            ["KURU"],
+        )
+
+    def test_at_handle_comes_first(self) -> None:
+        found = handles.signature_names(
+            ["ZZZero - VIVIAN Model (@RayWing) cosplay by somebody"]
+        )
+        self.assertEqual(found[0], "RayWing")
+
+    def test_label_forms(self) -> None:
+        self.assertEqual(handles.signature_names(["coser: Sakana"]), ["Sakana"])
+        self.assertEqual(handles.signature_names(["Credit to @Moliww"]), ["Moliww"])
+
+    def test_generic_by_is_lowest_priority(self) -> None:
+        found = handles.signature_names(["posted by someone", "cosplay by KURU"])
+        self.assertEqual(found[0], "KURU")
+
+    def test_stopwords_dropped(self) -> None:
+        self.assertEqual(handles.signature_names(["Cosplay by Unknown"]), [])
+        self.assertEqual(handles.signature_names(["photo by reddit"]), [])
+
+    def test_limit_applies(self) -> None:
+        found = handles.signature_names(
+            ["a by KURUA", "b by KURUB", "c by KURUC"], limit=2
+        )
+        self.assertEqual(len(found), 2)
+
+    def test_empty_input(self) -> None:
+        self.assertEqual(handles.signature_names([]), [])
+        self.assertEqual(handles.signature_names(["", "   "]), [])

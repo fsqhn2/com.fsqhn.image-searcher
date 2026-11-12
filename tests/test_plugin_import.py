@@ -106,6 +106,48 @@ class PluginImportTest(unittest.TestCase):
                     )
                 )
 
+    def test_watermark_tiles_defaults_on(self) -> None:
+        """整图读不出水印时切块再读，是独立开关，默认开。"""
+        module = import_plugin()
+        self.assertTrue(module.VisionConfig().watermark_tiles)
+
+    def test_signature_hunt_defaults_on(self) -> None:
+        """标题署名反查是独立开关，默认开。"""
+        module = import_plugin()
+        self.assertTrue(module.VisionConfig().signature_hunt)
+
+    def test_should_reread_watermark_on_repost_page_without_account(self) -> None:
+        """命中的是搬运页、又没给出账号时，重读这道也要跑。
+
+        s-20261112-0752-4fdf：命中的是 reddit 转载帖，has_best 为真，旧条件直接
+        跳过重读，而图上写着 @kuru_xox。
+        """
+        module = import_plugin()
+        self.assertTrue(
+            module.ImageSearcherPlugin._should_reread_watermark(
+                vision_enabled=True,
+                reread_enabled=True,
+                had_best=True,
+                repost_unresolved=True,
+                watermark_post="",
+                grok_post="",
+            )
+        )
+
+    def test_should_reread_watermark_skips_repost_page_that_already_landed(self) -> None:
+        """搬运页那条已经核到本人帖子，就别再读一遍。"""
+        module = import_plugin()
+        self.assertFalse(
+            module.ImageSearcherPlugin._should_reread_watermark(
+                vision_enabled=True,
+                reread_enabled=True,
+                had_best=True,
+                repost_unresolved=True,
+                watermark_post="https://x.com/kuru_xox/status/1",
+                grok_post="",
+            )
+        )
+
     def test_pick_best_skips_dead_site(self) -> None:
         """半次元已关站，落在那上面的候选不能当结论（s-20261111-1403-e15a）。"""
         module = import_plugin()

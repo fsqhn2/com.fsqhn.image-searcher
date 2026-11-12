@@ -384,6 +384,33 @@ class VisionConfig(PluginConfigBase):
             "关掉就只认拼图和 Grok 读出来的水印。",
         ),
     )
+    watermark_tiles: bool = Field(
+        default=True,
+        description=(
+            "水印分块重读：整图读不出水印时，把原图切成六块（上下三行×左右两列，"
+            "带重叠），一块一块放大再读，读到账号就停。整图读不出不一定是分辨率不够，"
+            "而是那行字在整幅画面里占比太小，模型注意力落不到它身上。"
+        ),
+        json_schema_extra=_ui(
+            "水印分块重读（原图切块）",
+            "默认开。只在整图读不出、或读到的号核不上时触发，最多多六次视觉调用；"
+            "关掉就只读整图。",
+        ),
+    )
+    signature_hunt: bool = Field(
+        default=True,
+        description=(
+            "标题署名反查：候选标题里写着「cosplay by XXX」「coser: XXX」「@XXX」这类"
+            "明确署名时，拿这个名字去检索 X 账号，再翻那个号自己的带图帖比指纹，"
+            "命中才算结论。搬运帖常把原作者名一起抄过来，而插件原来只从候选 URL 里"
+            "抽 handle，抄在标题里的名字完全用不上。"
+        ),
+        json_schema_extra=_ui(
+            "标题署名反查原作者",
+            "默认开。每单最多认三个署名、最多翻三个号的带图帖；翻不到就当没有，"
+            "不会因为名字像就改结论。",
+        ),
+    )
     x_from_name: bool = Field(
         default=True,
         description=(
@@ -1789,6 +1816,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
                     vision_enabled=bool(config.vision.enabled),
                     reread_enabled=bool(config.vision.watermark_reread),
                     had_best=had_best,
+                    repost_unresolved=needs_watermark,
                     watermark_post=str((vision_info or {}).get("watermark_post") or ""),
                     grok_post=str((grok_info or {}).get("post_url") or ""),
                 ):
@@ -1848,6 +1876,29 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 x_identity = None
             if x_identity and x_identity.get("status") == "hit":
                 best = self._promote_x_identity(best, x_identity)
+        # 搬运帖常把原作者名一起抄进标题（「Vivian cosplay by KURU」）。候选 URL
+        # 里抽不出号、图上水印也读不到时，标题里这个名字往往就是唯一剩下的入口：
+        # 拿它去检索 X 账号，再翻那个号自己的带图帖比指纹，对上了才换结论。
+        signature_author: dict[str, Any] | None = None
+        if (
+            upload
+            and bool(getattr(config.vision, "signature_hunt", True))
+            and (
+                best is None
+                or (
+                    best.status == "match"
+                    and not (best.handle or "").strip()
+                    and not self._is_x(best)
+                )
+            )
+        ):
+            try:
+                signature_author = await self._hunt_signature_author(ordered, upload)
+            except Exception as error:  # noqa: BLE001 - 反查不到不影响已经命中的那条
+                self.ctx.logger.warning("标题署名反查失败：%s", error)
+                signature_author = None
+            if signature_author and signature_author.get("status") == "hit":
+                best = self._promote_signature_author(best, signature_author)
         # 同一张图落在普通网页上（搬运站/图集页，页面上没有账号）时别停在那儿：
         # 候选里出现过的 X 号挨个翻一遍，谁自己的帖子里有这张图谁就是结论。
         repost_author: dict[str, Any] | None = None
@@ -2414,7 +2465,13 @@ class ImageSearcherPlugin(MaiBotPlugin):
         )
         return info
 
-    async def _read_watermark(self, upload: bytes | None) -> dict[str, Any]:
+    async def _read_watermark(
+        self,
+        upload: bytes | None,
+        *,
+        data_url: str = "",
+        label: str = "",
+    ) -> dict[str, Any]:
         """只读原图上的水印：命中搬运站时，这一步比再拼一次对照图更值得。
 
         拼图里 TARGET 格只有 320px，手写体小字经常被压没——实测同一张纳西妲
@@ -2440,17 +2497,22 @@ class ImageSearcherPlugin(MaiBotPlugin):
             return info
 
         started = time.monotonic()
-        try:
-            data_url, width, height = await asyncio.to_thread(vision.data_url_for, upload)
-        except Exception as error:  # noqa: BLE001 - 编码失败只影响这一步
-            info["error"] = f"原图编码失败：{str(error)[:60]}"
-            return info
+        width = height = 0
+        if data_url:
+            # 分块读：切图和缩放已经由 vision.tile_data_urls 做过，这里直接用。
+            pass
+        else:
+            try:
+                data_url, width, height = await asyncio.to_thread(vision.data_url_for, upload)
+            except Exception as error:  # noqa: BLE001 - 编码失败只影响这一步
+                info["error"] = f"原图编码失败：{str(error)[:60]}"
+                return info
 
         messages = [
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": vision.build_watermark_prompt()},
+                    {"type": "text", "text": vision.build_watermark_prompt(label=label)},
                     {"type": "image_url", "image_url": {"url": data_url}},
                 ],
             }
@@ -2496,9 +2558,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
         info["watermark"] = parsed["account"] or parsed["text"]
         info["watermark_text"] = parsed["text"]
         self.ctx.logger.info(
-            "读水印：%sx%s 模型=%s 文字=%s 账号=%s 耗时=%.1fs",
-            width,
-            height,
+            "读水印%s：%s 模型=%s 文字=%s 账号=%s 耗时=%.1fs",
+            f"[{label}]" if label else "",
+            f"{width}x{height}" if width and height else "分块",
             info["model"] or "未返回",
             parsed["text"] or "无",
             parsed["account"] or "无",
@@ -3241,13 +3303,19 @@ class ImageSearcherPlugin(MaiBotPlugin):
         vision_enabled: bool,
         reread_enabled: bool,
         had_best: bool,
+        repost_unresolved: bool = False,
         watermark_post: str,
         grok_post: str,
     ) -> bool:
         """要不要跑「原图再读一次水印」这道兜底。
 
-        前提三条：开关都打开、整轮没有结论、前面两条读水印的线也都没落地
-        （``watermark_post`` 和 ``grok_post`` 都为空）。
+        两种情况要跑：整轮没有结论；或者结论落在搬运站/社区站上又没给出账号
+        （``repost_unresolved``）——那种页面只是别人转的，图上水印往往是唯一还能
+        指到本人的线索。s-20261112-0752-4fdf 就是第二种：命中的是 reddit 转载帖，
+        整图读水印回了个「无」，重读这道因为 ``had_best`` 为真被直接跳过，
+        而图上其实写着 @kuru_xox。
+
+        前提仍是两条水印线都没落地（``watermark_post`` 和 ``grok_post`` 都为空）。
 
         特意**不看拼图有没有读到水印文本**：读到但没核到图，同样算没落地；
         一个字都没读到，更该再试一次。s-20261111-1403-e15a 就是这么翻车的——
@@ -3255,13 +3323,11 @@ class ImageSearcherPlugin(MaiBotPlugin):
         而旧代码把重读挂在了「拼图读到东西」的分支里，于是连着被跳过，
         最后报了个「未找到」，图上写着答案插件却说没有。
         """
-        return bool(
-            vision_enabled
-            and reread_enabled
-            and not had_best
-            and not (watermark_post or "").strip()
-            and not (grok_post or "").strip()
-        )
+        if not (vision_enabled and reread_enabled):
+            return False
+        if not (not had_best or repost_unresolved):
+            return False
+        return not (watermark_post or "").strip() and not (grok_post or "").strip()
 
     async def _reread_watermark(
         self,
@@ -3269,11 +3335,14 @@ class ImageSearcherPlugin(MaiBotPlugin):
         grok_info: dict[str, Any] | None,
         upload: bytes | None,
     ) -> None:
-        """拼图里读的水印不可靠时，把原图单独送去再读一次。
+        """整图读不出水印时再读一次，还读不出就切成分块逐块读。
 
         ac88 那单的水印是 4×4 拼图读的（TARGET 格只有 320px），把 ``Moliww``
-        读成了 ``Miharu``；同一张图按原图读就清楚得多。只在整轮没结论、两条水印
-        线也都没落地时跑，多一次 vlm 调用，读到新号才继续往下核。
+        读成了 ``Miharu``；同一张图按原图读就清楚得多。
+
+        整图也读不出来时（s-20261112-0752-4fdf：手机边写着 @kuru_xox，整图回
+        「无」）再切块：那行字在整幅画面里占比太小，模型注意力落不到它身上，切成
+        六块之后同一行字大了一个数量级。一块一块发，读到账号就停。
         """
         if not upload or not bool(getattr(self.config.vision, "enabled", True)):
             return
@@ -3281,30 +3350,80 @@ class ImageSearcherPlugin(MaiBotPlugin):
         known = {
             str(item.get("handle") or "").lower() for item in readings if isinstance(item, dict)
         }
+
+        if await self._reread_one(
+            vision_info, readings, known, upload, data_url="", label=""
+        ):
+            return
+        if not bool(getattr(self.config.vision, "watermark_tiles", True)):
+            return
         try:
-            info = await self._read_watermark(upload)
+            tiles = await asyncio.to_thread(vision.tile_data_urls, upload)
+        except Exception as error:  # noqa: BLE001 - 切块失败只是少一道兜底
+            self.ctx.logger.warning("原图切块失败：%s", error)
+            return
+        if not tiles:
+            return
+        self._vlog("整图没读出可用水印，改分块读：共 %s 块", len(tiles))
+        for label, data_url in tiles[: self._WATERMARK_TILE_LIMIT]:
+            if await self._reread_one(
+                vision_info, readings, known, upload, data_url=data_url, label=label
+            ):
+                self._vlog("分块读在第 %s 块命中原作者，剩下的块不再读", label)
+                return
+
+    # 分块最多读这么多块。2×3 正好六块，再多就说明前面几块都没戏，继续读只是烧额度。
+    _WATERMARK_TILE_LIMIT = 6
+
+    async def _reread_one(
+        self,
+        vision_info: dict[str, Any],
+        readings: list[dict[str, Any]],
+        known: set[str],
+        upload: bytes | None,
+        *,
+        data_url: str,
+        label: str,
+    ) -> bool:
+        """读一次（整图或某一块），读到没见过的号就核它自己的带图帖。
+
+        返回 True 表示这个号自己的帖子里真有这张图——整条分块循环就此收工。
+        """
+        where = f"[{label}]" if label else ""
+        try:
+            info = await self._read_watermark(upload, data_url=data_url, label=label)
         except Exception as error:  # noqa: BLE001 - 重读只是加分项
-            self.ctx.logger.warning("原图重读水印失败：%s", error)
-            return
+            self.ctx.logger.warning("重读水印失败%s：%s", where, error)
+            return False
         if not info.get("ok"):
-            self._vlog("原图重读水印没成：%s", info.get("error") or "-")
-            return
+            self._vlog("重读水印没成%s：%s", where, info.get("error") or "-")
+            return False
         raw = str(info.get("watermark") or "").strip()
         handle = vision.handle_from_watermark(raw)
         if not handle:
-            self._vlog("原图重读水印：文字=%s，没读出账号", raw or "-")
-            return
+            self._vlog("重读水印%s：文字=%s，没读出账号", where, raw or "-")
+            return False
         if handle.lower() in known:
-            self._vlog("原图重读水印：还是 @%s，不重复核", handle)
-            return
+            self._vlog("重读水印%s：还是 @%s，不重复核", where, handle)
+            return False
         reading = await self._verify_watermark_reading(
-            {"source": "vision-original", "raw": raw, "handle": handle},
+            {
+                "source": f"vision-tile-{label}" if label else "vision-original",
+                "raw": raw,
+                "handle": handle,
+            },
             upload,
             True,
         )
         readings.append(reading)
+        for key in ("handle", "fixed"):
+            # 核出来的真实写法也算见过，免得下一块读到同一个号又核一遍。
+            value = str(reading.get(key) or "").strip().lower()
+            if value:
+                known.add(value)
         vision_info["watermark_readings"] = readings
         self._apply_watermark_primary(vision_info, readings)
+        return bool(str(reading.get("post") or "").strip())
 
     async def _verify_watermark_reading(
         self,
@@ -4250,6 +4369,136 @@ class ImageSearcherPlugin(MaiBotPlugin):
             distance=distance,
             status="match",
             note=f"按微博昵称找到 X @{handle}：它自己的带图帖里有这张图（距离 {distance}）",
+        )
+
+    # 标题里最多认三个署名、最多翻三个号的带图帖。每次翻帖都是十来条候选图
+    # 下载比指纹，成本不低，而这些标题里真正写着作者名的通常只有一条。
+    _SIGNATURE_NAME_LIMIT = 3
+    _SIGNATURE_PROBE_LIMIT = 3
+
+    async def _hunt_signature_author(
+        self, ordered: list[Candidate], upload: bytes | None
+    ) -> dict[str, Any] | None:
+        """顺着标题里的署名（``by XXX``、``coser: XXX``、``@XXX``）去 X 上找本人。
+
+        搬运帖常把原作者名连动词一起抄进标题，那是整条标题里唯一指向本人的部分。
+        插件原来只从候选 URL 里抽 handle：s-20261112-0752-4fdf 抽到 miya1st 和
+        _ray_wing_ 两个都不对，而标题写着「Vivian cosplay by KURU」，KURU 完全没
+        用上，于是停在 reddit 的转载页上。
+
+        找到号还不够：必须那个号自己的带图帖里真有这张图才算数，翻不到就当没有。
+        """
+        if not upload:
+            return None
+        rows = sorted(
+            (
+                item
+                for item in ordered[:12]
+                if (item.title or item.name)
+                and item.status != "mismatch"
+                and not handles.is_blocked_source(item.source)
+            ),
+            key=self._x_hunt_priority,
+        )
+        if not rows:
+            return None
+        texts = [self._name_text(item) for item in rows]
+        names = handles.signature_names(texts, limit=self._SIGNATURE_NAME_LIMIT)
+        if not names:
+            return None
+        self._vlog("标题署名：%s", "、".join(names))
+        seen_handles = {
+            str(item.handle or "").strip().lstrip("@").lower()
+            for item in ordered
+            if (item.handle or "").strip()
+        }
+        probes = 0
+        seen_note = ""
+        for name in names:
+            if probes >= self._SIGNATURE_PROBE_LIMIT:
+                break
+            candidates = [item for item in await self._search_x_handles(name) if item]
+            # 署名本身也可能是 handle（标题里直接写 @kuru_xox 的那种）。
+            candidates.append(name)
+            tried: set[str] = set()
+            for handle in candidates:
+                key = str(handle or "").strip().lstrip("@")
+                low = key.lower()
+                if not key or low in tried or low in seen_handles:
+                    continue
+                tried.add(low)
+                info = await self._profile(key)
+                if not info:
+                    continue
+                x_name = str(info.get("name") or "")
+                resolved = str(info.get("screen_name") or key)
+                if not (
+                    identity.name_matches(name, x_name)
+                    or identity.name_matches(name, resolved)
+                ):
+                    self._vlog("署名 %s 搜到的 @%s（%s）对不上，丢掉", name, resolved, x_name or "-")
+                    continue
+                if probes >= self._SIGNATURE_PROBE_LIMIT:
+                    break
+                probes += 1
+                self._vlog(
+                    "署名对上 X：%s → @%s（%s，粉丝 %s），翻带图帖比指纹",
+                    name,
+                    resolved,
+                    x_name or "-",
+                    info.get("followers") or 0,
+                )
+                holder: dict[str, Any] = {}
+                await self._check_watermark_post(resolved, upload, holder)
+                post = str(holder.get("watermark_post") or "")
+                if post:
+                    source = next(
+                        (item for item in rows if name.lower() in self._name_text(item).lower()),
+                        None,
+                    )
+                    return {
+                        "status": "hit",
+                        "name": name,
+                        "handle": resolved,
+                        "x_name": x_name,
+                        "followers": int(info.get("followers") or 0),
+                        "post": post,
+                        "distance": int(holder.get("watermark_distance") or 0),
+                        "source_url": source.url if source is not None else "",
+                        "source_title": " ".join(
+                            (source.title or source.name or "").split()
+                        )[:60]
+                        if source is not None
+                        else "",
+                    }
+                seen_note = str(holder.get("watermark_note") or "")
+        if seen_note:
+            return {"status": "seen", "name": names[0], "reason": seen_note}
+        return None
+
+    def _promote_signature_author(
+        self, best: Candidate | None, info: dict[str, Any]
+    ) -> Candidate | None:
+        """署名那个号自己发过这张图时，那条帖子就是结论。
+
+        证据是「这个号自己的带图帖里指纹对上」，比搬运页那点相似度硬得多。
+        """
+        post = str(info.get("post") or "")
+        handle = str(info.get("handle") or "").strip().lstrip("@")
+        if not post or not handle:
+            return best
+        name = str(info.get("name") or "")
+        distance = int(info.get("distance") or 0)
+        self._vlog("标题署名反查命中，升成结论：%s → @%s %s（距离 %s）", name, handle, post, distance)
+        return Candidate(
+            engine="signature",
+            url=post,
+            platform="X (Twitter)",
+            handle="@" + handle,
+            name=str(info.get("x_name") or ""),
+            distance=distance,
+            status="match",
+            note=f"标题里署名 {name}，@{handle} 自己的带图帖里有这张图（距离 {distance}）",
         )
 
     # 从候选标题猜账号时最多验这么多个名字。别名列表常常挤在某一条搬运站
