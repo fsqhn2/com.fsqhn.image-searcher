@@ -2205,6 +2205,10 @@ class ImageSearcherPlugin(MaiBotPlugin):
             except Exception as error:  # noqa: BLE001 - 对号失败不影响已搜到的结果
                 self.ctx.logger.warning("同一个人多号推断失败：%s", error)
 
+        # 视觉命中但指纹对不上：翻不到那人自己发的这张，就只算线索，不当结论。
+        # 放在所有兜底之后——先让水印、署名、按名字换号这些硬线索把结论换掉。
+        best = await self._require_vision_proof(best, upload, route)
+
         # Grok 给了具体帖子或账号，也算有结论：前者是找到，后者是线索。
         grok_hit = bool(grok_info and grok_info.get("tier") in {"post", "account"})
         outcome = SearchOutcome(
@@ -4539,6 +4543,65 @@ class ImageSearcherPlugin(MaiBotPlugin):
         best.status = "suspect"
         best.note = f"视觉复核：疑似同一个人，但没在 @{handle} 最近的带图帖里翻到这张，仅供参考"
         self._vlog("视觉主页没翻到原帖，降级：%s", handle)
+        return None
+
+    async def _require_vision_proof(
+        self,
+        best: Candidate | None,
+        upload: bytes | None,
+        route: str,
+    ) -> Candidate | None:
+        """视觉命中、指纹又对不上时，必须有「她自己发过这张」作证，否则只算线索。
+
+        `_settle_vision_handle()` 只管落点是 X 主页的那一类。落在一条具体帖子、
+        或者微博／Instagram 这类翻不了帖的站点上时，之前是直接当结论发的：
+        s-20261112-1435-9aed 视觉凭「粉色双马尾、同款粉色系服装」挑了一条，距离 28，
+        落在一个微博 UID 上，整单写成找到——而正确答案在 X 上，压根没进候选。
+
+        门槛沿用用户 11-12 定下的口径：距离在 ``hash_threshold`` 内说明图就是同一张，
+        只是落点不好，照旧当视觉结论；超阈值（或没算出距离）就去翻那个号自己的
+        带图帖，翻到才升成 match，翻不到／翻不成／翻不了都降成疑似，只留在参考区。
+        代价是这类单更容易落成「未找到」，换来的是不再把别人当成答案。
+        """
+        if best is None or best.status != "vision" or not upload or route != "photo":
+            return best
+        threshold = self.config.plugin.hash_threshold
+        if not vision.needs_post_proof(best.distance, threshold):
+            return best
+        gap = (
+            f"指纹距离 {best.distance}"
+            if best.distance is not None
+            else "没算出指纹距离"
+        )
+        handle = (best.handle or "").strip().lstrip("@")
+        if is_x_platform(best.platform) and handle:
+            hit = await self._media_lookup(handle, upload)
+            if hit and hit.get("url"):
+                distance = int(hit.get("distance") or 0)
+                best.url = str(hit.get("url") or best.url)
+                best.distance = distance
+                best.status = "match"
+                best.note = (
+                    f"指纹一致（距离 {distance}）：视觉认人后翻 @{handle} 的带图帖子，"
+                    "找到这张"
+                )
+                self._vlog(
+                    "视觉命中补证：@%s → %s（距离 %s）", handle, best.url, distance
+                )
+                return best
+            note = vision.PROOF_NOTE_BLOCKED if (hit or {}).get("error") else vision.PROOF_NOTE_MISS
+            self._vlog(
+                "视觉命中没有帖子作证（%s）：@%s，%s",
+                gap,
+                handle,
+                str((hit or {}).get("error") or "带图帖里没有这张")[:80],
+            )
+        else:
+            note = vision.PROOF_NOTE_OFFLINE
+            self._vlog("视觉命中没有帖子作证（%s）：%s 翻不了帖", gap, handle or best.url)
+        best.status = "suspect"
+        best.downgrade = "vision"
+        best.note = note.format(gap=gap)
         return None
 
     # 按名字换号时最多核这么多个候选。检索结果里第一个通常就是本人，多试只是

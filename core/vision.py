@@ -312,6 +312,27 @@ VERDICT_PLATFORM_ID = "platform_id"
 VERDICT_UNTRACEABLE = "untraceable"
 VERDICT_NO_ACCOUNT = "no_account"
 
+# 视觉命中但指纹对不上时，光靠「模型说像」撑不起结论。要看能不能翻到那人
+# 自己发的这条帖子；翻不到就只留一句线索。
+PROOF_NOTE_MISS = "视觉复核：疑似同一个人（{gap}），但翻了她最近的带图帖没找到这张，只算线索"
+PROOF_NOTE_BLOCKED = "视觉复核：疑似同一个人（{gap}），但这次没翻成她的带图帖、核不了，只算线索"
+PROOF_NOTE_OFFLINE = "视觉复核：疑似同一个人（{gap}），但这个落点翻不了帖、核不了，只算线索"
+
+
+def needs_post_proof(distance: int | None, threshold: int) -> bool:
+    """视觉命中要不要拿「她自己发过这张」来作证。
+
+    距离够近时图本身就是同一张，只是落点不好（转发页、商品页），不必再翻帖；
+    距离超过阈值、或者压根没算出距离，那这条结论就只剩「模型说像」一句话——
+    必须翻到那个人自己的带图帖才算数，否则只算线索。
+
+    s-20261112-1435-9aed 就是这么错的：视觉凭「粉色双马尾、同款粉色系服装」挑了
+    一条，指纹距离 28，落在一个微博 UID 上，整单却写成了找到。
+    """
+    if distance is None:
+        return True
+    return int(distance) > int(threshold)
+
 DOWNGRADE_NOTES = {
     VERDICT_COMMERCE: "视觉复核：疑似同一个人，但来自电商商品页（{gap}），仅供参考",
     VERDICT_REPOST: "视觉复核：疑似同一个人，但那是转发页、图不是她发的（{gap}），仅供参考",

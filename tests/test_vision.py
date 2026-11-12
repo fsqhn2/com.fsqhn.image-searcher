@@ -40,6 +40,30 @@ def _size(raw: bytes) -> tuple[int, int]:
     return Image.open(io.BytesIO(raw)).size
 
 
+class VisionProofTest(unittest.TestCase):
+    """视觉命中要不要拿「她自己发过这张」作证（s-20261112-1435-9aed）。"""
+
+    def test_far_distance_needs_proof(self) -> None:
+        self.assertTrue(vision.needs_post_proof(28, 8))
+
+    def test_unknown_distance_needs_proof(self) -> None:
+        """图都没比过指纹，只剩「模型说像」这一句，同样得翻帖。"""
+        self.assertTrue(vision.needs_post_proof(None, 8))
+
+    def test_within_threshold_does_not_need_proof(self) -> None:
+        """距离够近说明图就是同一张，只是落点不好，不必再翻帖。"""
+        self.assertFalse(vision.needs_post_proof(8, 8))
+        self.assertFalse(vision.needs_post_proof(0, 8))
+
+    def test_proof_notes_all_mention_clue_only(self) -> None:
+        for note in (
+            vision.PROOF_NOTE_MISS,
+            vision.PROOF_NOTE_BLOCKED,
+            vision.PROOF_NOTE_OFFLINE,
+        ):
+            self.assertIn("只算线索", note.format(gap="指纹距离 28"))
+
+
 class BuildPromptTest(unittest.TestCase):
     def test_prompt_mentions_each_candidate_count(self):
         prompt = vision.build_prompt(16)
