@@ -3196,13 +3196,23 @@ class ImageSearcherPlugin(MaiBotPlugin):
     ) -> Candidate | None:
         """水印核对到本人发过这张图时，把它当成结论。
 
-        这条证据是「作者的带图帖里指纹对上」，比视觉认人硬；已经有结论时不该被
-        它顶掉。唯一的例外是结论本身落在搬运站/社区站又没有账号（只是别人转的
-        图，例如 arca.live 那条距离 0 的帖子）——作者本人的带图帖显然更该当结论。
+        这条证据是「作者的带图帖里指纹对上」，比视觉认人硬。所以只有一种情况不
+        顶掉：现有结论本身也是指纹对上的帖、又落到了具体账号上（那是另一条硬证据，
+        谁更对留给用户点开看）。
+
+        原来的写法是「已经有结论就不顶」，结果 s-20261112-0950-af18 里视觉挑了
+        @ayawan1012（距离 22，只是模型觉得像），而水印那一步已经核到
+        @idtNothinglose 自己发过这张图（距离 0），榜首却还是 ayawan——一条回复
+        里两个账号，说的还不是同一个人。
         """
         if not vision_info:
             return best
-        if best is not None and not self._is_repost_result(best):
+        if (
+            best is not None
+            and best.status == "match"
+            and (best.handle or "").strip()
+            and not self._is_repost_result(best)
+        ):
             return best
         post = str(vision_info.get("watermark_post") or "").strip()
         handle = str(vision_info.get("watermark_handle") or "").strip()
@@ -4431,19 +4441,32 @@ class ImageSearcherPlugin(MaiBotPlugin):
     async def _search_x_handles(self, name: str) -> list[str]:
         """昵称 → 疑似 X 号，借用 Lens 那套 SerpAPI key 跑一次网页检索。"""
         pool = self._pools.get("lens")
-        key = pool.acquire() if pool else ""
-        if not key:
+        if not pool:
             self._vlog("按名字搜 X：没有可用的 SerpAPI key，跳过")
             return []
 
-        def fetch() -> list[str]:
-            return identity.search_x_handles(name, key, self._proxy())
+        found: list[str] = []
+        for _ in range(2):
+            key = pool.acquire()
+            if not key:
+                return []
 
-        try:
-            found = await asyncio.wait_for(asyncio.to_thread(fetch), timeout=40)
-        except Exception as error:  # noqa: BLE001 - 搜不到就当没有这一步
-            self._vlog("按名字搜 X 失败：%s", str(error)[:80])
-            return []
+            def fetch(api_key: str = key) -> list[str]:
+                return identity.search_x_handles(name, api_key, self._proxy())
+
+            try:
+                found = await asyncio.wait_for(asyncio.to_thread(fetch), timeout=40)
+            except Exception as error:  # noqa: BLE001 - 搜不到就当没有这一步
+                text = str(error)
+                if "429" in text or "401" in text or "403" in text:
+                    # 一个 key 的月额度用完就换下一个，不然这一步天天静默失败。
+                    pool.mark_failure(key, 3600 if "429" in text else None)
+                    self._vlog("按名字搜 X：key 额度不可用（%s），换下一个", text[:40])
+                    continue
+                self._vlog("按名字搜 X 失败：%s", text[:80])
+                return []
+            pool.mark_success(key)
+            break
         self._vlog("按名字搜 X：%s → %s", name, "、".join(found) or "没给出号")
         return found
 

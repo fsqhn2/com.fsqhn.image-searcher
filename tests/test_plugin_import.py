@@ -9,6 +9,7 @@ core 的 504 项测试一个都不碰 plugin.py，全过了，可插件在服务
 from __future__ import annotations
 
 import importlib
+import logging
 import sys
 import types
 import unittest
@@ -152,6 +153,57 @@ class PluginImportTest(unittest.TestCase):
         """追查模式（读候选图的水印）是独立开关，默认开。"""
         module = import_plugin()
         self.assertTrue(module.VisionConfig().deep_trace)
+
+    def test_watermark_hit_beats_vision_guess(self) -> None:
+        """水印核到本人发过这张图时，视觉猜的那个号要让位。
+
+        s-20261112-0950-af18：水印那条距离 0（@idtNothinglose 自己发的），视觉
+        挑的 @ayawan1012 距离 22，原来水印被「已有结论」挡住，一条回复里两个账号。
+        """
+        module = import_plugin()
+        plugin = module.ImageSearcherPlugin.__new__(module.ImageSearcherPlugin)
+        plugin._ctx = types.SimpleNamespace(logger=logging.getLogger("test"))
+        guess = module.Candidate(
+            engine="lens",
+            url="https://x.com/ayawan1012/status/1",
+            platform="X (Twitter)",
+            handle="@ayawan1012",
+            name="Aya Wan",
+            distance=22,
+            status="vision",
+        )
+        info = {
+            "watermark_post": "https://x.com/idtNothinglose/status/2120509160668409975",
+            "watermark_handle": "idtNothinglose",
+            "watermark_name": "Reng",
+            "watermark_distance": 0,
+        }
+        promoted = plugin._promote_watermark_hit(guess, info)
+        self.assertIsNotNone(promoted)
+        self.assertEqual(promoted.handle, "@idtNothinglose")
+        self.assertEqual(promoted.distance, 0)
+
+    def test_watermark_hit_keeps_confirmed_match(self) -> None:
+        """已经是指纹对上、又落到账号上的帖子不被水印顶掉。"""
+        module = import_plugin()
+        plugin = module.ImageSearcherPlugin.__new__(module.ImageSearcherPlugin)
+        plugin._ctx = types.SimpleNamespace(logger=logging.getLogger("test"))
+        solid = module.Candidate(
+            engine="lens",
+            url="https://x.com/someone/status/2",
+            platform="X (Twitter)",
+            handle="@someone",
+            name="某人",
+            distance=3,
+            status="match",
+        )
+        info = {
+            "watermark_post": "https://x.com/other/status/9",
+            "watermark_handle": "other",
+            "watermark_distance": 0,
+        }
+        kept = plugin._promote_watermark_hit(solid, info)
+        self.assertEqual(kept.handle, "@someone")
 
     def test_id_name_search_defaults_on(self) -> None:
         """按 id= 的名字查各平台是独立开关，默认开。"""
