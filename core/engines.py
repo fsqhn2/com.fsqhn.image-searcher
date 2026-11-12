@@ -13,6 +13,7 @@ import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 from urllib.parse import urlparse
 
 from requests.exceptions import ConnectionError as RequestsConnectionError
@@ -38,11 +39,18 @@ from .httpclient import (
     json_or_raise,
     make_session,
 )
+from .identity import SERPER_LENS, is_serper_key
 from .keypool import KeyPool
 
 SERP_ENDPOINT = "https://serpapi.com/search.json"
 SERP_IMAGE_ENDPOINT = "https://serpapi.com/image"
 SERP_UPLOAD_LIMIT = 500 * 1024
+# Serper 的 Lens 只收公网图片链接（base64 会回 400 Missing "url"），所以要先把图
+# 传到 uguu 换一个直链。大图不传，省得白等一次上传。
+# 注意：tmpfiles.org 的 dl 直链喂给 Serper Lens 会回 organic=0（Google 抓不到那台机器），
+# 别换回去。telegra.ph 直接 400、file.io 回的是网页，也都试过不行。
+SERPER_HOST_UPLOAD = "https://uguu.se/upload?output=text"
+SERPER_HOST_LIMIT = 4 * 1024 * 1024
 SAUCENAO_ENDPOINT = "https://saucenao.com/search.php"
 SIGHTENGINE_ENDPOINT = "https://api.sightengine.com/1.0/check.json"
 
@@ -148,6 +156,70 @@ def _timeout(seconds: float) -> tuple[float, float]:
 
 
 # ---------------------------------------------------------------------------
+# Google Lens（SerpAPI，额度用完时换 Serper）
+# ---------------------------------------------------------------------------
+
+
+def serper_lens_candidates(payload: Any, engine: str = "lens") -> list[Candidate]:
+    """Serper Lens 的 ``organic`` → 插件自己的候选。
+
+    Serper 一次给 60 条（SerpAPI 只回四五条），全部收下来会让指纹比对跑很久，
+    所以这里按原顺序留前 30 条——原顺序就是 Google 的相关度排序，够用了。
+    """
+    if not isinstance(payload, dict):
+        return []
+    items: list[Candidate] = []
+    for row in (payload.get("organic") or [])[:30]:
+        if not isinstance(row, dict):
+            continue
+        link = clean_url(str(row.get("link") or ""))
+        if not link:
+            continue
+        title = str(row.get("title") or "")
+        link, title = promote_mirror(link, title)
+        items.append(
+            Candidate(
+                engine=engine,
+                url=link,
+                title=title,
+                source=str(row.get("source") or urlparse(link).netloc),
+                image_url=str(row.get("imageUrl") or ""),
+            ).finalize()
+        )
+    return items
+
+
+def host_image_publicly(raw: bytes, proxy: str = "", timeout: float = 40.0) -> str:
+    """把图传到 uguu 换一个三小时左右自动失效的直链。
+
+    Serper 的 Lens 不收 base64（回 400 ``Missing "url"``），只认公网链接。换不到
+    就返回空串，让上层报「图床没换成」，不要拿一张不存在的图去搜。只在轮到 Serper
+    的 key 时才走这里（SerpAPI 额度用完的替补），平时不会上传任何图。
+
+    用 uguu 是因为实测 Google 抓得到它：``d.uguu.se`` 的直链喂 Lens 能回 60 条。
+    tmpfiles 的 dl 直链则回 0 条，别换回去。
+    """
+    if not raw or len(raw) > SERPER_HOST_LIMIT:
+        return ""
+    session = make_session(proxy)
+    try:
+        resp = session.post(
+            SERPER_HOST_UPLOAD,
+            files={"files[]": ("upload.jpg", raw, "image/jpeg")},
+            timeout=_timeout(timeout),
+        )
+        if resp.status_code != 200:
+            return ""
+        # output=text 让 uguu 直接回一行纯文本直链，不用解 JSON。
+        link = resp.text.strip().splitlines()[0].strip() if resp.text.strip() else ""
+        return link if link.startswith("http") else ""
+    except Exception:  # noqa: BLE001 - 图床抽风就当这条路不通
+        return ""
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
 # Google Lens（SerpAPI）
 # ---------------------------------------------------------------------------
 
@@ -169,12 +241,14 @@ class LensEngine:
         timeout: float = 40.0,
         retries: int = 2,
         retry_delay: float = 1.5,
+        serper_upload: bool = True,
     ) -> None:
         self.pool = pool
         self.proxy = proxy
         self.timeout = timeout
         self.retries = max(0, int(retries))
         self.retry_delay = max(0.0, float(retry_delay))
+        self.serper_upload = bool(serper_upload)
 
     def search(self, raw: bytes, image_url: str = "", stream_id: str = "") -> list[Candidate]:
         """空返回或上传失败时换一次上传重试。
@@ -203,7 +277,9 @@ class LensEngine:
     def _search_once(self, raw: bytes, image_url: str = "") -> list[Candidate]:
         key = self.pool.acquire()
         if not key:
-            raise EngineError("没有可用的 SerpAPI key（未配置或全部冷却）")
+            raise EngineError("没有可用的检索 key（未配置或全部冷却）")
+        if is_serper_key(key):
+            return self._search_serper(key, raw, image_url)
 
         session = make_session(self.proxy)
         try:
@@ -272,6 +348,45 @@ class LensEngine:
             return str(payload.get("image_id") or "")
         except Exception:  # noqa: BLE001 - 上传失败就回退到按链接搜索
             return ""
+
+    def _search_serper(self, key: str, raw: bytes, image_url: str = "") -> list[Candidate]:
+        """Serper 的 Lens：只收公网图片链接，自己先换一个直链再搜。
+
+        一次调用扣 3 次额度（SerpAPI 是 1 次），所以它只当替补用——轮到它说明
+        SerpAPI 那几把 key 都已经没了或全在冷却。
+        """
+        link = str(image_url or "").strip()
+        if not link.startswith("http"):
+            if not self.serper_upload:
+                raise EngineError("Serper Lens 只收公网图片链接，图床开关关着，跳过")
+            link = host_image_publicly(raw, self.proxy, self.timeout)
+            if not link:
+                raise EngineError("Serper Lens 需要公网图片链接，图床没换成")
+        session = make_session(self.proxy)
+        try:
+            resp = session.post(
+                SERPER_LENS,
+                headers={"X-API-KEY": key, "Content-Type": "application/json"},
+                json={"url": link},
+                timeout=_timeout(self.timeout),
+            )
+            if is_auth_failure(resp.status_code):
+                self.pool.mark_failure(key)
+                raise EngineError(f"Serper Lens 返回 HTTP {resp.status_code}")
+            if resp.status_code >= 400:
+                # 400 多半是链接被拒（图床临时抽风），不是 key 的问题，别冷却。
+                detail = (resp.text or "").strip()[:80]
+                raise EngineError(f"Serper Lens 返回 HTTP {resp.status_code}：{detail}")
+            data = json_or_raise(resp, "Serper Lens")
+        except EngineError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self.pool.mark_failure(key, cooldown_seconds=60)
+            raise EngineError(f"{type(exc).__name__}: {str(exc)[:160]}") from exc
+        finally:
+            session.close()
+        self.pool.mark_success(key)
+        return serper_lens_candidates(data, engine=self.name)
 
 
 # ---------------------------------------------------------------------------

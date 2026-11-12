@@ -145,6 +145,56 @@ class ProfilesFromSearchTest(unittest.TestCase):
         self.assertEqual(identity.profiles_from_search(None), [])
 
 
+class SerperTest(unittest.TestCase):
+    """Serper 跟 SerpAPI 是两家：key 长度不同、查询写法受限也不同。"""
+
+    SERPER_KEY = "516421f1ec89b35083b93c9db20e0d235e66d534"
+    SERPAPI_KEY = "a" * 64
+
+    def test_detects_key_by_length(self) -> None:
+        self.assertTrue(identity.is_serper_key(self.SERPER_KEY))
+        self.assertFalse(identity.is_serper_key(self.SERPAPI_KEY))
+        self.assertFalse(identity.is_serper_key(""))
+        self.assertFalse(identity.is_serper_key("z" * 40))
+
+    def test_serper_query_has_no_quotes(self) -> None:
+        """Serper 免费档会拒「引号 + 其它词」，所以查询串必须裸写。"""
+        self.assertEqual(
+            identity.name_query("kuru_xox", "cosplay", self.SERPER_KEY),
+            "kuru_xox cosplay",
+        )
+        self.assertEqual(
+            identity.name_query("kuru_xox", "cosplay", self.SERPAPI_KEY),
+            '"kuru_xox" cosplay',
+        )
+
+    def test_web_search_normalizes_organic(self) -> None:
+        """两家返回结构不同，统一成 organic_results 后解析层才不用分家。"""
+
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {"organic": [{"title": "t", "link": "https://x.com/a_b"}]}
+
+        class FakeSession:
+            proxies: dict = {}
+
+            def post(self, *args, **kwargs):
+                return FakeResponse()
+
+            def close(self):
+                pass
+
+        original = identity.requests.Session
+        identity.requests.Session = lambda: FakeSession()
+        try:
+            payload = identity.web_search("a_b", self.SERPER_KEY)
+        finally:
+            identity.requests.Session = original
+        self.assertEqual(payload["organic_results"][0]["link"], "https://x.com/a_b")
+
+
 class NameMatchesTest(unittest.TestCase):
     def test_same_name_with_spacing_and_underscores(self) -> None:
         self.assertTrue(identity.name_matches("纸悦Etsu_ko", "纸悦 Etsu_ko"))

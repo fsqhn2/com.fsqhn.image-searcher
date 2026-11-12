@@ -31,6 +31,86 @@ NOISE_HANDLES = frozenset(
 _HANDLE_RE = re.compile(r"(?:x|twitter)\.com/([A-Za-z0-9_]{2,20})", re.I)
 _CLEAN_RE = re.compile(r"[\s_\-·.]+")
 
+# Serper（google.serper.dev）跟 SerpAPI 是两家：前者 key 是 40 位十六进制、按次扣
+# 预付额度（不按月重置），后者是 64 位、按月算。插件两处网页检索原来只认 SerpAPI，
+# 用户买的是 Serper 时会被当成无效 key。
+SERPER_SEARCH = "https://google.serper.dev/search"
+SERPER_LENS = "https://google.serper.dev/lens"
+SERPER_ACCOUNT = "https://google.serper.dev/account"
+
+
+def is_serper_key(api_key: str) -> bool:
+    """40 位十六进制 = Serper；64 位 = SerpAPI。"""
+    key = str(api_key or "").strip()
+    if len(key) != 40:
+        return False
+    return all(char in "0123456789abcdefABCDEF" for char in key)
+
+
+def name_query(name: str, suffix: str, api_key: str) -> str:
+    """按名字检索的查询串。
+
+    Serper 免费档会拒掉「引号 + 其它词」和 ``site:`` 这类写法（实测
+    ``"kuru_xox" cosplay`` 直接 HTTP 400 ``Query pattern not allowed``），所以给它
+    的查询串一律用裸词；SerpAPI 那边保留引号，能压掉不少同名噪声。
+    """
+    name = (name or "").strip()
+    suffix = (suffix or "").strip()
+    if is_serper_key(api_key):
+        return f"{name} {suffix}".strip()
+    return f'"{name}" {suffix}'.strip()
+
+
+def web_search(
+    query: str,
+    api_key: str,
+    proxy: str = "",
+    num: int = 10,
+    timeout: float = 30.0,
+) -> dict[str, Any]:
+    """跑一次网页检索，把两家的返回统一成 ``{"organic_results": [...]}``。
+
+    上层（``handles_from_search`` / ``profiles_from_search``）只认这一个形状，
+    所以接谁都不用改解析。
+    """
+    query = (query or "").strip()
+    if not query or not api_key:
+        return {}
+    session = requests.Session()
+    if proxy:
+        session.proxies.update({"http": proxy, "https": proxy})
+    try:
+        if is_serper_key(api_key):
+            response = session.post(
+                SERPER_SEARCH,
+                headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
+                json={"q": query, "num": max(10, int(num))},
+                timeout=timeout,
+            )
+            if response.status_code != 200:
+                detail = (response.text or "").strip()[:80]
+                raise IdentityError(f"网页检索 HTTP {response.status_code}：{detail}")
+            payload = response.json()
+            organic = payload.get("organic") if isinstance(payload, dict) else None
+            rows = [item for item in (organic or []) if isinstance(item, dict)]
+            return {"organic_results": rows}
+        response = session.get(
+            "https://serpapi.com/search.json",
+            params={"engine": "google", "q": query, "num": str(num), "api_key": api_key},
+            timeout=timeout,
+        )
+        if response.status_code != 200:
+            raise IdentityError(f"网页检索 HTTP {response.status_code}")
+        payload = response.json()
+        if isinstance(payload, dict) and payload.get("error"):
+            raise IdentityError(str(payload["error"])[:80])
+        return payload if isinstance(payload, dict) else {}
+    except ValueError as error:
+        raise IdentityError("网页检索回的不是 JSON") from error
+    finally:
+        session.close()
+
+
 
 class IdentityError(RuntimeError):
     """拿不到就说拿不到，不要静默当成「没有这个人」。"""
@@ -203,26 +283,7 @@ def search_x_handles(
     name = (name or "").strip()
     if not name or not api_key:
         return []
-    query = f'"{name}" twitter'
-    session = requests.Session()
-    if proxy:
-        session.proxies.update({"http": proxy, "https": proxy})
-    try:
-        response = session.get(
-            "https://serpapi.com/search.json",
-            params={"engine": "google", "q": query, "num": "10", "api_key": api_key},
-            timeout=timeout,
-        )
-    finally:
-        session.close()
-    if response.status_code != 200:
-        raise IdentityError(f"网页检索 HTTP {response.status_code}")
-    try:
-        payload = response.json()
-    except ValueError as error:
-        raise IdentityError("网页检索回的不是 JSON") from error
-    if payload.get("error"):
-        raise IdentityError(str(payload["error"])[:80])
+    payload = web_search(name_query(name, "twitter", api_key), api_key, proxy, num=10, timeout=timeout)
     return handles_from_search(payload, limit=limit)
 
 
@@ -312,30 +373,12 @@ def search_profiles(
     name = (name or "").strip()
     if not name or not api_key:
         return []
-    queries = [f'"{name}" cosplay']
+    queries = [name_query(name, "cosplay", api_key)]
     if fallback:
-        queries.append(f'"{name}"')
-    session = requests.Session()
-    if proxy:
-        session.proxies.update({"http": proxy, "https": proxy})
-    try:
-        for index, query in enumerate(queries):
-            response = session.get(
-                "https://serpapi.com/search.json",
-                params={"engine": "google", "q": query, "num": "20", "api_key": api_key},
-                timeout=timeout,
-            )
-            if response.status_code != 200:
-                raise IdentityError(f"网页检索 HTTP {response.status_code}")
-            try:
-                payload = response.json()
-            except ValueError as error:
-                raise IdentityError("网页检索回的不是 JSON") from error
-            if payload.get("error"):
-                raise IdentityError(str(payload["error"])[:80])
-            found = profiles_from_search(payload, limit=limit)
-            if found or index == len(queries) - 1:
-                return found
-    finally:
-        session.close()
+        queries.append(name_query(name, "", api_key))
+    for index, query in enumerate(queries):
+        payload = web_search(query, api_key, proxy, num=20, timeout=timeout)
+        found = profiles_from_search(payload, limit=limit)
+        if found or index == len(queries) - 1:
+            return found
     return []

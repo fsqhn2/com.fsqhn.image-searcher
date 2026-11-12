@@ -272,6 +272,107 @@ class ReferenceCandidatesTest(unittest.TestCase):
         self.assertIn(avatar, pool)
 
 
+class SerperLensTest(unittest.TestCase):
+    """Serper 的 Lens 是替补：只收公网链接，结果字段跟 SerpAPI 完全不同。"""
+
+    def test_parses_organic(self) -> None:
+        from core.engines import serper_lens_candidates
+
+        payload = {
+            "organic": [
+                {
+                    "title": "某某 on X",
+                    "source": "X",
+                    "link": "https://x.com/foo/status/1",
+                    "imageUrl": "https://pbs.twimg.com/media/a.jpg",
+                    "thumbnailUrl": "https://encrypted-tbn0.gstatic.com/x",
+                },
+                {"title": "没有链接", "link": ""},
+            ]
+        }
+        items = serper_lens_candidates(payload)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].url, "https://x.com/foo/status/1")
+        self.assertEqual(items[0].image_url, "https://pbs.twimg.com/media/a.jpg")
+        self.assertEqual(items[0].source, "X")
+
+    def test_caps_result_count(self) -> None:
+        """Serper 一次回 60 条，全收下来指纹比对会跑很久。"""
+        from core.engines import serper_lens_candidates
+
+        payload = {"organic": [{"link": f"https://x.com/a/status/{i}"} for i in range(60)]}
+        self.assertEqual(len(serper_lens_candidates(payload)), 30)
+
+    def test_bad_payload(self) -> None:
+        from core.engines import serper_lens_candidates
+
+        self.assertEqual(serper_lens_candidates(None), [])
+        self.assertEqual(serper_lens_candidates({}), [])
+
+    def test_host_returns_plain_text_link(self) -> None:
+        """uguu 用 output=text 直接回一行直链，不用解 JSON。"""
+        from core import engines
+
+        class FakeResponse:
+            status_code = 200
+            text = "https://d.uguu.se/abc.jpg\n"
+
+            def json(self):
+                raise AssertionError("不该去解 JSON")
+
+        class FakeSession:
+            def post(self, *args, **kwargs):
+                return FakeResponse()
+
+            def close(self):
+                pass
+
+        with mock.patch.object(engines, "make_session", lambda *a, **k: FakeSession()):
+            self.assertEqual(engines.host_image_publicly(b"x"), "https://d.uguu.se/abc.jpg")
+
+    def test_host_rejects_non_link_body(self) -> None:
+        """图床回了一段错误文本，就不能当链接用。"""
+        from core import engines
+
+        class FakeResponse:
+            status_code = 200
+            text = "Upload failed"
+
+            def json(self):
+                return {}
+
+        class FakeSession:
+            def post(self, *args, **kwargs):
+                return FakeResponse()
+
+            def close(self):
+                pass
+
+        with mock.patch.object(engines, "make_session", lambda *a, **k: FakeSession()):
+            self.assertEqual(engines.host_image_publicly(b"x"), "")
+
+    def test_host_returns_empty_when_upload_fails(self) -> None:
+        """图床不通就返回空串，别拿一个假链接去搜。"""
+        from core import engines
+
+        class FakeResponse:
+            status_code = 500
+            text = "boom"
+
+            def json(self):
+                return {}
+
+        class FakeSession:
+            def post(self, *args, **kwargs):
+                return FakeResponse()
+
+            def close(self):
+                pass
+
+        with mock.patch.object(engines, "make_session", lambda *a, **k: FakeSession()):
+            self.assertEqual(engines.host_image_publicly(b"x"), "")
+
+
 class LensRetryTest(unittest.TestCase):
     """Lens 对同一张图会随机返回 0 条，空返回必须重试，有结果就立刻停。"""
 

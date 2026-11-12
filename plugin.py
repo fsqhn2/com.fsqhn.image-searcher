@@ -181,6 +181,19 @@ class LensConfig(EngineConfig):
         ge=0,
         le=10,
     )
+    serper_upload: bool = Field(
+        default=True,
+        description=(
+            "Lens 的 key 池里可以混放 Serper 的 key（40 位，按次扣预付额度）。Serper "
+            "的 Lens 不收图片字节、只收公网链接，轮到它时得先把图传到 uguu.se 换一个"
+            "三小时左右失效的直链。关掉的话 Serper 的 key 只能用于网页检索。"
+        ),
+        json_schema_extra=_ui(
+            "Serper 走图床（Lens 替补）",
+            "默认开。SerpAPI 那几把 key 都用完时，Lens 会换 Serper 顶上；这一路会把图"
+            "传到 uguu.se（公开、几小时后失效），一次扣 3 次 Serper 额度。",
+        ),
+    )
 
 
 class YandexConfig(EngineConfig):
@@ -1165,6 +1178,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 section.engine_timeout,
                 config.lens.retries,
                 config.lens.retry_delay,
+                serper_upload=bool(getattr(config.lens, "serper_upload", True)),
             ),
             "yandex": YandexEngine(global_proxy, section.engine_timeout),
             "baidu": BaiduEngine(global_proxy, section.engine_timeout),
