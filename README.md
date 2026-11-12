@@ -183,7 +183,7 @@
 
 ## 申请 API / 密钥
 
-四个引擎里 Yandex 和百度不需要 key，Lens 和 SauceNAO 要自己申请。两个模型服务不算引擎：视觉复核直接用你已经在跑的 `vlm`（按该模型单价计费），Grok 要单独买 key、按次计费。
+四个引擎里 Yandex 和百度不需要 key，Lens 和 SauceNAO 要自己申请。两个模型服务不算引擎：视觉复核直接用你已经在跑的 `vlm`（按该模型单价计费），Grok 要单独买 key、按次计费。另外 [Serper](#serper可选网页检索与-lens-替补另一家) 是可选的第二家检索服务，给网页检索和 Lens 当替补。
 
 **所有 key 都填在 `config.toml` 里，不要提交到仓库。**
 
@@ -218,6 +218,30 @@ keys = ["你的 SauceNAO key"]
 ```
 
 SauceNAO 索引的是 pixiv、danbooru 这类插画站，真人照片常常没结果。这里它还有个额外作用：**它的高相似度命中被用来判断「这张是不是插画」**，从而决定走哪条引擎顺序。
+
+### Serper（可选：网页检索与 Lens 替补，另一家）
+
+Serper（https://serper.dev）跟 SerpAPI **不是一家公司**，key 也不通用：Serper 是 40 位十六进制，SerpAPI 是 64 位。拿错一栏会一直回 401，所以插件把它单独放一节、单独给开关，别混进 `[lens] keys`。
+
+它干两件事：
+
+- **网页检索**：按名字去 X 找账号、按 `id=` 后面的名字去十个平台查主页。SerpAPI 那几把 key 都不可用时自动改用它。
+- **Lens 替补**：SerpAPI 额度用完或全部冷却时，Lens 改走 Serper 顶上。
+
+```toml
+[serper]
+enabled = true
+keys = ["你的 40 位 Serper key"]
+lens_fallback = true
+upload = true
+```
+
+几件要知道的事：
+
+- **额度是预付总量**，充多少用多少，不按月刷新。网页检索 1 次扣 1 次，Lens 1 次扣 3 次。
+- **免费档挑查询写法**：带引号的组合（`"名字" cosplay`）和 `site:` 会直接回 400 `Query pattern not allowed`。插件已经按它的规矩把查询串改写成裸词，你不用管。
+- **它的 Lens 只收公网图片链接**，不收图片字节，所以走替补时要先把图传到 uguu.se 换个几小时后失效的直链——这就是 `upload` 那个开关。不想让图出本机，把 `lens_fallback` 或 `upload` 关掉即可，网页检索不受影响。
+- 不想用就把 `enabled` 设成 false，或者 `keys` 留空——留空时它自然不参与。
 
 ### Sightengine（可选，AI 生成图检测）
 
@@ -369,6 +393,19 @@ fake_ip_ranges = ["198.18.0.0/15"]
 | `db_policy_invert` | false | 反转名单含义 |
 
 名单可以填群号，也可以填会话 ID，插件会自动把群号映射成会话 ID。收紧后冷门插画命中率会略降。详见上文 SauceNAO 一节。
+
+### Serper（`[serper]`）
+
+单独一节、单独开关，跟 `[lens]` 那几把 SerpAPI key 完全分开——两家公司的 key 长度都不一样，混填只会互相 401。
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `enabled` | true | 总开关。key 留空即自然不参与，不必特意关 |
+| `keys` | 空 | Serper 的 40 位 key，可填多个轮询 |
+| `lens_fallback` | true | SerpAPI 全部不可用时，让 Lens 改用 Serper 顶上（一次扣 3 次额度） |
+| `upload` | true | 允许把图传到 uguu.se 换直链；关掉等于 Serper 不碰 Lens，网页检索不受影响 |
+
+网页检索（按名字搜 X、按 `id=` 的名字查各平台）永远先走 SerpAPI，它那边全都不可用才轮到 Serper；两家都是 Google 后端，结果一样，所以只要有一家跑通就收工，返回空也认，不会拿另一家再花一次额度。
 
 ### 视觉复核（`[vision]`）
 

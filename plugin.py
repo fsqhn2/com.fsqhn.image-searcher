@@ -181,17 +181,58 @@ class LensConfig(EngineConfig):
         ge=0,
         le=10,
     )
-    serper_upload: bool = Field(
+
+
+class SerperConfig(PluginConfigBase):
+    """Serper（google.serper.dev）：跟 SerpAPI 是两家，key 不通用，单独配、单独开关。
+
+    它有两个用途：网页检索（按名字搜 X、按 id= 的名字查各平台）和给 Lens 当替补。
+    网页检索一次扣 1 次额度，Lens 一次扣 3 次还得先把图传到公网图床，所以两个用途
+    各留一个开关。额度是预付总量、用完不按月刷新，省着点用。
+    """
+
+    __ui_label__ = "Serper（另一家的 key，可选）"
+    __ui_order__ = 9
+
+    enabled: bool = Field(
         default=True,
         description=(
-            "Lens 的 key 池里可以混放 Serper 的 key（40 位，按次扣预付额度）。Serper "
-            "的 Lens 不收图片字节、只收公网链接，轮到它时得先把图传到 uguu.se 换一个"
-            "三小时左右失效的直链。关掉的话 Serper 的 key 只能用于网页检索。"
+            "Serper 的总开关。key 留空时它自然不参与，不必特意关；真不想用再关掉。"
+            "关掉后既不参与网页检索，也不给 Lens 当替补。"
+        ),
+        json_schema_extra=_ui("启用 Serper", "填了 key 就生效；不想用把这个关掉。"),
+    )
+    keys: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Serper 的 API Key，40 位十六进制，跟 SerpAPI 的 64 位 key 不是一回事，"
+            "别填进 Lens 那一栏。可填多个轮询。"
         ),
         json_schema_extra=_ui(
-            "Serper 走图床（Lens 替补）",
-            "默认开。SerpAPI 那几把 key 都用完时，Lens 会换 Serper 顶上；这一路会把图"
-            "传到 uguu.se（公开、几小时后失效），一次扣 3 次 Serper 额度。",
+            "Serper API Key",
+            "40 位十六进制。拿 SerpAPI 的 key 填这里会一直报 401。",
+        ),
+    )
+    lens_fallback: bool = Field(
+        default=True,
+        description=(
+            "SerpAPI 那几把 key 都用完或全部冷却时，让 Lens 改用 Serper 顶上。"
+            "一次扣 3 次 Serper 额度，还要先把图传到公网图床，比 SerpAPI 慢几秒。"
+        ),
+        json_schema_extra=_ui(
+            "允许 Serper 替补 Lens",
+            "默认开。只有 SerpAPI 全部不可用时才会轮到它。",
+        ),
+    )
+    upload: bool = Field(
+        default=True,
+        description=(
+            "Serper 的 Lens 不收图片字节、只收公网链接，走它时必须先把图传到 uguu.se "
+            "换一个几小时后失效的直链。关掉等于不让 Serper 碰 Lens，网页检索不受影响。"
+        ),
+        json_schema_extra=_ui(
+            "允许上传图片到图床",
+            "默认开。图片会传到 uguu.se（公开、几小时后失效），只在上面的替补开关生效时才发生。",
         ),
     )
 
@@ -845,6 +886,7 @@ class ImageSearcherConfig(PluginConfigBase):
     yandex: YandexConfig = Field(default_factory=YandexConfig)
     baidu: BaiduConfig = Field(default_factory=BaiduConfig)
     saucenao: SauceNaoConfig = Field(default_factory=SauceNaoConfig)
+    serper: SerperConfig = Field(default_factory=SerperConfig)
     vision: VisionConfig = Field(default_factory=VisionConfig)
     grok: GrokConfig = Field(default_factory=GrokConfig)
     ai_detect: AiDetectConfig = Field(default_factory=AiDetectConfig)
@@ -1171,6 +1213,15 @@ class ImageSearcherPlugin(MaiBotPlugin):
             "saucenao": KeyPool(config.saucenao.keys),
             "ai": KeyPool(config.ai_detect.keys),
         }
+        # Serper 单独一个池：它跟 SerpAPI 不是一家，key 也不通用，别混进 lens 池。
+        # 总开关关掉或者没填 key，这个池就不存在，后面各处自然跳过它。
+        serper_keys = list(config.serper.keys) if config.serper.enabled else []
+        if serper_keys:
+            self._pools["serper"] = KeyPool(serper_keys)
+        # Lens 只在「允许替补」且「允许上传图床」时才把 Serper 那把挂上去。
+        lens_serper_pool = self._pools.get("serper") if config.serper.lens_fallback else None
+        if lens_serper_pool is not None and not config.serper.upload:
+            lens_serper_pool = None
         self._engines = {
             "lens": LensEngine(
                 self._pools["lens"],
@@ -1178,7 +1229,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 section.engine_timeout,
                 config.lens.retries,
                 config.lens.retry_delay,
-                serper_upload=bool(getattr(config.lens, "serper_upload", True)),
+                serper_pool=lens_serper_pool,
             ),
             "yandex": YandexEngine(global_proxy, section.engine_timeout),
             "baidu": BaiduEngine(global_proxy, section.engine_timeout),
@@ -4453,34 +4504,47 @@ class ImageSearcherPlugin(MaiBotPlugin):
         return info
 
     async def _search_x_handles(self, name: str) -> list[str]:
-        """昵称 → 疑似 X 号，借用 Lens 那套 SerpAPI key 跑一次网页检索。"""
-        pool = self._pools.get("lens")
-        if not pool:
-            self._vlog("按名字搜 X：没有可用的 SerpAPI key，跳过")
-            return []
+        """昵称 → 疑似 X 号，跑一次网页检索。
 
+        先用 SerpAPI 那几把 key（lens 池）；它那边全都不可用时，如果 Serper 配了
+        key 就换 Serper 顶上。两家都是 Google 后端，搜到的结果一样，所以只要有一家
+        跑通就收工——返回空也认，不拿另一家再花一次额度。
+        """
         found: list[str] = []
-        for _ in range(2):
-            key = pool.acquire()
-            if not key:
-                return []
+        for pool_name in ("lens", "serper"):
+            pool = self._pools.get(pool_name)
+            if not pool:
+                continue
+            ran = False
+            for _ in range(2):
+                key = pool.acquire()
+                if not key:
+                    break
 
-            def fetch(api_key: str = key) -> list[str]:
-                return identity.search_x_handles(name, api_key, self._proxy())
+                def fetch(api_key: str = key) -> list[str]:
+                    return identity.search_x_handles(name, api_key, self._proxy())
 
-            try:
-                found = await asyncio.wait_for(asyncio.to_thread(fetch), timeout=40)
-            except Exception as error:  # noqa: BLE001 - 搜不到就当没有这一步
-                text = str(error)
-                if "429" in text or "401" in text or "403" in text:
-                    # 一个 key 的月额度用完就换下一个，不然这一步天天静默失败。
-                    pool.mark_failure(key, 3600 if "429" in text else None)
-                    self._vlog("按名字搜 X：key 额度不可用（%s），换下一个", text[:40])
-                    continue
-                self._vlog("按名字搜 X 失败：%s", text[:80])
-                return []
-            pool.mark_success(key)
-            break
+                try:
+                    found = await asyncio.wait_for(asyncio.to_thread(fetch), timeout=40)
+                except Exception as error:  # noqa: BLE001 - 搜不到就当没有这一步
+                    text = str(error)
+                    if "429" in text or "401" in text or "403" in text:
+                        # 一个 key 的额度用完就换下一个，不然这一步天天静默失败。
+                        pool.mark_failure(key, 3600 if "429" in text else None)
+                        self._vlog(
+                            "按名字搜 X（%s）：key 额度不可用（%s），换下一个",
+                            pool_name,
+                            text[:40],
+                        )
+                        continue
+                    self._vlog("按名字搜 X（%s）失败：%s", pool_name, text[:80])
+                    found = []
+                    break
+                pool.mark_success(key)
+                ran = True
+                break
+            if ran:
+                break
         self._vlog("按名字搜 X：%s → %s", name, "、".join(found) or "没给出号")
         return found
 
@@ -4758,14 +4822,13 @@ class ImageSearcherPlugin(MaiBotPlugin):
         wanted = [str(name or "").strip() for name in names if str(name or "").strip()]
         if not upload or not wanted:
             return None
-        pool = self._pools.get("lens")
-        if not pool:
-            self._vlog("按 id= 的名字查各平台：没有可用的 SerpAPI key，跳过")
+        if not self._pools.get("lens") and not self._pools.get("serper"):
+            self._vlog("按 id= 的名字查各平台：没有可用的网页检索 key，跳过")
             return None
         profiles: list[dict[str, str]] = []
         used = ""
         for name in wanted:
-            rows = await self._search_profiles_with_rotation(pool, name)
+            rows = await self._search_profiles_with_rotation(name)
             if rows:
                 profiles = rows
                 used = name
@@ -4817,35 +4880,41 @@ class ImageSearcherPlugin(MaiBotPlugin):
             return result
         return result
 
-    async def _search_profiles_with_rotation(
-        self, pool: Any, name: str
-    ) -> list[dict[str, str]]:
-        """一次网页检索，key 用完了就换下一个。
+    async def _search_profiles_with_rotation(self, name: str) -> list[dict[str, str]]:
+        """一次网页检索，key 用完了就换下一个；SerpAPI 全不可用时换 Serper。
 
-        现网两个 key，其中一个月额度已经用完（实测同一个名字一个回 429、另一个
-        正常）。不换 key 的话这一步会天天静默失败，看着就跟没这功能一样。
+        现网三把 SerpAPI key，其中一把月额度已经用完（实测同一个名字一个回 429、
+        另一个正常）。不换 key 的话这一步会天天静默失败，看着就跟没这功能一样。
         """
-        for _ in range(2):
-            key = pool.acquire()
-            if not key:
-                return []
+        for pool_name in ("lens", "serper"):
+            pool = self._pools.get(pool_name)
+            if not pool:
+                continue
+            for _ in range(2):
+                key = pool.acquire()
+                if not key:
+                    break
 
-            def fetch(api_key: str = key) -> list[dict[str, str]]:
-                return identity.search_profiles(name, api_key, self._proxy(), fallback=False)
+                def fetch(api_key: str = key) -> list[dict[str, str]]:
+                    return identity.search_profiles(name, api_key, self._proxy(), fallback=False)
 
-            try:
-                rows = await asyncio.wait_for(asyncio.to_thread(fetch), timeout=40)
-            except Exception as error:  # noqa: BLE001 - 查不到就当没这一步
-                text = str(error)
-                if "429" in text or "401" in text or "403" in text:
-                    # 额度用完的 key 冷却久一点，别每单都拿它试一次。
-                    pool.mark_failure(key, 3600 if "429" in text else None)
-                    self._vlog("按 id= 的名字查各平台：key 额度不可用（%s），换下一个", text[:40])
-                    continue
-                self._vlog("按 id= 的名字查各平台失败：%s", text[:80])
-                return []
-            pool.mark_success(key)
-            return rows
+                try:
+                    rows = await asyncio.wait_for(asyncio.to_thread(fetch), timeout=40)
+                except Exception as error:  # noqa: BLE001 - 查不到就当没这一步
+                    text = str(error)
+                    if "429" in text or "401" in text or "403" in text:
+                        # 额度用完的 key 冷却久一点，别每单都拿它试一次。
+                        pool.mark_failure(key, 3600 if "429" in text else None)
+                        self._vlog(
+                            "按 id= 的名字查各平台（%s）：key 额度不可用（%s），换下一个",
+                            pool_name,
+                            text[:40],
+                        )
+                        continue
+                    self._vlog("按 id= 的名字查各平台（%s）失败：%s", pool_name, text[:80])
+                    return []
+                pool.mark_success(key)
+                return rows
         return []
 
     def _promote_id_name(self, best: Candidate | None, info: dict[str, Any]) -> Candidate | None:

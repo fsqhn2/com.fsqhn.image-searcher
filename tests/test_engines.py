@@ -373,6 +373,41 @@ class SerperLensTest(unittest.TestCase):
             self.assertEqual(engines.host_image_publicly(b"x"), "")
 
 
+class LensSerperFallbackTest(unittest.TestCase):
+    """Serper 是独立的一池：SerpAPI 还能用就绝不轮到它。"""
+
+    def test_prefers_serpapi_and_leaves_serper_untouched(self) -> None:
+        from core.engines import LensEngine
+        from core.keypool import KeyPool
+
+        serper = KeyPool(["a" * 40])
+        engine = LensEngine(KeyPool(["serpapi-key"]), serper_pool=serper)
+        key, pool = engine._pick_key()
+        self.assertEqual(key, "serpapi-key")
+        self.assertIs(pool, engine.pool)
+        # 主池抽中时不能把 Serper 那把也消耗掉
+        self.assertEqual(serper.available_count(), 1)
+
+    def test_falls_back_only_when_serpapi_all_cooling(self) -> None:
+        from core.engines import LensEngine
+        from core.keypool import KeyPool
+
+        engine = LensEngine(KeyPool(["serpapi-key"]), serper_pool=KeyPool(["a" * 40]))
+        engine.pool.mark_failure("serpapi-key", 3600)
+        key, pool = engine._pick_key()
+        self.assertEqual(key, "a" * 40)
+        self.assertIs(pool, engine.serper_pool)
+
+    def test_no_fallback_when_not_configured(self) -> None:
+        from core.engines import LensEngine
+        from core.keypool import KeyPool
+
+        engine = LensEngine(KeyPool(["serpapi-key"]), serper_pool=None)
+        engine.pool.mark_failure("serpapi-key", 3600)
+        key, _ = engine._pick_key()
+        self.assertEqual(key, "")
+
+
 class LensRetryTest(unittest.TestCase):
     """Lens 对同一张图会随机返回 0 条，空返回必须重试，有结果就立刻停。"""
 

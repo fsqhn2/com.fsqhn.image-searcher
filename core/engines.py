@@ -241,14 +241,26 @@ class LensEngine:
         timeout: float = 40.0,
         retries: int = 2,
         retry_delay: float = 1.5,
-        serper_upload: bool = True,
+        serper_pool: KeyPool | None = None,
     ) -> None:
         self.pool = pool
+        # Serper 是一把独立的池：只有 SerpAPI 那边全不可用时才轮到它，不参与轮询。
+        self.serper_pool = serper_pool
         self.proxy = proxy
         self.timeout = timeout
         self.retries = max(0, int(retries))
         self.retry_delay = max(0.0, float(retry_delay))
-        self.serper_upload = bool(serper_upload)
+
+    def _pick_key(self) -> tuple[str, KeyPool]:
+        """先拿 SerpAPI 的 key，它那边一个都拿不到才用 Serper 顶。"""
+        key = self.pool.acquire()
+        if key:
+            return key, self.pool
+        if self.serper_pool is not None:
+            key = self.serper_pool.acquire()
+            if key:
+                return key, self.serper_pool
+        return "", self.pool
 
     def search(self, raw: bytes, image_url: str = "", stream_id: str = "") -> list[Candidate]:
         """空返回或上传失败时换一次上传重试。
@@ -275,11 +287,11 @@ class LensEngine:
         return items
 
     def _search_once(self, raw: bytes, image_url: str = "") -> list[Candidate]:
-        key = self.pool.acquire()
+        key, pool = self._pick_key()
         if not key:
             raise EngineError("没有可用的检索 key（未配置或全部冷却）")
         if is_serper_key(key):
-            return self._search_serper(key, raw, image_url)
+            return self._search_serper(key, raw, image_url, pool)
 
         session = make_session(self.proxy)
         try:
@@ -294,23 +306,23 @@ class LensEngine:
 
             resp = session.get(SERP_ENDPOINT, params=params, timeout=_timeout(self.timeout))
             if is_auth_failure(resp.status_code):
-                self.pool.mark_failure(key)
+                pool.mark_failure(key)
                 raise EngineError(f"SerpAPI 返回 HTTP {resp.status_code}")
             data = json_or_raise(resp, "SerpAPI")
             if data.get("error"):
                 message = str(data["error"])[:160]
                 if any(token in message.lower() for token in ("key", "quota", "plan", "limit")):
-                    self.pool.mark_failure(key)
+                    pool.mark_failure(key)
                 raise EngineError(message)
         except EngineError:
             raise
         except Exception as exc:  # noqa: BLE001
-            self.pool.mark_failure(key, cooldown_seconds=60)
+            pool.mark_failure(key, cooldown_seconds=60)
             raise EngineError(f"{type(exc).__name__}: {str(exc)[:160]}") from exc
         finally:
             session.close()
 
-        self.pool.mark_success(key)
+        pool.mark_success(key)
         items: list[Candidate] = []
         for group in ("visual_matches", "exact_matches"):
             for match in data.get(group) or []:
@@ -349,16 +361,22 @@ class LensEngine:
         except Exception:  # noqa: BLE001 - 上传失败就回退到按链接搜索
             return ""
 
-    def _search_serper(self, key: str, raw: bytes, image_url: str = "") -> list[Candidate]:
+    def _search_serper(
+        self,
+        key: str,
+        raw: bytes,
+        image_url: str = "",
+        pool: KeyPool | None = None,
+    ) -> list[Candidate]:
         """Serper 的 Lens：只收公网图片链接，自己先换一个直链再搜。
 
         一次调用扣 3 次额度（SerpAPI 是 1 次），所以它只当替补用——轮到它说明
-        SerpAPI 那几把 key 都已经没了或全在冷却。
+        SerpAPI 那几把 key 都已经没了或全在冷却。上传图床的开关在配置层控制：
+        ``serper.upload`` 关掉时根本不会把这个池挂到引擎上。
         """
+        target = pool if pool is not None else self.pool
         link = str(image_url or "").strip()
         if not link.startswith("http"):
-            if not self.serper_upload:
-                raise EngineError("Serper Lens 只收公网图片链接，图床开关关着，跳过")
             link = host_image_publicly(raw, self.proxy, self.timeout)
             if not link:
                 raise EngineError("Serper Lens 需要公网图片链接，图床没换成")
@@ -371,7 +389,7 @@ class LensEngine:
                 timeout=_timeout(self.timeout),
             )
             if is_auth_failure(resp.status_code):
-                self.pool.mark_failure(key)
+                target.mark_failure(key)
                 raise EngineError(f"Serper Lens 返回 HTTP {resp.status_code}")
             if resp.status_code >= 400:
                 # 400 多半是链接被拒（图床临时抽风），不是 key 的问题，别冷却。
@@ -381,11 +399,11 @@ class LensEngine:
         except EngineError:
             raise
         except Exception as exc:  # noqa: BLE001
-            self.pool.mark_failure(key, cooldown_seconds=60)
+            target.mark_failure(key, cooldown_seconds=60)
             raise EngineError(f"{type(exc).__name__}: {str(exc)[:160]}") from exc
         finally:
             session.close()
-        self.pool.mark_success(key)
+        target.mark_success(key)
         return serper_lens_candidates(data, engine=self.name)
 
 

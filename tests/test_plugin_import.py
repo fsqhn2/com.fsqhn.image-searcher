@@ -41,6 +41,20 @@ class PluginImportTest(unittest.TestCase):
         module = import_plugin()
         self.assertEqual(module.SauceNaoConfig().min_similarity, 75)
 
+    def test_serper_is_its_own_section(self) -> None:
+        """Serper 单独一节、单独开关，key 不跟 SerpAPI 混在一起。
+
+        两家的 key 长度都不一样（Serper 40 位、SerpAPI 64 位），混进 Lens 那一栏
+        会互相报 401；额度算法也不同，Serper 是预付总量、用完不按月刷新。
+        """
+        module = import_plugin()
+        config = module.SerperConfig()
+        self.assertTrue(config.enabled)
+        self.assertTrue(config.lens_fallback)
+        self.assertTrue(config.upload)
+        self.assertEqual(config.keys, [])
+        self.assertIn("serper", module.ImageSearcherConfig.model_fields)
+
     def test_watermark_reread_defaults_on(self) -> None:
         """「原图再读一次水印」是独立开关，默认开。
 

@@ -146,6 +146,20 @@ db_full_groups = []
 # 想反过来就把这个设成 true：名单上的群走收紧，其他群走全量。
 db_policy_invert = false
 
+[serper]
+# Serper：跟 SerpAPI 是两家公司，key 不通用，所以单独一节、单独开关。
+# 它干两件事：① 网页检索（按名字搜 X、按 id= 的名字查各平台）；② SerpAPI 额度用完时
+# 给 Lens 当替补。注册：https://serper.dev ，key 是 40 位十六进制。
+# 额度是预付总量（充值多少用多少，不按月刷新），网页检索 1 次扣 1 次，Lens 1 次扣 3 次。
+# 注意：免费档不接受带引号的组合查询和 site: 写法（回 400），插件已经按它的规矩改写了查询串。
+enabled = true
+keys = []
+# SerpAPI 那几把 key 都用完/全部冷却时，让 Lens 改用 Serper。一次 3 次额度。
+lens_fallback = true
+# Serper 的 Lens 只收公网图片链接，走它时必须先把图传到 uguu.se 换直链。
+# 关掉等于不让 Serper 碰 Lens，网页检索不受影响。
+upload = true
+
 [vision]
 # 视觉复核：指纹一条都没通过时，把目标图和最接近的候选拼成一张对照图，交给
 # MaiBot 的视觉模型判断有没有「同一个人」。只找同一个人，不要求同一张图，
