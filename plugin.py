@@ -397,6 +397,20 @@ class VisionConfig(PluginConfigBase):
             "关掉就只读整图。",
         ),
     )
+    deep_trace: bool = Field(
+        default=True,
+        description=(
+            "追查模式：原图读不出水印时，去读搜到的候选图。搬运链里水印常常只留在"
+            "转载的那张图上——群里发的原图是干净的，reddit 那张手机边却写着账号；"
+            "同一套图的不同张，光读原图永远读不到。读到账号照旧核它自己的带图帖，"
+            "核不上就当线索，不会因此改结论。"
+        ),
+        json_schema_extra=_ui(
+            "追查模式（读候选图的水印）",
+            "默认开。命中搬运页时先读候选图、再读原图；每单最多三张候选图、"
+            "总调用封顶 12 次。关掉就只读用户发的那张图。",
+        ),
+    )
     signature_hunt: bool = Field(
         default=True,
         description=(
@@ -1837,7 +1851,13 @@ class ImageSearcherPlugin(MaiBotPlugin):
                             "sources": [],
                             "watermark": "",
                         }
-                    await self._reread_watermark(vision_info, grok_info, upload)
+                    await self._reread_watermark(
+                        vision_info,
+                        grok_info,
+                        upload,
+                        ordered,
+                        prefer_candidates=had_best,
+                    )
                 if not had_best and vision_info and vision_info.get("picked"):
                     ordered = dedupe_accounts(self._rank(candidates, names))
                     # 模型可能一次报好几格，取指纹距离最近的那条当结论——距离近说明
@@ -3334,64 +3354,144 @@ class ImageSearcherPlugin(MaiBotPlugin):
         vision_info: dict[str, Any],
         grok_info: dict[str, Any] | None,
         upload: bytes | None,
+        ordered: list[Candidate] | None = None,
+        *,
+        prefer_candidates: bool = False,
     ) -> None:
-        """整图读不出水印时再读一次，还读不出就切成分块逐块读。
+        """原图读不出水印时，换看法、再换图各找一遍。
 
-        ac88 那单的水印是 4×4 拼图读的（TARGET 格只有 320px），把 ``Moliww``
-        读成了 ``Miharu``；同一张图按原图读就清楚得多。
+        三道，读到账号就停：
+        1. 整图读——命中搬运页时先读候选图，那才是水印通常所在的那张；
+        2. 切块读——一行小字在整幅画面里占比太小，切成六块它就大了一个数量级；
+        3. 换图读——水印常常只留在转载链的那张图上，用户发来的原图是干净的。
 
-        整图也读不出来时（s-20261112-0752-4fdf：手机边写着 @kuru_xox，整图回
-        「无」）再切块：那行字在整幅画面里占比太小，模型注意力落不到它身上，切成
-        六块之后同一行字大了一个数量级。一块一块发，读到账号就停。
+        s-20261112-0752-4fdf 正是第 3 道：群里发的原图没水印，reddit 转载的那张
+        手机边写着 @kuru_xox，同一套图的不同张，光读原图永远读不到。所以命中
+        搬运页时先读候选图，兜底顺序反过来。
         """
         if not upload or not bool(getattr(self.config.vision, "enabled", True)):
             return
+        section = self.config.vision
         readings = list(vision_info.get("watermark_readings") or [])
         known = {
             str(item.get("handle") or "").lower() for item in readings if isinstance(item, dict)
         }
+        tiles_on = bool(getattr(section, "watermark_tiles", True))
+        trace_on = bool(getattr(section, "deep_trace", True))
+        candidates = self._watermark_candidates(ordered) if trace_on else []
+        calls = 0
 
-        if await self._reread_one(
-            vision_info, readings, known, upload, data_url="", label=""
-        ):
-            return
-        if not bool(getattr(self.config.vision, "watermark_tiles", True)):
-            return
-        try:
-            tiles = await asyncio.to_thread(vision.tile_data_urls, upload)
-        except Exception as error:  # noqa: BLE001 - 切块失败只是少一道兜底
-            self.ctx.logger.warning("原图切块失败：%s", error)
-            return
-        if not tiles:
-            return
-        self._vlog("整图没读出可用水印，改分块读：共 %s 块", len(tiles))
-        for label, data_url in tiles[: self._WATERMARK_TILE_LIMIT]:
-            if await self._reread_one(
-                vision_info, readings, known, upload, data_url=data_url, label=label
-            ):
-                self._vlog("分块读在第 %s 块命中原作者，剩下的块不再读", label)
+        async def read(source: bytes, label: str, data_url: str = "") -> bool:
+            nonlocal calls
+            if calls >= self._WATERMARK_REREAD_BUDGET:
+                return False
+            calls += 1
+            return await self._reread_one(
+                vision_info,
+                readings,
+                known,
+                source,
+                data_url=data_url,
+                label=label,
+                verify=upload,
+            )
+
+        async def read_tiles(source: bytes, prefix: str) -> bool:
+            nonlocal calls
+            if calls >= self._WATERMARK_REREAD_BUDGET:
+                return False
+            try:
+                tiles = await asyncio.to_thread(vision.tile_data_urls, source)
+            except Exception as error:  # noqa: BLE001 - 切块失败只是少一道兜底
+                self.ctx.logger.warning("%s 切块失败：%s", prefix, error)
+                return False
+            for label, data_url in tiles[: self._WATERMARK_TILE_LIMIT]:
+                if await read(source, f"{prefix}-{label}", data_url=data_url):
+                    self._vlog("分块读在 %s-%s 命中，剩下的块不再读", prefix, label)
+                    return True
+            return False
+
+        loaded: list[tuple[str, bytes]] = []
+        for index, item in enumerate(candidates):
+            raw = await self._download(item.image_url)
+            if raw:
+                loaded.append((f"候选{index + 1}", raw))
+        if loaded:
+            self._vlog(
+                "追查模式：候选图备好 %s 张（%s），距离 %s",
+                len(loaded),
+                "、".join(label for label, _ in loaded),
+                "、".join(str(item.distance) for item in candidates[: len(loaded)]),
+            )
+
+        if prefer_candidates and loaded:
+            # 命中搬运页：水印几乎只在转载的那张图上，先读它，别把额度花在原图。
+            for label, raw in loaded:
+                if await read(raw, label):
+                    return
+            if tiles_on and await read_tiles(loaded[0][1], loaded[0][0]):
                 return
+            if await read(upload, ""):
+                return
+            if tiles_on and await read_tiles(upload, "原图"):
+                return
+            return
+
+        if await read(upload, ""):
+            return
+        if tiles_on and await read_tiles(upload, "原图"):
+            return
+        for label, raw in loaded:
+            if await read(raw, label):
+                return
+        if tiles_on and loaded and await read_tiles(loaded[0][1], loaded[0][0]):
+            return
 
     # 分块最多读这么多块。2×3 正好六块，再多就说明前面几块都没戏，继续读只是烧额度。
     _WATERMARK_TILE_LIMIT = 6
+
+    # 追查模式最多读几张候选图。候选图算指纹时都下载过，重取一张不贵，但视觉调用
+    # 一次两三秒，三张够了——真带水印的那张通常就是距离最近的那条。
+    _CANDIDATE_WATERMARK_LIMIT = 3
+
+    # 这一轮兜底最多花多少次视觉调用。三张候选图 + 整图 + 六块，正好一轮；超了
+    # 就按顺序砍掉后面的，兜底不能把整单拖成几分钟。
+    _WATERMARK_REREAD_BUDGET = 12
+
+    @classmethod
+    def _watermark_candidates(cls, ordered: list[Candidate] | None) -> list[Candidate]:
+        """挑出值得读水印的候选图：按指纹距离排，越像越先读。"""
+        rows = [
+            item
+            for item in (ordered or [])
+            if (item.image_url or "").strip()
+            and item.status in {"match", "suspect", "vision"}
+        ]
+        rows.sort(
+            key=lambda item: (item.distance if item.distance is not None else 999, item.rank)
+        )
+        return rows[: cls._CANDIDATE_WATERMARK_LIMIT]
 
     async def _reread_one(
         self,
         vision_info: dict[str, Any],
         readings: list[dict[str, Any]],
         known: set[str],
-        upload: bytes | None,
+        source: bytes | None,
         *,
         data_url: str,
         label: str,
+        verify: bytes | None = None,
     ) -> bool:
         """读一次（整图或某一块），读到没见过的号就核它自己的带图帖。
 
-        返回 True 表示这个号自己的帖子里真有这张图——整条分块循环就此收工。
+        ``source`` 是要读的那张图，``verify`` 是拿来比指纹的原图——候选图上的
+        水印要拿用户发的那张去核，才算「她发过跟你这张一样的图」。
+        返回 True 表示这个号自己的帖子里真有这张图，整条兜底就此收工。
         """
         where = f"[{label}]" if label else ""
         try:
-            info = await self._read_watermark(upload, data_url=data_url, label=label)
+            info = await self._read_watermark(source, data_url=data_url, label=label)
         except Exception as error:  # noqa: BLE001 - 重读只是加分项
             self.ctx.logger.warning("重读水印失败%s：%s", where, error)
             return False
@@ -3408,11 +3508,11 @@ class ImageSearcherPlugin(MaiBotPlugin):
             return False
         reading = await self._verify_watermark_reading(
             {
-                "source": f"vision-tile-{label}" if label else "vision-original",
+                "source": f"vision-{label}" if label else "vision-original",
                 "raw": raw,
                 "handle": handle,
             },
-            upload,
+            verify if verify is not None else source,
             True,
         )
         readings.append(reading)

@@ -148,6 +148,66 @@ class PluginImportTest(unittest.TestCase):
             )
         )
 
+    def test_deep_trace_defaults_on(self) -> None:
+        """追查模式（读候选图的水印）是独立开关，默认开。"""
+        module = import_plugin()
+        self.assertTrue(module.VisionConfig().deep_trace)
+
+    def test_watermark_candidates_prefers_closest_images(self) -> None:
+        """按指纹距离挑候选图：判死的、没图链的都不读，越像越先读。
+
+        s-20261112-0752-4fdf：原图没水印，reddit 那张同套图有，得先读它。
+        """
+        module = import_plugin()
+        candidate = module.Candidate
+        rows = [
+            candidate(
+                engine="lens",
+                url="https://example.com/1",
+                image_url="https://img/1.jpg",
+                status="mismatch",
+                distance=0,
+            ),
+            candidate(
+                engine="lens",
+                url="https://example.com/2",
+                image_url="",
+                status="match",
+                distance=2,
+            ),
+            candidate(
+                engine="yandex",
+                url="https://example.com/3",
+                image_url="https://img/3.jpg",
+                status="match",
+                distance=5,
+            ),
+            candidate(
+                engine="yandex",
+                url="https://example.com/4",
+                image_url="https://img/4.jpg",
+                status="suspect",
+                distance=1,
+            ),
+            candidate(
+                engine="lens",
+                url="https://example.com/5",
+                image_url="https://img/5.jpg",
+                status="suspect",
+                distance=40,
+            ),
+        ]
+        picked = module.ImageSearcherPlugin._watermark_candidates(rows)
+        self.assertEqual(
+            [item.image_url for item in picked],
+            ["https://img/4.jpg", "https://img/3.jpg", "https://img/5.jpg"],
+        )
+
+    def test_watermark_candidates_without_ordered(self) -> None:
+        module = import_plugin()
+        self.assertEqual(module.ImageSearcherPlugin._watermark_candidates(None), [])
+        self.assertEqual(module.ImageSearcherPlugin._watermark_candidates([]), [])
+
     def test_pick_best_skips_dead_site(self) -> None:
         """半次元已关站，落在那上面的候选不能当结论（s-20261111-1403-e15a）。"""
         module = import_plugin()
