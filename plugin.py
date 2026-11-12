@@ -2060,7 +2060,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
             )
         ):
             try:
-                signature_author = await self._hunt_signature_author(ordered, upload)
+                signature_author = await self._hunt_signature_author(
+                    ordered, upload, hints=self._watermark_hints(vision_info)
+                )
             except Exception as error:  # noqa: BLE001 - 反查不到不影响已经命中的那条
                 self.ctx.logger.warning("标题署名反查失败：%s", error)
                 signature_author = None
@@ -4681,12 +4683,13 @@ class ImageSearcherPlugin(MaiBotPlugin):
             )
         return info
 
-    async def _search_x_handles(self, name: str) -> list[str]:
+    async def _search_x_handles(self, name: str, limit: int = 3) -> list[str]:
         """昵称 → 疑似 X 号，跑一次网页检索。
 
         先用 SerpAPI 那几把 key（lens 池）；它那边全都不可用时，如果 Serper 配了
         key 就换 Serper 顶上。两家都是 Google 后端，搜到的结果一样，所以只要有一家
-        跑通就收工——返回空也认，不拿另一家再花一次额度。
+        跑通就收工——返回空也认，不拿另一家再花一次额度。``limit`` 放宽之后，
+        handle 里带着这个名字的号会排在最前面（不再被同名的无关大号挤掉）。
         """
         found: list[str] = []
         for pool_name in ("lens", "serper"):
@@ -4700,7 +4703,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
                     break
 
                 def fetch(api_key: str = key) -> list[str]:
-                    return identity.search_x_handles(name, api_key, self._proxy())
+                    return identity.search_x_handles(
+                        name, api_key, self._proxy(), limit=limit, prefer=name
+                    )
 
                 try:
                     found = await asyncio.wait_for(asyncio.to_thread(fetch), timeout=40)
@@ -4823,9 +4828,31 @@ class ImageSearcherPlugin(MaiBotPlugin):
     # 下载比指纹，成本不低，而这些标题里真正写着作者名的通常只有一条。
     _SIGNATURE_NAME_LIMIT = 3
     _SIGNATURE_PROBE_LIMIT = 3
+    # 按名字搜 X 一次最多取几个候选：以前只取 3 个，7496 那单真号 `kuru_xox`
+    # 就被三个同名的无关大号挤掉了。放宽到 8，靠 handle 命中优先排序顶着，
+    # 真正翻帖的仍然只有 _SIGNATURE_PROBE_LIMIT 个，不额外多花时间。
+    _SIGNATURE_SEARCH_LIMIT = 8
+
+    @staticmethod
+    def _watermark_hints(vision_info: dict[str, Any] | None) -> list[str]:
+        """图上读出来的号，按读出顺序去重——给标题署名那条线做纠写法的锚点。"""
+        out: list[str] = []
+        for item in (vision_info or {}).get("watermark_readings") or []:
+            if not isinstance(item, dict):
+                continue
+            handle = str(item.get("handle") or "").strip().lstrip("@")
+            if handle and handle.lower() not in {value.lower() for value in out}:
+                out.append(handle)
+        primary = str((vision_info or {}).get("watermark_handle") or "").strip().lstrip("@")
+        if primary and primary.lower() not in {value.lower() for value in out}:
+            out.insert(0, primary)
+        return out
 
     async def _hunt_signature_author(
-        self, ordered: list[Candidate], upload: bytes | None
+        self,
+        ordered: list[Candidate],
+        upload: bytes | None,
+        hints: list[str] | None = None,
     ) -> dict[str, Any] | None:
         """顺着标题里的署名（``by XXX``、``coser: XXX``、``@XXX``）去 X 上找本人。
 
@@ -4833,6 +4860,10 @@ class ImageSearcherPlugin(MaiBotPlugin):
         插件原来只从候选 URL 里抽 handle：s-20261112-0752-4fdf 抽到 miya1st 和
         _ray_wing_ 两个都不对，而标题写着「Vivian cosplay by KURU」，KURU 完全没
         用上，于是停在 reddit 的转载页上。
+
+        ``hints`` 是图上读出来的号（水印）：它跟署名只差一个字母时（7496 的
+        ``kufu_xox`` 与 ``KURU``），直接按署名改写回来先试——比按名字重新搜一遍
+        准，也比盲改字母省事。
 
         找到号还不够：必须那个号自己的带图帖里真有这张图才算数，翻不到就当没有。
         """
@@ -4862,10 +4893,26 @@ class ImageSearcherPlugin(MaiBotPlugin):
         }
         probes = 0
         seen_note = ""
+        typed = [str(item or "").strip().lstrip("@") for item in (hints or []) if item]
         for name in names:
             if probes >= self._SIGNATURE_PROBE_LIMIT:
                 break
-            candidates = [item for item in await self._search_x_handles(name) if item]
+            # 署名优先：先拿水印号按署名纠一遍（kufu_xox → kuru_xox），再按名字搜。
+            corrected = [
+                fixed
+                for handle in typed
+                for fixed in handles.signature_fix(handle, [name])
+            ]
+            if corrected:
+                self._vlog(
+                    "署名纠写法：%s → %s",
+                    "、".join("@" + item for item in typed[:2]),
+                    "、".join("@" + item for item in corrected[:3]),
+                )
+            searched = await self._search_x_handles(
+                name, limit=self._SIGNATURE_SEARCH_LIMIT
+            )
+            candidates = corrected + [item for item in searched if item]
             # 署名本身也可能是 handle（标题里直接写 @kuru_xox 的那种）。
             candidates.append(name)
             tried: set[str] = set()

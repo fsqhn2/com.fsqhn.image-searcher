@@ -178,6 +178,24 @@ class TypoVariantTest(unittest.TestCase):
         self.assertEqual(handles.typo_variants("中文昵称"), [])
         self.assertEqual(handles.typo_variants(""), [])
 
+
+class SignatureFixTest(unittest.TestCase):
+    """标题署名能拿来回读错的号：7496 那单 kufu_xox 其实是 kuru_xox。"""
+
+    def test_one_letter_off(self) -> None:
+        self.assertEqual(handles.signature_fix("kufu_xox", ["KURU"]), ["kuru_xox"])
+
+    def test_works_when_name_has_extra_words(self) -> None:
+        self.assertEqual(handles.signature_fix("kufu_xox", ["クル / KURU"]), ["kuru_xox"])
+
+    def test_unrelated_name_changes_nothing(self) -> None:
+        self.assertEqual(handles.signature_fix("kufu_xox", ["Moliww"]), [])
+        self.assertEqual(handles.signature_fix("kufu_xox", ["AB"]), [])
+
+    def test_never_returns_the_same_handle(self) -> None:
+        self.assertNotIn("kufu_xox", handles.signature_fix("kufu_xox", ["kufu"]))
+        self.assertEqual(handles.signature_fix("ab", ["kuru"]), [])
+
     def test_limit_applies(self) -> None:
         self.assertLessEqual(len(handles.typo_variants("menruinyanko", limit=5)), 5)
 

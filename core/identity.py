@@ -162,15 +162,20 @@ def parse_weibo_profile(payload: Any) -> dict[str, Any] | None:
     }
 
 
-def handles_from_search(payload: Any, limit: int = 3) -> list[str]:
+def handles_from_search(payload: Any, limit: int = 3, prefer: str = "") -> list[str]:
     """从 SerpAPI 网页检索结果里挑 X 账号，按出现次数排序。
 
     只认标题、链接、摘要里出现的 ``x.com/<handle>``：Google 索引的 X 帖子标题
-    本身就带账号名（「某人 on X」），同一页里重复出现就是在说同一个号。出现次数
-    一样时保持原始顺序，让排在前面的结果优先。
+    本身就带账号名（「某人 on X」），同一页里重复出现就是在说同一个号。
+
+    ``prefer`` 是「这个名字」：handle 里含它的排在最前面。实测 s-20261112-1511-7496
+    搜 KURU，回来的是显示名正好叫 KURU 的三个无关号（helicopterfood 11.8 万粉、
+    kuruupdates、kuru8k），真号 ``kuru_xox`` 的显示名是「クル / KURU」，按出现
+    次数排根本进不了前三个。名字对得上号 handle 的，才更像本人。
     """
     if not isinstance(payload, dict):
         return []
+    core = re.sub(r"[^0-9a-z]+", "", (prefer or "").lower())
     blocks: list[str] = []
     for item in payload.get("organic_results") or []:
         if not isinstance(item, dict):
@@ -191,7 +196,23 @@ def handles_from_search(payload: Any, limit: int = 3) -> list[str]:
                 counts[handle] = 0
                 order.append(handle)
             counts[handle] += 1
-    order.sort(key=lambda item: -counts[item])
+
+    def rank(handle: str) -> tuple[int, int]:
+        # handle 里带着这个名字的排前面：名字整段开头（kuru_xox、kuru8k）最像本人，
+        # 只是含在词里（kuruupdates）次之，完全不含的垫底；同档再按出现次数。
+        low = handle.lower()
+        if core and len(core) >= 3:
+            if re.match(re.escape(core) + r"(?:[_.]|\d|$)", low):
+                hit = 2
+            elif core in low:
+                hit = 1
+            else:
+                hit = 0
+        else:
+            hit = 1
+        return (-hit, -counts[handle])
+
+    order.sort(key=rank)
     return order[: max(1, limit)]
 
 
@@ -274,17 +295,20 @@ def search_x_handles(
     proxy: str = "",
     timeout: float = 30.0,
     limit: int = 3,
+    prefer: str = "",
 ) -> list[str]:
     """昵称 → 疑似 X 账号（按检索结果里的出现次数排序）。
 
     用 Google 网页检索而不是 X 站内搜索：站内搜索只认帖文内容，昵称对不上号；
     网页检索的 X 帖子标题自带账号名，实测同一个号能在 9 条结果里反复出现。
+    ``prefer`` 传名字本身时，handle 里含着这个名字的排最前（见
+    :func:`handles_from_search`）。
     """
     name = (name or "").strip()
     if not name or not api_key:
         return []
     payload = web_search(name_query(name, "twitter", api_key), api_key, proxy, num=10, timeout=timeout)
-    return handles_from_search(payload, limit=limit)
+    return handles_from_search(payload, limit=limit, prefer=prefer or name)
 
 
 # 一条检索结果里能落地的平台主页。顺序就是展示优先级：X 排头，因为只有 X 能

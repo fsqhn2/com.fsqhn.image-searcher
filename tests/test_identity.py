@@ -84,6 +84,34 @@ class HandlesFromSearchTest(unittest.TestCase):
         self.assertEqual(identity.handles_from_search({}), [])
         self.assertEqual(identity.handles_from_search(None), [])
 
+    def test_prefers_handles_containing_the_name(self) -> None:
+        """7496 那单：显示名正好叫 KURU 的三个号挤在前面，真号 handle 才含着 kuru。"""
+        payload = {
+            "organic_results": [
+                {"title": "KURU on X", "link": "https://x.com/helicopterfood/status/1", "snippet": "KURU"},
+                {"title": "KURU on X", "link": "https://x.com/helicopterfood/status/2", "snippet": "KURU"},
+                {"title": "KURU on X", "link": "https://x.com/helicopterfood/status/3", "snippet": "KURU"},
+                {"title": "kuru updates on X", "link": "https://x.com/kuruupdates/status/4", "snippet": "kuru"},
+                {"title": "k on X", "link": "https://x.com/kuru8k/status/5", "snippet": "kuru"},
+                {"title": "クル / KURU on X", "link": "https://x.com/kuru_xox/status/6", "snippet": "クル"},
+            ]
+        }
+        found = identity.handles_from_search(payload, limit=4, prefer="KURU")
+        self.assertIn("kuru_xox", found)
+        # 名字整段开头的排在「只是含在里面」和「只有显示名像」的前面。
+        self.assertLess(found.index("kuru_xox"), found.index("kuruupdates"))
+        self.assertLess(found.index("kuruupdates"), found.index("helicopterfood"))
+
+    def test_without_prefer_keeps_count_order(self) -> None:
+        payload = {
+            "organic_results": [
+                {"title": "KURU on X", "link": "https://x.com/helicopterfood/status/1", "snippet": ""},
+                {"title": "KURU on X", "link": "https://x.com/helicopterfood/status/2", "snippet": ""},
+                {"title": "クル / KURU on X", "link": "https://x.com/kuru_xox/status/3", "snippet": ""},
+            ]
+        }
+        self.assertEqual(identity.handles_from_search(payload), ["helicopterfood", "kuru_xox"])
+
 
 class ProfilesFromSearchTest(unittest.TestCase):
     def test_picks_profiles_across_platforms(self) -> None:

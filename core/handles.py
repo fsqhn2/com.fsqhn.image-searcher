@@ -211,6 +211,37 @@ def typo_variants(handle: str, limit: int = 18) -> list[str]:
     return out[: max(1, limit)]
 
 
+def signature_fix(handle: str, names: list[str], limit: int = 4) -> list[str]:
+    """署名对得上、handle 只差一个字母时，把 handle 里那一段按署名改写。
+
+    实测 s-20261112-1511-7496：水印读成 ``kufu_xox``（r 被读成 f），X 上查无此号；
+    而同一条链上标题已经写着「Vivian cosplay by KURU」。拿 KURU 去套 ``kufu_xox``，
+    只有 f→r 这一处不同，改写回来就是 ``kuru_xox``——真号，距离 3 的那张图就是她的。
+
+    只认「同样长度、只差一个字母」这一种，改完还要由调用方去核它自己的带图帖，
+    核不到不会当成结论。
+    """
+    raw = (handle or "").strip().lstrip("@").lower()
+    if not _HANDLE_OK.fullmatch(raw):
+        return []
+    out: list[str] = []
+    for name in names:
+        core = re.sub(r"[^0-9a-z]+", "", str(name or "").lower())
+        if len(core) < 3 or len(core) > len(raw):
+            continue
+        for start in range(len(raw) - len(core) + 1):
+            window = raw[start : start + len(core)]
+            if window == core:
+                continue
+            # 等长、只差一个字母：Hamming 距离为 1。
+            if sum(1 for left, right in zip(window, core) if left != right) != 1:
+                continue
+            fixed = raw[:start] + core + raw[start + len(core) :]
+            if _HANDLE_OK.fullmatch(fixed) and fixed != raw and fixed not in out:
+                out.append(fixed)
+    return out[: max(1, limit)]
+
+
 def in_url_slug(name: str, urls: list[str]) -> bool:
     """这个名字是不是出现在候选 URL 里（搬运站的路径通常就是它认定的主人名）。
 

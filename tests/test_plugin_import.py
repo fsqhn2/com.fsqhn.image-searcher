@@ -566,6 +566,23 @@ class PluginImportTest(unittest.TestCase):
         self.assertTrue(hasattr(plugin_class, "_fanbox_track"))
         self.assertTrue(hasattr(plugin_class, "_hunt_teaser"))
 
+    def test_watermark_hints_dedupes_and_keeps_primary_first(self) -> None:
+        """7496：给标题署名那条线当锚点的，只该是图上真读出来的号。"""
+        module = import_plugin()
+        hints = module.ImageSearcherPlugin._watermark_hints(
+            {
+                "watermark_handle": "KUFU_xox",
+                "watermark_readings": [
+                    {"handle": "kufu_xox"},
+                    {"handle": ""},
+                    {"handle": "KUFU_xox"},
+                    {"handle": "kuru_xox"},
+                ],
+            }
+        )
+        self.assertEqual(hints, ["kufu_xox", "kuru_xox"])
+        self.assertEqual(module.ImageSearcherPlugin._watermark_hints(None), [])
+
 
 if __name__ == "__main__":
     unittest.main()
