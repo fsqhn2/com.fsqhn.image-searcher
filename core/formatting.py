@@ -962,6 +962,7 @@ ENGINE_LABELS = {
     "watermark": "图上水印核对",
     "identity": "按名字换到 X 核对",
     "repost_author": "搬运站转贴反查",
+    "author": "图上水印 + 标题署名",
 }
 
 

@@ -572,16 +572,65 @@ class PluginImportTest(unittest.TestCase):
         hints = module.ImageSearcherPlugin._watermark_hints(
             {
                 "watermark_handle": "KUFU_xox",
+                "watermark_state": "ok",
+                "watermark_user_id": "123",
                 "watermark_readings": [
-                    {"handle": "kufu_xox"},
+                    {"handle": "kufu_xox", "state": "ok", "user_id": "123"},
                     {"handle": ""},
-                    {"handle": "KUFU_xox"},
-                    {"handle": "kuru_xox"},
+                    {"handle": "KUFU_xox", "state": "ok"},
+                    {"handle": "kuru_xox", "state": "missing"},
                 ],
             }
         )
-        self.assertEqual(hints, ["kufu_xox", "kuru_xox"])
+        self.assertEqual([item["handle"] for item in hints], ["kufu_xox", "kuru_xox"])
+        self.assertEqual(hints[0]["state"], "ok")
+        self.assertEqual(hints[0]["user_id"], "123")
         self.assertEqual(module.ImageSearcherPlugin._watermark_hints(None), [])
+
+    def test_cross_author_takes_over_a_repost_page(self) -> None:
+        """1710/1713：认出是谁但没有帖子时，别停在搬运页，也别判成没找到。"""
+        module = import_plugin()
+
+        class Quiet:
+            def _vlog(self, *args, **kwargs) -> None:
+                return None
+
+        repost = module.Candidate(
+            engine="lens",
+            url="https://www.reddit.com/r/Seia/comments/1xgosaw/seia_cosplay_by_kuru",
+            platform="reddit.com",
+            name="Seia cosplay by KURU",
+            distance=1,
+            status="match",
+        )
+        promoted = module.ImageSearcherPlugin._promote_cross_author(
+            Quiet(), repost, {"handle": "kuru_xox", "name": "KURU", "x_name": "クル / KURU"}
+        )
+        self.assertIsNotNone(promoted)
+        self.assertEqual(promoted.engine, "author")
+        self.assertEqual(promoted.handle, "@kuru_xox")
+        self.assertEqual(promoted.status, "match")
+        self.assertIn("已经翻不到", promoted.note)
+
+    def test_cross_author_never_overrides_a_confirmed_post(self) -> None:
+        module = import_plugin()
+
+        class Quiet:
+            def _vlog(self, *args, **kwargs) -> None:
+                return None
+
+        solid = module.Candidate(
+            engine="lens",
+            url="https://x.com/myao_nyaa_/status/1",
+            platform="X (Twitter)",
+            handle="@myao_nyaa_",
+            distance=0,
+            status="match",
+        )
+        kept = module.ImageSearcherPlugin._promote_cross_author(
+            Quiet(), solid, {"handle": "kuru_xox", "name": "KURU"}
+        )
+        self.assertIs(kept, solid)
 
 
 if __name__ == "__main__":

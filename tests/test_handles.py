@@ -196,6 +196,28 @@ class SignatureFixTest(unittest.TestCase):
         self.assertNotIn("kufu_xox", handles.signature_fix("kufu_xox", ["kufu"]))
         self.assertEqual(handles.signature_fix("ab", ["kuru"]), [])
 
+
+class NameMatchesHandleTest(unittest.TestCase):
+    """署名跟水印号是不是同一个人：1710 那单是「图上 @kuru_xox + 标题 by KURU」。"""
+
+    def test_name_as_leading_segment(self) -> None:
+        self.assertTrue(handles.name_matches_handle("KURU", "kuru_xox"))
+        self.assertTrue(handles.name_matches_handle("クル / KURU", "kuru_xox"))
+        self.assertTrue(handles.name_matches_handle("KURU", "kuru"))
+
+    def test_one_letter_off_still_matches(self) -> None:
+        self.assertTrue(handles.name_matches_handle("KURU", "kufu_xox"))
+
+    def test_other_people_do_not_match(self) -> None:
+        self.assertFalse(handles.name_matches_handle("KURU", "kuruupdates"))
+        self.assertFalse(handles.name_matches_handle("KURU", "kuru88303829"))
+        self.assertFalse(handles.name_matches_handle("KURU", "kuru8k"))
+        self.assertFalse(handles.name_matches_handle("Moliww", "kuru_xox"))
+
+    def test_too_short_names_are_ignored(self) -> None:
+        self.assertFalse(handles.name_matches_handle("KU", "ku_ru"))
+        self.assertFalse(handles.name_matches_handle("", "kuru_xox"))
+
     def test_limit_applies(self) -> None:
         self.assertLessEqual(len(handles.typo_variants("menruinyanko", limit=5)), 5)
 

@@ -242,6 +242,24 @@ def signature_fix(handle: str, names: list[str], limit: int = 4) -> list[str]:
     return out[: max(1, limit)]
 
 
+def name_matches_handle(name: str, handle: str) -> bool:
+    """标题里的署名，跟图上读出来那个号是不是同一个名字。
+
+    7496/1710 那种情形：图上水印 `@kuru_xox`，标题写着「Seia cosplay by KURU」——
+    署名正好是这个 handle 的开头一段，两个独立来源指向同一个人。这条只用来做
+    「交叉验证」，不是拿名字去猜号，所以门槛写得死：名字至少四个字母，而且必须是
+    handle 的整段开头（后面跟 `_`、`.`、数字或到此为止）。
+    """
+    raw = (handle or "").strip().lstrip("@").lower()
+    core = re.sub(r"[^0-9a-z]+", "", str(name or "").lower())
+    if len(core) < 4 or not raw:
+        return False
+    if re.match(re.escape(core) + r"(?:[_.]|$)", raw):
+        return True
+    # 水印读错一个字母的情形（kufu_xox / KURU）也算对上：改回来是同一个号。
+    return bool(signature_fix(raw, [name]))
+
+
 def in_url_slug(name: str, urls: list[str]) -> bool:
     """这个名字是不是出现在候选 URL 里（搬运站的路径通常就是它认定的主人名）。
 

@@ -2068,6 +2068,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 signature_author = None
             if signature_author and signature_author.get("status") == "hit":
                 best = self._promote_signature_author(best, signature_author)
+            elif signature_author and signature_author.get("status") == "author":
+                # 认得出是谁、但翻不到这张：结论给作者，别判成「没找到」。
+                best = self._promote_cross_author(best, signature_author)
         # 同一张图落在普通网页上（搬运站/图集页，页面上没有账号）时别停在那儿：
         # 候选里出现过的 X 号挨个翻一遍，谁自己的帖子里有这张图谁就是结论。
         repost_author: dict[str, Any] | None = None
@@ -4834,18 +4837,42 @@ class ImageSearcherPlugin(MaiBotPlugin):
     _SIGNATURE_SEARCH_LIMIT = 8
 
     @staticmethod
-    def _watermark_hints(vision_info: dict[str, Any] | None) -> list[str]:
-        """图上读出来的号，按读出顺序去重——给标题署名那条线做纠写法的锚点。"""
-        out: list[str] = []
+    def _watermark_hints(vision_info: dict[str, Any] | None) -> list[dict[str, Any]]:
+        """图上读出来、并且已经核到存在的号，按读出顺序去重。
+
+        给两处用：标题署名那条线拿它纠写法，以及「水印 + 署名」的交叉验证。
+        只收 `state == "ok"` 的——查无此号的写法拿去做交叉验证只会把错号钉死。
+        """
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
         for item in (vision_info or {}).get("watermark_readings") or []:
             if not isinstance(item, dict):
                 continue
             handle = str(item.get("handle") or "").strip().lstrip("@")
-            if handle and handle.lower() not in {value.lower() for value in out}:
-                out.append(handle)
+            if not handle or handle.lower() in seen:
+                continue
+            seen.add(handle.lower())
+            out.append(
+                {
+                    "handle": handle,
+                    "state": str(item.get("state") or ""),
+                    "user_id": str(item.get("user_id") or ""),
+                    "name": str(item.get("name") or ""),
+                    "post": str(item.get("post") or ""),
+                }
+            )
         primary = str((vision_info or {}).get("watermark_handle") or "").strip().lstrip("@")
-        if primary and primary.lower() not in {value.lower() for value in out}:
-            out.insert(0, primary)
+        if primary and primary.lower() not in seen:
+            out.insert(
+                0,
+                {
+                    "handle": primary,
+                    "state": str((vision_info or {}).get("watermark_state") or ""),
+                    "user_id": str((vision_info or {}).get("watermark_user_id") or ""),
+                    "name": str((vision_info or {}).get("watermark_name") or ""),
+                    "post": str((vision_info or {}).get("watermark_post") or ""),
+                },
+            )
         return out
 
     async def _hunt_signature_author(
@@ -4893,7 +4920,12 @@ class ImageSearcherPlugin(MaiBotPlugin):
         }
         probes = 0
         seen_note = ""
-        typed = [str(item or "").strip().lstrip("@") for item in (hints or []) if item]
+        anchors = [
+            item
+            for item in (hints or [])
+            if isinstance(item, dict) and str(item.get("handle") or "").strip()
+        ]
+        typed = [str(item.get("handle")).strip().lstrip("@") for item in anchors]
         for name in names:
             if probes >= self._SIGNATURE_PROBE_LIMIT:
                 break
@@ -4967,9 +4999,65 @@ class ImageSearcherPlugin(MaiBotPlugin):
                         else "",
                     }
                 seen_note = str(holder.get("watermark_note") or "")
+        # 交叉验证：图上水印读到、并且核到存在的号，如果跟标题署名是同一个名字，
+        # 两个独立来源就指向同一个人。她自己的帖子里翻不到这张（删过帖、或者本来
+        # 就在付费图包里）不影响「作者是谁」——1710 那单水印明明读出 @kuru_xox，
+        # 却因为翻不到那张判成「没找到」，只在下面挂了一句「可能是模型读错了」。
+        for anchor in anchors:
+            if str(anchor.get("state") or "") != fxtwitter.PROFILE_OK:
+                continue
+            handle = str(anchor.get("handle") or "").strip().lstrip("@")
+            for name in names:
+                if not handles.name_matches_handle(name, handle):
+                    continue
+                self._vlog(
+                    "交叉验证成立：水印 @%s + 标题署名 %s，认定作者（原帖翻不到）",
+                    handle,
+                    name,
+                )
+                return {
+                    "status": "author",
+                    "name": name,
+                    "handle": handle,
+                    "x_name": str(anchor.get("name") or ""),
+                    "user_id": str(anchor.get("user_id") or ""),
+                }
         if seen_note:
             return {"status": "seen", "name": names[0], "reason": seen_note}
         return None
+
+    def _promote_cross_author(
+        self, best: Candidate | None, info: dict[str, Any]
+    ) -> Candidate | None:
+        """图上水印和标题署名指向同一个号时，把「作者是谁」定下来。
+
+        这不算放宽指纹：指纹管的是「这张图是不是它发的」，这里回答的是「这是谁」。
+        证据是两条独立的线索对上同一个号（图上写着、搬运帖标题也署这个名），而
+        原帖翻不到有正当理由（她自己删过帖、或者图只在付费包里）。
+
+        已经有落到人身上的结论（指纹命中的帖子、核过的账号）时不动它——那些更硬。
+        """
+        handle = str(info.get("handle") or "").strip().lstrip("@")
+        if not handle:
+            return best
+        if best is not None and (best.handle or "").strip() and best.status == "match":
+            return best
+        self._vlog(
+            "认定作者：@%s（图上水印 + 标题署名 %s）", handle, str(info.get("name") or "")
+        )
+        return Candidate(
+            engine="author",
+            url="",
+            platform="X (Twitter)",
+            handle="@" + handle,
+            name=str(info.get("x_name") or ""),
+            distance=None,
+            status="match",
+            note=(
+                "作者是她，但这张的帖子已经翻不到：图上水印和标题署名都指向这个号，"
+                "可她自己最近的带图帖里没有这张（可能删了，或者只在付费图包里）"
+            ),
+        )
 
     def _promote_signature_author(
         self, best: Candidate | None, info: dict[str, Any]
