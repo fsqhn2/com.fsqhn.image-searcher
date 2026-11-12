@@ -451,6 +451,21 @@ class VisionConfig(PluginConfigBase):
             "关掉就只读整图。",
         ),
     )
+    watermark_following: bool = Field(
+        default=True,
+        description=(
+            "水印里的号本人没发这张图时，去她关注的人里找同一个人。coser 的小号常挂在"
+            "自己的关注里：实测水印读成 @NERUchi890（28.7 万粉），她最近 14 条带图帖都"
+            "没这张，但她只关注 5 个人，其中一个 @oharapekopeko 发的正是这张（距离 0），"
+            "两个号挂的是同一条 patreon.com/NENE318。这条比「按名字搜 X」准，那边搜出来"
+            "的是同名的陌生人。只在号存在、本人没发这张时才跑，每单最多一次。"
+        ),
+        json_schema_extra=_ui(
+            "水印号的关注里找小号",
+            "默认开。只看关注列表里外链相同或昵称同词根的号，最多翻三个号的带图帖；"
+            "关掉就只核水印那个号本人。",
+        ),
+    )
     deep_trace: bool = Field(
         default=True,
         description=(
@@ -1894,6 +1909,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
                         grok_info,
                         upload,
                         allow_variants=not had_best,
+                        ordered=ordered,
                     )
                 # 第三道兜底：拼图、Grok 两条读水印的线都扑街时，用原图单独再读一次。
                 #
@@ -3286,6 +3302,15 @@ class ImageSearcherPlugin(MaiBotPlugin):
         account = "@" + handle.lstrip("@")
         distance = int(vision_info.get("watermark_distance") or 0)
         self._vlog("水印核对命中，升成结论：%s %s（距离 %s）", account, post, distance)
+        note = f"图上水印核对：{account} 自己的带图帖里有这张图（距离 {distance}）"
+        alt_from = str(vision_info.get("watermark_alt_from") or "").strip()
+        if alt_from:
+            # 水印那个号本人没发，是同一个人另一个号发的：这句要说清楚，
+            # 不然用户会以为图上写的就是结论这个号。
+            note = (
+                f"图上水印写着 @{alt_from.lstrip('@')}，"
+                f"同一人的另一个号 {account} 发过这张（距离 {distance}）"
+            )
         return Candidate(
             engine="watermark",
             url=post,
@@ -3294,7 +3319,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
             name=str(vision_info.get("watermark_name") or ""),
             distance=distance,
             status="match",
-            note=f"图上水印核对：{account} 自己的带图帖里有这张图（距离 {distance}）",
+            note=note,
         )
 
     def _is_repost_result(self, item: Candidate | None) -> bool:
@@ -3358,9 +3383,155 @@ class ImageSearcherPlugin(MaiBotPlugin):
         )
         self._vlog("水印核对没命中：@%s", handle)
 
+    # 关注列表最多看多少个号：接口一页就是 50 个，再多也拿不到。
+    _FOLLOWING_SCAN_LIMIT = 50
+    # 最多翻几个「同一个人」的带图帖。每翻一个都要下载十几张图，别贪多：
+    # 实测一个号约 8～12 秒，三个就是半分钟，再多这一单就要等太久。
+    # 176c 那单筛出 4 个同外链的号，答案排在第二个，三个能盖住。
+    _FOLLOWING_TARGET_LIMIT = 3
+
+    @staticmethod
+    def _name_core(value: Any) -> str:
+        """昵称压成小写字母数字，用来判断两个号是不是同一个词根。"""
+        return re.sub(r"[^0-9a-z]+", "", str(value or "").lower())
+
+    async def _following_accounts(self, handle: str) -> list[dict[str, Any]]:
+        """拉一个号关注的人，只取一页。"""
+        payload = await self._fetch_json(
+            f"https://api.fxtwitter.com/2/profile/{handle}/following", timeout=15
+        )
+        rows = (payload or {}).get("results") if isinstance(payload, dict) else None
+        return [row for row in (rows or []) if isinstance(row, dict)][: self._FOLLOWING_SCAN_LIMIT]
+
+    async def _hunt_following_account(
+        self, handle: str, upload: bytes | None
+    ) -> dict[str, Any] | None:
+        """水印核到的号本人没发这张图时，去她关注的人里找同一个人。
+
+        实测 s-20261112-1030-176c：水印读成 ``neruchi890``，核到真号
+        ``@NERUchi890``（28.7 万粉），最近 14 条带图帖里没有这张；她只关注 5 个
+        人，其中一个 ``@oharapekopeko`` 发的正是这张（距离 0），两个号挂的是同
+        一条 ``patreon.com/NENE318``。小号藏在自己的关注里是常见做法，这条路比
+        「按名字搜 X」准——那边搜出来的是同名的陌生人。
+        """
+        if not upload or not handle:
+            return None
+        rows = await self._following_accounts(handle)
+        if not rows:
+            return None
+        mine = await self._profile(handle) or {}
+        my_links = set(same_person.external_links(mine))
+        my_name = self._name_core(mine.get("name"))
+        picked: list[str] = []
+        for row in rows:
+            screen = str(row.get("screen_name") or "").strip()
+            if not screen or screen.lower() == handle.lower():
+                continue
+            links = set(same_person.external_links(row))
+            if my_links and links & my_links:
+                picked.append(screen)
+                continue
+            # 外链对不上时才看昵称：同一个词根的两个号（NENE / ne）也算。
+            other = self._name_core(row.get("name"))
+            if len(my_name) >= 2 and len(other) >= 2 and (my_name in other or other in my_name):
+                picked.append(screen)
+        if not picked:
+            return None
+        targets = picked[: self._FOLLOWING_TARGET_LIMIT]
+        self._vlog(
+            "水印号 @%s 关注里的疑似同一个人：%s",
+            handle,
+            "、".join("@" + item for item in targets),
+        )
+        for candidate in targets:
+            hit = await self._media_lookup(candidate, upload)
+            if not (hit and hit.get("url")):
+                continue
+            distance = int(hit.get("distance") or 0)
+            self._vlog(
+                "水印号 @%s 关注里的 @%s 发了这张图（距离 %s），升成结论",
+                handle,
+                candidate,
+                distance,
+            )
+            return {
+                "handle": candidate,
+                "post": str(hit["url"]),
+                "distance": distance,
+                "name": "",
+            }
+        return None
+
+    async def _follow_up_following(
+        self,
+        vision_info: dict[str, Any],
+        results: list[dict[str, Any]],
+        upload: bytes | None,
+        ordered: list[Candidate] | None = None,
+    ) -> None:
+        """水印的号本人都没发这张图时，去她关注的人里找同一个人。
+
+        只在「号存在、本人最近十几条里没有这张」时跑一次，每单最多一次；命中就
+        把结论换成那个人那条帖子，没命中什么也不写——本来就已经是「最近没有这
+        张」了，别再堆一句。
+
+        这一步会有好几个候选号，先试「名字在候选里出现过」的那个：176c 那单视觉
+        读到两个真号（PINKYKISS 和 neruchi890），后者才是图和搬运站标题里那个人，
+        前者跟这张图没关系，先翻她把时间花光就白跑了。
+        """
+        if not upload or not vision_info or not results:
+            return
+        if not bool(getattr(self.config.vision, "watermark_following", True)):
+            return
+        pool = [
+            item
+            for item in results
+            if str(item.get("state") or "") == fxtwitter.PROFILE_OK
+            and str(item.get("handle") or "").strip()
+            and not str(item.get("post") or "").strip()
+        ]
+        if not pool:
+            return
+        if ordered:
+            pool.sort(
+                key=lambda item: 0
+                if self._account_mentioned(str(item.get("handle") or ""), ordered)
+                else 1
+            )
+        handle = str(pool[0]["handle"])
+        alt = await self._hunt_following_account(handle, upload)
+        if not alt:
+            return
+        vision_info["watermark_post"] = alt["post"]
+        vision_info["watermark_handle"] = alt["handle"]
+        vision_info["watermark_url"] = f"https://x.com/{alt['handle']}"
+        vision_info["watermark_distance"] = int(alt["distance"])
+        vision_info["watermark_alt_from"] = handle
+        if alt.get("name"):
+            vision_info["watermark_name"] = alt["name"]
+        vision_info["watermark_note"] = (
+            f"水印写着 @{handle}，这张图是同一人的另一个号 @{alt['handle']} 发的，"
+            f"指纹距离 {alt['distance']}"
+        )
+
     # 近似写法最多试这么多个：每个都是一次 profile 请求，试太多会把兜底拖成
     # 几十秒，而真能对上的写法通常就在前几个（w 读散、少一个字母这类）。
     _VARIANT_LIMIT = 18
+
+    def _account_mentioned(self, handle: str, ordered: list[Candidate]) -> bool:
+        """这个号的名字有没有在候选的链接或标题里出现过。
+
+        搬运站的路径和标题常写着当事人名（``fapello.com/.../nenechi890-neruchi890/``），
+        出现在那里的号才是跟这张图有关的人；水印偶尔读出来的无关号不会出现在那里。
+        """
+        key = str(handle or "").strip().lstrip("@").lower()
+        if len(key) < 4:
+            return False
+        for item in ordered:
+            text = f"{item.url or ''} {item.title or ''}".lower()
+            if key in text:
+                return True
+        return False
 
     async def _verify_watermarks(
         self,
@@ -3369,6 +3540,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
         upload: bytes | None,
         *,
         allow_variants: bool,
+        ordered: list[Candidate] | None = None,
     ) -> None:
         """把两个模型读到的水印都核一遍，谁翻到这张图谁就是结论。
 
@@ -3407,6 +3579,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
             return
         vision_info["watermark_readings"] = results
         self._apply_watermark_primary(vision_info, results)
+        if not str(vision_info.get("watermark_post") or "").strip():
+            # 主读法没落地，才去关注列表里找同一个人的小号；命中由它自己把主字段改掉。
+            await self._follow_up_following(vision_info, results, upload, ordered)
 
     def _apply_watermark_primary(
         self, vision_info: dict[str, Any], results: list[dict[str, Any]]

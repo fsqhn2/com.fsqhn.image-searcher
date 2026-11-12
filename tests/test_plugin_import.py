@@ -55,6 +55,149 @@ class PluginImportTest(unittest.TestCase):
         self.assertEqual(config.keys, [])
         self.assertIn("serper", module.ImageSearcherConfig.model_fields)
 
+    def test_watermark_following_defaults_on(self) -> None:
+        """水印号的关注列表里找小号，默认开。"""
+        module = import_plugin()
+        self.assertTrue(module.VisionConfig().watermark_following)
+
+    def test_name_core_strips_punctuation(self) -> None:
+        module = import_plugin()
+        self.assertEqual(module.ImageSearcherPlugin._name_core("NENE・890"), "nene890")
+        self.assertEqual(module.ImageSearcherPlugin._name_core("  "), "")
+
+    def test_hunts_alt_account_in_following(self) -> None:
+        """s-20261112-1030-176c：水印号 @NERUchi890 本人没发这张，小号挂在她的关注里。
+
+        她只关注 5 个人，其中 @oharapekopeko 挂的是同一个 patreon.com/NENE318，
+        也发的正是这张（距离 0）。这条要能顺着关注列表摸过去，并且只翻筛出来的
+        那几个号，别人不翻。
+        """
+        import asyncio
+        from unittest import mock
+
+        module = import_plugin()
+        plugin = object.__new__(module.ImageSearcherPlugin)
+
+        async def following(self, handle):
+            return [
+                {
+                    "screen_name": "oharapekopeko",
+                    "name": "ne",
+                    "website": {"url": "https://www.patreon.com/NENE318"},
+                },
+                {"screen_name": "stranger", "name": "other", "website": {"url": "https://example.com/z"}},
+                {"screen_name": "NERUchi890", "name": "NENE", "website": {}},
+            ]
+
+        async def profile(self, handle):
+            return {"name": "NENE", "website": {"url": "https://www.patreon.com/NENE318"}}
+
+        scanned: list[str] = []
+
+        async def media(self, handle, upload):
+            scanned.append(handle)
+            if handle == "oharapekopeko":
+                return {"url": "https://x.com/oharapekopeko/status/2120454779109519482", "distance": 0}
+            return None
+
+        with (
+            mock.patch.object(module.ImageSearcherPlugin, "_vlog", lambda *a, **k: None),
+            mock.patch.object(module.ImageSearcherPlugin, "_following_accounts", following),
+            mock.patch.object(module.ImageSearcherPlugin, "_profile", profile),
+            mock.patch.object(module.ImageSearcherPlugin, "_media_lookup", media),
+        ):
+            found = asyncio.run(plugin._hunt_following_account("NERUchi890", b"x"))
+
+        self.assertIsNotNone(found)
+        self.assertEqual(found["handle"], "oharapekopeko")
+        self.assertEqual(found["distance"], 0)
+        # 无关的人不能翻，自己也不翻
+        self.assertEqual(scanned, ["oharapekopeko"])
+
+    def test_hunts_alt_account_by_similar_name_without_links(self) -> None:
+        """外链对不上时按昵称同词根兜底：NENE 与 ne 算同一个词根。"""
+        import asyncio
+        from unittest import mock
+
+        module = import_plugin()
+        plugin = object.__new__(module.ImageSearcherPlugin)
+
+        async def following(self, handle):
+            return [
+                {"screen_name": "somebody", "name": "ne", "website": {}},
+                {"screen_name": "unrelated", "name": "totally different", "website": {}},
+            ]
+
+        async def profile(self, handle):
+            return {"name": "NENE", "website": {}}
+
+        async def media(self, handle, upload):
+            return {"url": f"https://x.com/{handle}/status/1", "distance": 3}
+
+        with (
+            mock.patch.object(module.ImageSearcherPlugin, "_vlog", lambda *a, **k: None),
+            mock.patch.object(module.ImageSearcherPlugin, "_following_accounts", following),
+            mock.patch.object(module.ImageSearcherPlugin, "_profile", profile),
+            mock.patch.object(module.ImageSearcherPlugin, "_media_lookup", media),
+        ):
+            found = asyncio.run(plugin._hunt_following_account("NERUchi890", b"x"))
+
+        self.assertIsNotNone(found)
+        self.assertEqual(found["handle"], "somebody")
+
+    def test_following_hunt_off_when_switch_closed(self) -> None:
+        """开关关掉时一次关注列表都不拉。"""
+        import asyncio
+        from unittest import mock
+
+        module = import_plugin()
+        plugin = object.__new__(module.ImageSearcherPlugin)
+
+        called: list[str] = []
+
+        async def following(self, handle):
+            called.append(handle)
+            return []
+
+        vision_info = {}
+        results = [{"state": "ok", "handle": "NERUchi890", "post": ""}]
+        config = mock.Mock()
+        config.vision.watermark_following = False
+
+        with (
+            mock.patch.object(module.ImageSearcherPlugin, "_vlog", lambda *a, **k: None),
+            mock.patch.object(module.ImageSearcherPlugin, "_following_accounts", following),
+            mock.patch.object(
+                module.ImageSearcherPlugin,
+                "config",
+                new_callable=mock.PropertyMock,
+                return_value=config,
+            ),
+        ):
+            asyncio.run(plugin._follow_up_following(vision_info, results, b"x"))
+
+        self.assertEqual(called, [])
+        self.assertEqual(vision_info, {})
+
+    def test_account_mentioned_prefers_the_handle_in_candidates(self) -> None:
+        """176c 那单视觉读到两个真号，只有 neruchi890 出现在搬运站标题里。"""
+        from types import SimpleNamespace
+
+        module = import_plugin()
+        plugin = object.__new__(module.ImageSearcherPlugin)
+
+        ordered = [
+            SimpleNamespace(
+                url="https://fapello.com/video/anime-cosplay/30750978/nenechi890-neruchi890/",
+                title="",
+            ),
+            SimpleNamespace(url="https://leakgallery.com/nene/13052904", title="Nene Exclusive"),
+        ]
+        self.assertTrue(plugin._account_mentioned("neruchi890", ordered))
+        self.assertFalse(plugin._account_mentioned("PINKYKISS", ordered))
+        # 太短的名字不作数，免得两三个字母到处都能撞上
+        self.assertFalse(plugin._account_mentioned("ne", ordered))
+
     def test_watermark_reread_defaults_on(self) -> None:
         """「原图再读一次水印」是独立开关，默认开。
 
