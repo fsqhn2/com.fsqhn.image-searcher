@@ -323,7 +323,7 @@ def _weibo_lines(outcome: SearchOutcome) -> list[str]:
         return []
     top = info.get("max_fans")
     if top is None:
-        return [f"📱 微博：按「{query}」搜过，一个同名的都没有"]
+        return [f"📱 微博：按「{query}」搜过，没有昵称对得上的号"]
     return [
         f"📱 微博：按「{query}」搜过，同名的都是路人号（粉丝最多 {_fans_text(int(top))}），"
         "不像正主，没往结果里塞"

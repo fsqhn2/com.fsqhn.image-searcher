@@ -296,3 +296,51 @@ class WeiboSearchTest(unittest.TestCase):
         self.assertEqual(identity.weibo_fans("15万"), 150000)
         self.assertEqual(identity.weibo_fans(""), 0)
         self.assertEqual(identity.weibo_fans("粉丝"), 0)
+
+
+class WeiboNameMatchTest(unittest.TestCase):
+    """微博搜索结果要过名字关：按「包含」召回的话，粉丝数一排序就是一坨无关号。"""
+
+    def test_exact_and_prefix(self) -> None:
+        self.assertTrue(identity.weibo_name_matches("萌生w", "萌生w"))
+        self.assertTrue(identity.weibo_name_matches("萌生w", "萌生www"))
+        self.assertTrue(identity.weibo_name_matches("青生w", "青生w"))
+        self.assertTrue(identity.weibo_name_matches("纸悦Etsu_ko", "纸悦Etsu_ko"))
+
+    def test_brand_noise_is_rejected(self) -> None:
+        """实测 6704：水印读成 didasne，微博召回 adidasneo（阿迪官方，109.6 万粉）。"""
+        self.assertFalse(identity.weibo_name_matches("didasne", "adidasneo"))
+        self.assertFalse(identity.weibo_name_matches("青生w", "阮青生w09"))
+        self.assertFalse(identity.weibo_name_matches("kuru", "kuruupdates001"))
+
+    def test_one_typo_still_matches(self) -> None:
+        """读错一个字母时还得认，否则「轻颜/@青生w」这类读数全白费。"""
+        self.assertTrue(identity.weibo_name_matches("qingsheng", "qinsheng"))
+        self.assertTrue(identity.weibo_name_matches("萌生ww", "萌生www"))
+
+    def test_short_strings_never_match(self) -> None:
+        self.assertFalse(identity.weibo_name_matches("ab", "abc"))
+        self.assertFalse(identity.weibo_name_matches("", "萌生w"))
+
+
+class WeiboCookieHeaderTest(unittest.TestCase):
+    def test_split_fields(self) -> None:
+        self.assertEqual(
+            identity.weibo_cookie_header("abc", "def"), "SUB=abc; SUBP=def"
+        )
+
+    def test_tolerates_prefix_and_quotes(self) -> None:
+        self.assertEqual(
+            identity.weibo_cookie_header("SUB=abc", '"SUBP=def"'), "SUB=abc; SUBP=def"
+        )
+
+    def test_legacy_whole_string(self) -> None:
+        self.assertEqual(
+            identity.weibo_cookie_header("", "", "SUB=x; SUBP=y"), "SUB=x; SUBP=y"
+        )
+        self.assertEqual(identity.weibo_cookie_header("", "", ""), "")
+
+    def test_split_fields_win_over_legacy(self) -> None:
+        self.assertEqual(
+            identity.weibo_cookie_header("new", "newp", "SUB=old"), "SUB=new; SUBP=newp"
+        )

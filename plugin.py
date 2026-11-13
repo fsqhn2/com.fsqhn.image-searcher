@@ -919,16 +919,31 @@ class WeiboConfig(PluginConfigBase):
             "默认开。读到微博号就去核主页；只当线索，不改已有结论。",
         ),
     )
+    sub: str = Field(
+        default="",
+        description=(
+            "微博登录 cookie 里的 SUB 那一项的值（浏览器开发者工具 → Cookies → weibo.com）。"
+            "和下面的 SUBP 一起填，两项都空就走免登录。带不带 `SUB=` 前缀都认。"
+        ),
+        json_schema_extra=_ui(
+            "SUB",
+            "从浏览器 Cookie 里复制 SUB 的值。约 7 天过期，过期后重填。留空=免登录。",
+        ),
+    )
+    subp: str = Field(
+        default="",
+        description="微博登录 cookie 里的 SUBP 那一项的值，和 SUB 配套。",
+        json_schema_extra=_ui("SUBP", "和 SUB 一起复制过来了就填上；只填 SUB 也能用。"),
+    )
     cookie: str = Field(
         default="",
         description=(
-            "微博登录 cookie（可选）。留空走访客 cookie 的免登录路径，已经够核主页和粉丝数；"
-            "填了就走登录态。用 tools/weibo_login.py 扫码登录可以自动拿到这串值，"
-            "大约 7 天失效，失效后重新扫一次。"
+            "老写法：整串 `SUB=...; SUBP=...`。留着是为了兼容已经这么填的配置，"
+            "新配置请用上面的 SUB / SUBP 两格（填了它们就以它们为准）。"
         ),
         json_schema_extra=_ui(
-            "微博登录 Cookie（可选）",
-            "留空=免登录。扫码登录后把 SUB=...; SUBP=... 整段粘过来，7 天左右要重扫。",
+            "整串 Cookie（老配置兼容）",
+            "不用填。要填就填 `SUB=...; SUBP=...` 整段；拆开填上面两格更省事。",
         ),
     )
     min_fans: int = Field(
@@ -4828,6 +4843,20 @@ class ImageSearcherPlugin(MaiBotPlugin):
             return handle
         return ""
 
+    def _weibo_cookie(self) -> str:
+        """微博登录 cookie：SUB / SUBP 两格优先，老配置里那整串兜底。
+
+        拆成两格是用户 2026-11-13 的要求——整串一百多字符，粘贴时最容易漏一半或
+        多带个引号，而漏了另一半的 cookie 依然能让请求发出去，只是微博会回 401/432，
+        看起来像「登录填了却没用」。
+        """
+        section = self.config.weibo
+        return identity.weibo_cookie_header(
+            str(section.sub or ""),
+            str(section.subp or ""),
+            str(section.cookie or ""),
+        )
+
     async def _weibo_profile(self, uid: str) -> dict[str, Any] | None:
         """微博 UID → 昵称/粉丝/认证。查不到就当没有，不编名字。"""
 
@@ -4836,7 +4865,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 uid,
                 self._proxy(),
                 timeout=15,
-                cookie=str(self.config.weibo.cookie or ""),
+                cookie=self._weibo_cookie(),
             )
 
         try:
@@ -4864,7 +4893,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 name,
                 self._proxy(),
                 timeout=20,
-                cookie=str(self.config.weibo.cookie or ""),
+                cookie=self._weibo_cookie(),
                 min_fans=0,
                 limit=5,
             )
@@ -4957,7 +4986,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 self._vlog("微博反查失败（%s）：%s", name, text[:80])
                 # 填了登录 cookie 却收到 401/403/432，多半是那串 cookie 过期（约 7 天）。
                 # 这时要明说一句，否则整条微博反查会静默变成「什么都没搜到」。
-                if str(section.cookie or "").strip() and any(
+                if self._weibo_cookie() and any(
                     code in text for code in ("401", "403", "432")
                 ):
                     return {"status": "error", "reason": "cookie", "query": name}

@@ -1981,7 +1981,7 @@ class WeiboClueLineTest(unittest.TestCase):
         text = formatting._best_block(
             self._make({"status": "none", "query": "青生w", "max_fans": None})
         )
-        self.assertIn("一个同名的都没有", text)
+        self.assertIn("没有昵称对得上的号", text)
 
     def test_absent_weibo_adds_nothing(self) -> None:
         text = formatting._best_block(self._make(None))

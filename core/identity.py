@@ -287,6 +287,80 @@ def _weibo_cookie_session(cookie: str, proxy: str, timeout: float) -> requests.S
     return session
 
 
+def weibo_cookie_header(sub: str = "", subp: str = "", cookie: str = "") -> str:
+    """把配置里的 ``sub`` / ``subp`` 拼成 ``Cookie`` 头；老配置的整串优先权最低。
+
+    拆成两项是用户 2026-11-13 的要求：微博那串 ``SUB=...; SUBP=...`` 一百多字符，
+    整段粘贴容易带错引号或漏一半，拆开各自一格更好填。这里顺手容忍两种常见粘贴
+    方式——带 ``SUB=`` 前缀和不带，带引号和不带。
+    """
+
+    def _one(value: str, name: str) -> str:
+        text = str(value or "").strip().strip("'\"").strip()
+        if not text:
+            return ""
+        low = text.lower()
+        if low.startswith(name.lower() + "="):
+            return f"{name}={text.split('=', 1)[1].strip()}"
+        return f"{name}={text}"
+
+    parts = [part for part in (_one(sub, "SUB"), _one(subp, "SUBP")) if part]
+    if parts:
+        return "; ".join(parts)
+    return str(cookie or "").strip().strip("'\"").strip()
+
+
+def _distance(left: str, right: str) -> int:
+    """编辑距离，只用来判断两个昵称差几个字符。"""
+    if left == right:
+        return 0
+    if not left:
+        return len(right)
+    if not right:
+        return len(left)
+    previous = list(range(len(right) + 1))
+    for i, left_char in enumerate(left, start=1):
+        current = [i]
+        for j, right_char in enumerate(right, start=1):
+            current.append(
+                min(
+                    previous[j] + 1,
+                    current[j - 1] + 1,
+                    previous[j - 1] + (left_char != right_char),
+                )
+            )
+        previous = current
+    return previous[-1]
+
+
+def weibo_name_matches(query: str, name: str) -> bool:
+    """微博搜出来的这个昵称，是不是真的对得上搜的那个名字。
+
+    比 :func:`name_matches` 严：那个只要互相包含就算同一个人（换平台时昵称常带
+    后缀），拿来过滤搜索结果会放过一堆无关号。实测搜 ``didasne``（图上水印读成
+    这样）会召回 ``adidasneo``——阿迪达斯官方号，109.6 万粉；按粉丝数排序它排第一，
+    于是结果里冒出「📱 微博：adidasneo（粉丝 10.9 万）」。
+
+    所以这里要求：完全相同、或者一方以另一方开头／结尾（``萌生w`` → ``萌生www``），
+    或者长度接近且编辑距离在 1~2 以内。纯粹「包含」不算。
+    """
+    left = _clean(query)
+    right = _clean(name)
+    if len(left) < 3 or len(right) < 3:
+        return False
+    if left == right:
+        return True
+    # 前后缀只在「多出来的部分很短」时才算：`萌生w` → `萌生www` 是多挂两个字母，
+    # 而 `kuru` → `kuruupdates001` 只是碰巧同前缀，后者不能放行。
+    if abs(len(left) - len(right)) <= 3 and (
+        right.startswith(left) or left.startswith(right) or right.endswith(left)
+    ):
+        return True
+    if abs(len(left) - len(right)) > 2:
+        return False
+    return _distance(left, right) <= (1 if min(len(left), len(right)) < 8 else 2)
+
+
 def weibo_session(proxy: str = "", timeout: float = 15.0, cookie: str = "") -> requests.Session:
     """拿一个能用的微博 session：配了 cookie 就用 cookie，没配就取访客 cookie。"""
     if (cookie or "").strip():
@@ -425,6 +499,11 @@ def search_weibo_users(
     if response.status_code != 200:
         raise IdentityError(f"微博用户搜索 HTTP {response.status_code}")
     rows = parse_weibo_search(response.text)
+    if not rows:
+        return []
+    # 微博按「包含关键词」召回，同名的路人号能占满整页；名字对不上的直接丢，
+    # 否则光按粉丝排序就会被「adidasneo」这种同名大号顶到最前面。
+    rows = [row for row in rows if weibo_name_matches(name, str(row.get("name") or ""))]
     if not rows:
         return []
     kept = [row for row in rows if int(row.get("followers") or 0) >= max(0, min_fans)]
