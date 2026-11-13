@@ -46,7 +46,7 @@ class ForwardNodesTest(unittest.TestCase):
         outcome = SearchOutcome(status="ok", best=best, candidates=[best], image_b64="BESTIMG")
         nodes = build_forward_nodes(_task(outcome), command="麦麦寻人")
         images = _images(nodes)
-        self.assertEqual(images, [(1, "BESTIMG")])
+        self.assertEqual(images, [(0, "BESTIMG")])
 
     def test_not_found_still_carries_a_reference_image(self) -> None:
         other = Candidate(engine="yandex", url="https://www.pixiv.net/artworks/1", distance=21, status="suspect")
@@ -60,7 +60,7 @@ class ForwardNodesTest(unittest.TestCase):
         )
         nodes = build_forward_nodes(_task(outcome), command="麦麦寻人")
         images = _images(nodes)
-        self.assertEqual(images, [(2, "REFIMG")])
+        self.assertEqual(images, [(1, "REFIMG")])
         text = "\n".join(
             part.get("content", "")
             for node in nodes
@@ -73,7 +73,7 @@ class ForwardNodesTest(unittest.TestCase):
         outcome = SearchOutcome(status="not_found", best=None, candidates=[], image_b64="UPIMG", image_source="upload")
         nodes = build_forward_nodes(_task(outcome), command="麦麦寻人", show_reference=False)
         images = _images(nodes)
-        self.assertEqual(images, [(2, "UPIMG")])
+        self.assertEqual(images, [(1, "UPIMG")])
         joined = "\n".join(
             part.get("content", "")
             for node in nodes
@@ -194,7 +194,7 @@ class ForwardNodesTest(unittest.TestCase):
         outcome = self._grouped_outcome(hit=False)
         outcome.images = {"https://img.example/1.jpg": "LENS1", "https://img.example/3.jpg": "YANDEX1"}
         nodes = build_forward_nodes(_task(outcome), command="麦麦寻人")
-        self.assertEqual(_images(nodes), [(2, "BEST"), (3, "LENS1"), (4, "YANDEX1")])
+        self.assertEqual(_images(nodes), [(1, "BEST"), (2, "LENS1"), (3, "YANDEX1")])
 
     def test_more_reply_carries_every_candidate_image(self) -> None:
         outcome = self._grouped_outcome(hit=False)
@@ -206,7 +206,7 @@ class ForwardNodesTest(unittest.TestCase):
         nodes = build_forward_nodes(_task(outcome), command="麦麦寻人", limit=10, replay=True)
         self.assertEqual(
             _images(nodes),
-            [(2, "BEST"), (3, "LENS1"), (3, "LENS2"), (4, "YANDEX1")],
+            [(1, "BEST"), (2, "LENS1"), (2, "LENS2"), (3, "YANDEX1")],
         )
 
     def test_engine_limit_caps_candidates_per_engine(self) -> None:
@@ -229,7 +229,7 @@ class ForwardNodesTest(unittest.TestCase):
         outcome.image_source = "https://img.example/1.jpg"
         outcome.images = {"https://img.example/1.jpg": "REF", "https://img.example/3.jpg": "YANDEX1"}
         nodes = build_forward_nodes(_task(outcome), command="麦麦寻人")
-        self.assertEqual(_images(nodes), [(2, "REF"), (3, "REF"), (4, "YANDEX1")])
+        self.assertEqual(_images(nodes), [(1, "REF"), (2, "REF"), (3, "YANDEX1")])
 
     def test_engine_group_sorted_by_distance(self) -> None:
         """组内按指纹距离从近到远排，第一条就是该引擎最接近的那张。"""
@@ -288,14 +288,16 @@ class ForwardNodesTest(unittest.TestCase):
         outcome = SearchOutcome(status="ok", best=None, candidates=[], image_b64="")
         nodes = build_forward_nodes(_task(outcome), command="示例指令")
         header = nodes[0]["content"][0]["content"]
-        self.assertEqual(header, "🔍 示例指令结果")
+        self.assertTrue(header.startswith("🔍 示例指令结果"))
+        # 标题并进结论节点，别单独占一个只有一行字的节点
+        self.assertIn("未找到可靠出处", header)
 
     def test_nodes_carry_sender_uin(self) -> None:
         """uin 为空时 QQ 端会提示消息异常，所以每个节点都要带 user_id。"""
         outcome = SearchOutcome(status="not_found", best=None, candidates=[], image_b64="", image_source="")
         nodes = build_forward_nodes(_task(outcome), command="麦麦寻人", user_id="2377510578")
         self.assertTrue(all(node.get("user_id") == "2377510578" for node in nodes))
-        self.assertGreaterEqual(len(nodes), 3)
+        self.assertGreaterEqual(len(nodes), 2)
 
 
 class CandidateAccountTest(unittest.TestCase):
@@ -1143,10 +1145,18 @@ class SamePersonTest(unittest.TestCase):
 
     def test_marks_the_account_tied_to_the_image(self) -> None:
         outcome = self._make()
-        outcome.same_person["members"][0]["tied"] = True
+        outcome.same_person["members"][0]["exact"] = True
         text = formatting._best_block(outcome)
         self.assertIn("@NENEchi8890（18.5 万，跟这张图对上的那条）", text)
         self.assertNotIn("@haru007312（5.9 万，跟这张图", text)
+
+    def test_vision_only_member_is_not_marked_as_tied(self) -> None:
+        """视觉判的是「同一个人」不是同一张图，别让两个号都标成对上的那条。"""
+        outcome = self._make()
+        outcome.same_person["members"][0]["tied"] = True
+        outcome.same_person["members"][1]["tied"] = True
+        text = formatting._best_block(outcome)
+        self.assertNotIn("跟这张图对上的那条", text)
 
     def test_absent_without_a_group(self) -> None:
         text = formatting._best_block(SearchOutcome(status="ok", candidates=[]))

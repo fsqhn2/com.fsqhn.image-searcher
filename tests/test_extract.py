@@ -47,6 +47,15 @@ class ExtractIdentityTest(unittest.TestCase):
         self.assertEqual(handle, "@usagi_rr")
         self.assertEqual(name, "荣小兔头")
 
+    def test_x_page_title_suffix_is_not_part_of_the_name(self) -> None:
+        """x.com 标题是「名字 (@handle) / X」：账号抽走后不能剩「名字 () / X」。"""
+        name, handle = extract_identity(
+            "https://x.com/ranrankanu/status/2116861599533477933",
+            "甘雨ランのお家 (@ranrankanu) / X",
+        )
+        self.assertEqual(handle, "@ranrankanu")
+        self.assertEqual(name, "甘雨ランのお家")
+
     def test_bilibili_space(self) -> None:
         _name, handle = extract_identity("https://space.bilibili.com/123456", "某个UP")
         self.assertEqual(handle, "UID 123456")

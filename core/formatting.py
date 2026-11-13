@@ -430,7 +430,8 @@ def _same_person_lines(outcome: SearchOutcome) -> list[str]:
     parts: list[str] = []
     for item in members:
         tag = _fans_text(int(item.get("followers") or 0)) if item.get("followers") else ""
-        if item.get("tied"):
+        # 只有指纹真对上这张图的号才标「对上的那条」；视觉判的同一个人是另一张图。
+        if item.get("exact"):
             tag = f"{tag}，跟这张图对上的那条" if tag else "跟这张图对上的那条"
         parts.append(f"@{item.get('handle')}（{tag}）" if tag else f"@{item.get('handle')}")
     who = "、".join(parts)
@@ -1260,12 +1261,18 @@ def build_forward_nodes(
             item["user_id"] = user_id
         return item
 
-    nodes.append(node([{"type": "text", "content": _header_text(outcome, command, replay)}]))
-
-    best_content: list[dict] = [{"type": "text", "content": _best_block(outcome, detail=replay)}]
+    nodes.append(
+        node(
+            [
+                {
+                    "type": "text",
+                    "content": f"{_header_text(outcome, command, replay)}\n{_best_block(outcome, detail=replay)}",
+                }
+            ]
+        )
+    )
     if outcome.image_b64 and outcome.best is not None:
-        best_content.append({"type": "image", "content": outcome.image_b64})
-    nodes.append(node(best_content))
+        nodes[-1]["content"].append({"type": "image", "content": outcome.image_b64})
 
     # 视觉和 Grok 都挑出了东西时，两张图并排给：结论里一句「Grok 那边也有个号」
     # 不如图直接摆出来好判断。

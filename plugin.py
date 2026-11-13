@@ -6690,6 +6690,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
         """
         pairs: list[tuple[str, str]] = []
         anchors: set[str] = set()
+        exact: set[str] = set()
         for item in ordered:
             if not self._is_x(item):
                 continue
@@ -6698,6 +6699,8 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 continue
             status = str(item.status or "")
             pairs.append((handle, status))
+            if status == "match":
+                exact.add(handle.lower())
             if status in same_person.TRUSTED:
                 anchors.add(handle.lower())
         handles_seen = same_person.eligible(pairs)[: self._SAME_PERSON_LIMIT]
@@ -6722,6 +6725,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
                     "name": str(info.get("name") or "")[:40],
                     "followers": int(info.get("followers") or 0),
                     "tied": handle in anchors,
+                    # 「跟这张图对上的那条」只给指纹真对上的号：视觉判的「同一个人」
+                    # 不是同一张图，两个号都标一遍会看成有两个结论。
+                    "exact": handle in exact,
                 }
             )
         members.sort(key=lambda item: -item["followers"])

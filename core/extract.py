@@ -24,6 +24,8 @@ SOTWE_TITLE_SUFFIX_RE = re.compile(r"\s*[-–—]\s*(?:Twitter|X).*$", re.I)
 # X 帖子的搜索结果标题长这样：`□카🕯 on X: "그러니까 …"`。后面那半截是正文，
 # 不是名字；整条当名字发出去，用户看到的就是一长串句子。
 X_ON_TITLE_RE = re.compile(r"^(?P<name>.+?)\s+on\s+(?:X|Twitter):\s*", re.I)
+# x.com 页面标题的尾巴：「名字 (@handle) / X」。账号先被抽走，这条再收后缀。
+_X_PAGE_SUFFIX_RE = re.compile(r"\s*/\s*(?:X|Twitter)\s*$", re.I)
 BILIBILI_SPACE_RE = re.compile(r"space\.bilibili\.com/(\d+)")
 BILIBILI_VIDEO_RE = re.compile(r"bilibili\.com/video/(BV[A-Za-z0-9]+)")
 DOUYIN_USER_RE = re.compile(r"douyin\.com/user/([A-Za-z0-9_\-]+)")
@@ -489,7 +491,12 @@ def extract_identity(url: str, title: str = "") -> tuple[str, str]:
         if found:
             handle = "@" + found.group(1)
 
-    name = HANDLE_RE.sub("", clean_title).strip(" -–—|·")
+    name = HANDLE_RE.sub("", clean_title)
+    # x.com 的页面标题是「名字 (@handle) / X」：账号抽走后会剩下「名字 () / X」，
+    # 空括号和站点后缀都不该算名字的一部分（s-20261113-2147-2f31）。
+    name = _ANY_EMPTY_PAREN_RE.sub(" ", name)
+    name = _X_PAGE_SUFFIX_RE.sub("", name)
+    name = re.sub(r"\s{2,}", " ", name).strip(" -–—|·/")
     return name[:60], handle
 
 
