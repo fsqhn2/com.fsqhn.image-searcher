@@ -896,6 +896,54 @@ class PluginSectionConfig(PluginConfigBase):
     )
 
 
+class WeiboConfig(PluginConfigBase):
+    """微博站内反查：读到「微博@某某」或 X 上查无此号时，去微博搜出主页和粉丝数。
+
+    微博没有独立的英文 handle，昵称就是账号名，所以「按 handle 反查」等于按昵称
+    搜人。搜索页免登录就能读（拿一次访客 cookie），所以不配 cookie 也能用；配了
+    登录 cookie 就走登录态，结果更全、也不吃访客 cookie 那套偶发的 432。
+    """
+
+    __ui_label__ = "微博反查（读到微博号时核主页）"
+    __ui_icon__ = "at-sign"
+    __ui_order__ = 10
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            "读到「微博@某某」这类线索，或某个号在 X 上查无此人时，拿这个名字去微博搜一遍，"
+            "把主页、昵称、粉丝数当线索写进结果。免登录即可用，不需要填 cookie。"
+        ),
+        json_schema_extra=_ui(
+            "启用微博反查",
+            "默认开。读到微博号就去核主页；只当线索，不改已有结论。",
+        ),
+    )
+    cookie: str = Field(
+        default="",
+        description=(
+            "微博登录 cookie（可选）。留空走访客 cookie 的免登录路径，已经够核主页和粉丝数；"
+            "填了就走登录态。用 tools/weibo_login.py 扫码登录可以自动拿到这串值，"
+            "大约 7 天失效，失效后重新扫一次。"
+        ),
+        json_schema_extra=_ui(
+            "微博登录 Cookie（可选）",
+            "留空=免登录。扫码登录后把 SUB=...; SUBP=... 整段粘过来，7 天左右要重扫。",
+        ),
+    )
+    min_fans: int = Field(
+        default=200,
+        description=(
+            "粉丝数门槛。微博搜索结果按相关度排，同名的路人号能占满整页（实测搜「青生w」"
+            "出来 15 个「阮青生w*」，粉丝 1~102），低于这个数的号不写进结果，只在结论里"
+            "说一句「搜到的最多才几只粉」。"
+        ),
+        json_schema_extra=_ui("粉丝门槛", "默认 200。低于这个数的同名号当路人，不往结果里塞。"),
+        ge=0,
+        le=1_000_000,
+    )
+
+
 class ImageSearcherConfig(PluginConfigBase):
     """插件总配置。"""
 
@@ -906,6 +954,7 @@ class ImageSearcherConfig(PluginConfigBase):
     baidu: BaiduConfig = Field(default_factory=BaiduConfig)
     saucenao: SauceNaoConfig = Field(default_factory=SauceNaoConfig)
     serper: SerperConfig = Field(default_factory=SerperConfig)
+    weibo: WeiboConfig = Field(default_factory=WeiboConfig)
     vision: VisionConfig = Field(default_factory=VisionConfig)
     grok: GrokConfig = Field(default_factory=GrokConfig)
     ai_detect: AiDetectConfig = Field(default_factory=AiDetectConfig)
@@ -2212,6 +2261,16 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 "署名线索：@%s（翻过她的带图帖，没有这张）", x_guess["handle"]
             )
 
+        # 读到微博号时去微博站内核一遍：水印写着「微博@某某」、@后面跟着中文昵称、
+        # 或者那个号在 X 上查无此人，都值得去微博搜一次。只当线索——微博没有独立
+        # handle，昵称重名太常见，粉丝数就写在旁边让用户自己判断。
+        weibo_clue: dict[str, Any] | None = None
+        if upload and ordered and not (best is not None and best.status == "match"):
+            try:
+                weibo_clue = await self._hunt_weibo(ordered, vision_info, grok_info)
+            except Exception as error:  # noqa: BLE001 - 查不到不影响已经搜到的结果
+                self.ctx.logger.warning("微博反查失败：%s", error)
+
         # 付费内容线索：搬运站和泄露站按名字建页，有页就说明这个人确实在做
         # OnlyFans。它同样不改 best，只多给一个可以核对的号。
         paid_info: dict[str, Any] | None = None
@@ -2254,6 +2313,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
             same_person=same_person_info,
             x_identity=x_identity,
             repost_author=repost_author,
+            weibo=weibo_clue,
             paywall=paywall_info,
         )
 
@@ -4772,7 +4832,12 @@ class ImageSearcherPlugin(MaiBotPlugin):
         """微博 UID → 昵称/粉丝/认证。查不到就当没有，不编名字。"""
 
         def fetch() -> dict[str, Any] | None:
-            return identity.fetch_weibo_profile(uid, self._proxy(), timeout=15)
+            return identity.fetch_weibo_profile(
+                uid,
+                self._proxy(),
+                timeout=15,
+                cookie=str(self.config.weibo.cookie or ""),
+            )
 
         try:
             info = await asyncio.wait_for(asyncio.to_thread(fetch), timeout=28)
@@ -4787,6 +4852,164 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 info.get("followers"),
             )
         return info
+
+    async def _search_weibo_users(self, name: str) -> list[dict[str, Any]]:
+        """按微博昵称搜人，按粉丝数从多到少。搜不到返回空列表，接口挂了抛异常。"""
+        name = (name or "").strip()
+        if len(name) < 2:
+            return []
+
+        def fetch() -> list[dict[str, Any]]:
+            return identity.search_weibo_users(
+                name,
+                self._proxy(),
+                timeout=20,
+                cookie=str(self.config.weibo.cookie or ""),
+                min_fans=0,
+                limit=5,
+            )
+
+        return await asyncio.wait_for(asyncio.to_thread(fetch), timeout=32)
+
+    async def _hunt_weibo(
+        self,
+        ordered: list[Candidate],
+        vision_info: dict[str, Any] | None,
+        grok_info: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """读到微博号时去微博站内搜一遍，把主页和粉丝数当线索留下来。
+
+        以前只核 X：水印读成「@青生w」这种中文昵称，抽取函数直接丢掉；Grok 读成
+        「微博@萌生w」也只留在文案里，没往下查。这里补的就是这一步——微博号落地
+        成「昵称 + 粉丝数 + 主页链接」，让用户能自己点开看。
+
+        只当线索：不改 best、不参与匹配判定。粉丝数低于门槛的同名号不写进结果，
+        否则搜「青生w」能捞出 15 个「阮青生w*」。
+        """
+        section = self.config.weibo
+        if not section.enabled:
+            return None
+        vision_info = vision_info or {}
+        grok_info = grok_info or {}
+        seal = str(vision_info.get("watermark") or "").strip()
+        seal_text = str(vision_info.get("watermark_text") or "").strip()
+        grok_seal = str(grok_info.get("watermark") or "").strip()
+        seal_texts = [text for text in (seal, seal_text, grok_seal) if text]
+        title_texts = [
+            self._name_text(item) for item in ordered[:8] if self._name_text(item)
+        ]
+        targets = handles.weibo_targets(seal_texts + title_texts, limit=3)
+        uids = [value for kind, value in targets if kind == "uid"]
+        names = [value for kind, value in targets if kind == "name"]
+        # 水印里含中文的 @昵称不可能是 X 号（X 只认 ASCII），只可能是微博这类
+        # 中文平台的昵称，所以直接排进微博候选。
+        for name in handles.at_names(seal_texts, limit=4):
+            if handles.has_cjk(name) and name not in names:
+                names.append(name)
+        # 水印那个号在 X 上查无此人时，同样去微博试一次：同一个人常常两个平台
+        # 用一个昵称，X 上没这个名字不代表微博上也没有。
+        for item in vision_info.get("watermark_readings") or []:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("state") or "") != fxtwitter.PROFILE_MISSING:
+                continue
+            handle = str(item.get("handle") or "").strip()
+            if handle and handle not in names:
+                names.append(handle)
+        if not uids and not names:
+            return None
+
+        def source_of(name: str) -> str:
+            if name and name in seal:
+                return "水印"
+            if name and name in grok_seal:
+                return "Grok 读数"
+            if name and name in seal_text:
+                return "水印（候选图）"
+            return "候选标题"
+
+        floor = int(section.min_fans or 0)
+        weaker: dict[str, Any] | None = None
+        for uid in uids[:2]:
+            info = await self._weibo_profile(uid)
+            if not info:
+                continue
+            followers = int(info.get("followers") or 0)
+            row = {
+                "status": "hit",
+                "kind": "uid",
+                "query": uid,
+                "uid": uid,
+                "name": str(info.get("name") or ""),
+                "followers": followers,
+                "url": f"https://weibo.com/u/{uid}",
+                "verified": str(info.get("verified") or ""),
+                "source": "候选链接",
+                "min_fans": floor,
+            }
+            self._vlog("微博反查：UID %s → %s（粉丝 %s）", uid, row["name"], followers)
+            return row
+        for name in names[:2]:
+            try:
+                rows = await self._search_weibo_users(name)
+            except Exception as error:  # noqa: BLE001 - 查不到不影响已有结论
+                self._vlog("微博反查失败（%s）：%s", name, str(error)[:80])
+                continue
+            source = source_of(name)
+            top = rows[0] if rows else None
+            if top is not None:
+                followers = int(top.get("followers") or 0)
+                if followers >= floor:
+                    self._vlog(
+                        "微博反查：%s → %s（粉丝 %s，来源 %s）",
+                        name,
+                        top.get("name"),
+                        followers,
+                        source,
+                    )
+                    return {
+                        "status": "hit",
+                        "kind": "name",
+                        "query": name,
+                        "uid": str(top.get("uid") or ""),
+                        "name": str(top.get("name") or ""),
+                        "followers": followers,
+                        "url": str(top.get("url") or ""),
+                        "source": source,
+                        "min_fans": floor,
+                    }
+                candidate = {
+                    "status": "none",
+                    "kind": "name",
+                    "query": name,
+                    "max_fans": followers,
+                    "top_name": str(top.get("name") or ""),
+                    "url": str(top.get("url") or ""),
+                    "source": source,
+                    "min_fans": floor,
+                }
+                self._vlog(
+                    "微博反查：%s 只搜到同名的路人号（最多 %s 粉），低于门槛 %s",
+                    name,
+                    followers,
+                    floor,
+                )
+            else:
+                candidate = {
+                    "status": "none",
+                    "kind": "name",
+                    "query": name,
+                    "max_fans": None,
+                    "source": source,
+                    "min_fans": floor,
+                }
+                self._vlog("微博反查：%s 微博上一个同名的都没有", name)
+            if weaker is None or (
+                candidate.get("max_fans") is not None
+                and (weaker.get("max_fans") is None or candidate["max_fans"] > weaker["max_fans"])
+            ):
+                weaker = candidate
+        return weaker
 
     async def _search_x_handles(self, name: str, limit: int = 3) -> list[str]:
         """昵称 → 疑似 X 号，跑一次网页检索。

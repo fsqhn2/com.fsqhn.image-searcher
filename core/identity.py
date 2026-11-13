@@ -1,11 +1,14 @@
 """把落点在微博这类「认不到图」的站上的同一个人，换到她的 X 号去核。
 
-两段都很窄，各自只做一件事：
+三段都很窄，各自只做一件事：
 
 1. 微博数字 UID → 昵称：``weibo.com/ajax/profile/info`` 免登录可读，但要先拿一次
    访客 cookie（``passport.weibo.com/visitor`` 那套）。候选里的微博链接只有 UID，
    没有昵称，而 UID 本身搜不出人。
-2. 昵称 → X 号：复用 Lens 那套 SerpAPI key 跑一次 Google 网页检索，从结果标题和
+2. 微博昵称 → 主页/粉丝数：``s.weibo.com/user`` 的用户搜索页是服务端渲染的，带上
+   同一个访客 cookie 就能读出 UID、昵称、粉丝数。这一步是为了把「图上水印写着
+   微博@某某」这种线索落地，免得读到微博号就丢掉。
+3. 昵称 → X 号：复用 Lens 那套 SerpAPI key 跑一次 Google 网页检索，从结果标题和
    链接里挑 ``x.com/<handle>``。实测搜「纸悦Etsu_ko twitter」时 9 条结果全是同一个
    号，噪声很小；但同名同姓的人也存在，所以这里只出候选，能不能当结论砍在上层的
    指纹比对上——只有那个号自己的帖子里真有这张图才算数。
@@ -232,6 +235,9 @@ def _visitor_session(proxy: str, timeout: float) -> requests.Session:
         ),
         "Referer": "https://passport.weibo.com/visitor/visitor",
     }
+    # UA 一定要落成 session 默认头：只在个别请求上传 UA 时，只要有一处忘了就会
+    # 收到 HTTP 432（微博的反爬状态码），而且看起来像「接口没数据」。
+    session.headers.update({"User-Agent": headers["User-Agent"]})
     response = session.post(
         "https://passport.weibo.com/visitor/genvisitor",
         data={"cb": "gen_callback", "fp": "{}"},
@@ -260,12 +266,98 @@ def _visitor_session(proxy: str, timeout: float) -> requests.Session:
     return session
 
 
-def fetch_weibo_profile(uid: str, proxy: str = "", timeout: float = 15.0) -> dict[str, Any] | None:
+def _weibo_cookie_session(cookie: str, proxy: str, timeout: float) -> requests.Session:
+    """把用户配的微博 cookie 串直接塞进 session，不再走访客流程。
+
+    配了登录 cookie 时用它：``s.weibo.com`` 的搜索结果更全、也不吃访客 cookie
+    那套偶发的 432。没配时一律回落到 :func:`_visitor_session`，所以不登录也能跑。
+    """
+    session = requests.Session()
+    if proxy:
+        session.proxies.update({"http": proxy, "https": proxy})
+    session.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+            ),
+            "Cookie": (cookie or "").strip(),
+        }
+    )
+    return session
+
+
+def weibo_session(proxy: str = "", timeout: float = 15.0, cookie: str = "") -> requests.Session:
+    """拿一个能用的微博 session：配了 cookie 就用 cookie，没配就取访客 cookie。"""
+    if (cookie or "").strip():
+        return _weibo_cookie_session(cookie, proxy, timeout)
+    return _visitor_session(proxy, timeout)
+
+
+# 微博搜索结果里的粉丝数写法有三种：「194」「1,234」「1.2万」。
+_FANS = re.compile(r"([\d,]+(?:\.\d+)?)\s*([万wW]?)")
+
+
+def weibo_fans(text: str) -> int:
+    """「1.2万」→ 12000。读不出来返回 0，不猜。"""
+    match = _FANS.search((text or "").replace(" ", ""))
+    if not match:
+        return 0
+    try:
+        value = float(match.group(1).replace(",", ""))
+    except ValueError:
+        return 0
+    if match.group(2):
+        value *= 10000
+    return int(value)
+
+
+_WEIBO_CARD = re.compile(r'<div class="card card-user-b(.*?)(?=<div class="card card-user-b|\Z)', re.S)
+_WEIBO_CARD_UID = re.compile(r"weibo\.com/u/(\d+)")
+_WEIBO_CARD_NAME = re.compile(r'class="name"[^>]*>(.*?)</a>', re.S)
+_WEIBO_CARD_FANS = re.compile(r"粉丝：\s*([\d,\.]+\s*[万wW]?)")
+
+
+def parse_weibo_search(html: str) -> list[dict[str, Any]]:
+    """``s.weibo.com/user`` 的搜索页 → 用户列表。
+
+    页面是服务端渲染的，用户卡片带 ``card-user-b`` 这个 class，卡里有 UID、昵称、
+    粉丝数三项。这三项就是反查全部要的东西：UID 能拼主页，粉丝数用来挡同名路人号。
+    """
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for block in _WEIBO_CARD.findall(html or ""):
+        uid_match = _WEIBO_CARD_UID.search(block)
+        name_match = _WEIBO_CARD_NAME.search(block)
+        if not uid_match or not name_match:
+            continue
+        uid = uid_match.group(1)
+        if uid in seen:
+            continue
+        name = re.sub(r"<[^>]+>", "", name_match.group(1)).strip()
+        if not name:
+            continue
+        fans_match = _WEIBO_CARD_FANS.search(block)
+        seen.add(uid)
+        rows.append(
+            {
+                "uid": uid,
+                "name": name,
+                "followers": weibo_fans(fans_match.group(1) if fans_match else ""),
+                "url": f"https://weibo.com/u/{uid}",
+            }
+        )
+    return rows
+
+
+def fetch_weibo_profile(
+    uid: str, proxy: str = "", timeout: float = 15.0, cookie: str = ""
+) -> dict[str, Any] | None:
     """微博数字 UID → 昵称/粉丝/认证/简介。查不到人返回 None，取不到数据抛 IdentityError。"""
     uid = (uid or "").strip()
     if not uid.isdigit():
         return None
-    session = _visitor_session(proxy, timeout)
+    session = weibo_session(proxy, timeout, cookie)
     try:
         response = session.get(
             f"https://weibo.com/ajax/profile/info?uid={uid}",
@@ -287,6 +379,57 @@ def fetch_weibo_profile(uid: str, proxy: str = "", timeout: float = 15.0) -> dic
     except ValueError as error:
         raise IdentityError("微博资料接口回的不是 JSON") from error
     return parse_weibo_profile(payload)
+
+
+WEIBO_USER_SEARCH = "https://s.weibo.com/user"
+
+
+def search_weibo_users(
+    name: str,
+    proxy: str = "",
+    timeout: float = 20.0,
+    cookie: str = "",
+    min_fans: int = 200,
+    limit: int = 1,
+) -> list[dict[str, Any]]:
+    """微博昵称 → 主页候选，按粉丝数从多到少。
+
+    微博没有独立的 handle，昵称就是账号名，所以「按 handle 反查」在这里等于
+    「按昵称搜人」。搜索结果按相关度排，同名的路人号能占满整页（实测搜「青生w」
+    出来 15 个「阮青生w*」，粉丝 1~102），所以这里只收粉丝数过线的，按粉丝排序
+    取前几个——正主的粉丝量不会和路人号一个量级。
+
+    ``min_fans`` 传 0 表示不过滤（给「一个都没像样的」这种结论留出统计依据）。
+    """
+    name = (name or "").strip()
+    if len(name) < 2:
+        return []
+    session = weibo_session(proxy, timeout, cookie)
+    try:
+        response = session.get(
+            WEIBO_USER_SEARCH,
+            params={"q": name},
+            headers={
+                # 这里必须带 UA：访客 session 只在个别请求上设了 UA，漏掉时微博直接
+                # 回 HTTP 432（实测线上第一次跑就撞上了）。
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+                ),
+                "Referer": "https://weibo.com/",
+            },
+            timeout=timeout,
+        )
+    finally:
+        session.close()
+    if response.status_code != 200:
+        raise IdentityError(f"微博用户搜索 HTTP {response.status_code}")
+    rows = parse_weibo_search(response.text)
+    if not rows:
+        return []
+    kept = [row for row in rows if int(row.get("followers") or 0) >= max(0, min_fans)]
+    kept.sort(key=lambda row: int(row.get("followers") or 0), reverse=True)
+    return kept[: max(1, limit)]
 
 
 def search_x_handles(

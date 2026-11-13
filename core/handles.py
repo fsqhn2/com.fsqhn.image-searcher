@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import re
+from urllib.parse import unquote
 
 _TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9_]{3,14}")
 
@@ -153,6 +154,102 @@ def signature_names(texts: list[str], limit: int = 3) -> list[str]:
             if len(found) >= max(1, limit):
                 return found
     return found
+
+
+# 微博的「账号」就是昵称本身，没有单独的英文 handle，所以这里两件事都要认：
+# 明写的微博链接（weibo.com/u/7012365432）和「微博@某某」这种读数。
+# 实测 s-20261113-1108-73e0：Grok 把水印读成「微博@萌生w」，插件的抽取函数只认
+# ASCII 账号，这个中文昵称一个字符都抽不出来，线索整条丢掉。
+_WEIBO_URL = re.compile(
+    r"weibo\.(?:com|cn)/(?:u/|n/|profile/)?([A-Za-z0-9_\u4e00-\u9fff.\-%]{2,40})",
+    re.I,
+)
+# 分隔符必须显式出现（: ： @ 或空格），否则「weibo.com/x」会被当成昵称 com。
+_WEIBO_AT = re.compile(
+    r"(?:新浪微博|微博|weibo)\s*(?:[:：]|@|\s)\s*@?\s*"
+    r"([A-Za-z0-9_\u4e00-\u9fff][A-Za-z0-9_\u4e00-\u9fff.\-]{1,29})",
+    re.I,
+)
+# 中文昵称后面常紧跟句子成分（「微博@萌生w的水印」），在第一个虚词/名词处截断。
+_WEIBO_CUT = re.compile(r"(?:的|是|在|上|里|发|写|水印|主页)")
+
+
+# 水印上光秃秃的 ``@某某``：X 的 handle 只能是 ASCII，所以含中文的那部分不可能
+# 是 X 号，只可能是微博这类中文平台的昵称。实测 73e0 的水印写着「轻颜 / @青生w」，
+# 老抽取函数一个字符都不认，这条线索直接消失。
+_AT_NAME = re.compile(
+    r"@\s*([A-Za-z0-9_\u4e00-\u9fff][A-Za-z0-9_\u4e00-\u9fff.\-]{1,29})"
+)
+_CJK = re.compile(r"[\u4e00-\u9fff]")
+
+
+def has_cjk(text: str) -> bool:
+    """里面有没有汉字。"""
+    return bool(_CJK.search(text or ""))
+
+
+def at_names(texts: list[str], limit: int = 4) -> list[str]:
+    """``@某某`` 后面的名字，中文也认。
+
+    含不含中文由调用方判断：含中文的不可能是 X 号，要去微博这类站查。
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+    for text in texts:
+        for match in _AT_NAME.finditer(text or ""):
+            value = _WEIBO_CUT.split(match.group(1))[0].strip(".-")
+            low = value.lower()
+            if len(value) < 2 or low in _SIG_STOP or low.isdigit():
+                continue
+            if len(set(low)) <= 2 or low in seen:
+                continue
+            seen.add(low)
+            found.append(value)
+            if len(found) >= max(1, limit):
+                return found
+    return found
+
+
+def weibo_targets(texts: list[str], limit: int = 3) -> list[tuple[str, str]]:
+    """从文本里认出「指向微博」的线索：``("uid", "7012365432")`` 或 ``("name", "青生w")``。
+
+    只认明确写着「微博 / weibo」的地方，或者直接给了 weibo.com 的链接。水印上光秃秃
+    一个 ``@青生w``（没有平台名）不在这里处理——那种要等 X 上查无此号才会拐去微博试，
+    由插件那一侧决定，免得每个读到的号都去微博搜一遍。
+    """
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for text in texts:
+        raw = text or ""
+        if not raw:
+            continue
+        for match in _WEIBO_URL.finditer(raw):
+            value = unquote(match.group(1)).strip(".")
+            if value.isdigit():
+                key = ("uid", value)
+            else:
+                key = ("name", value)
+            if key[1].lower() in {"u", "n", "profile", "com", "cn", "www"}:
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(key)
+        for match in _WEIBO_AT.finditer(raw):
+            value = _WEIBO_CUT.split(match.group(1))[0].strip(".-")
+            low = value.lower()
+            if len(value) < 2 or low in _SIG_STOP or low.isdigit():
+                continue
+            if len(set(low)) <= 2:
+                continue
+            key = ("name", value)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(key)
+        if len(found) >= max(1, limit):
+            break
+    return found[: max(1, limit)]
 
 
 def stem(handle: str) -> str:

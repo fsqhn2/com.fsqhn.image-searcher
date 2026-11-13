@@ -60,6 +60,10 @@ class SearchOutcome:
     # "handle", "post", "distance", "x_name"}。hit 时结论已经换成那条帖子；none 只用来
     # 说明「翻过哪些号、都没有」，不改结论。
     repost_author: dict | None = None
+    # 微博站内反查：{"status": hit/none/error, "query", "kind": name/uid, "uid", "name",
+    # "followers", "url", "source", "max_fans", "floor"}。hit 只是线索（这个号确实是
+    # 她本人），不改 best；none 说明搜过但没搜到粉丝量像正主的同名号。
+    weibo: dict | None = None
     # 确认作者后在她自己的付费页找到的售卖信息：{"platform": patreon/fanbox, "handle",
     # "shop", "post": {title, url, published, min_cents, currency},
     # "tiers": [{title, cents, currency, free}], "preview": {title, url}}。
@@ -92,6 +96,7 @@ class SearchOutcome:
             "same_person": self.same_person,
             "x_identity": self.x_identity,
             "repost_author": self.repost_author,
+            "weibo": self.weibo,
             "paywall": self.paywall,
         }
 
@@ -119,6 +124,7 @@ class SearchOutcome:
             same_person=summary.get("same_person"),
             x_identity=summary.get("x_identity"),
             repost_author=summary.get("repost_author"),
+            weibo=summary.get("weibo"),
             paywall=summary.get("paywall"),
         )
 

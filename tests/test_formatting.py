@@ -1928,3 +1928,61 @@ class RepostAuthorTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WeiboClueLineTest(unittest.TestCase):
+    """微博反查那句：搜到谁要写清粉丝数和主页，只有路人号也要照实说。"""
+
+    def _make(self, weibo: dict | None) -> SearchOutcome:
+        item = Candidate(
+            engine="baidu",
+            url="https://weibo.com/u/1234567890",
+            distance=22,
+            status="suspect",
+            platform="weibo.com",
+        )
+        item.finalize()
+        return SearchOutcome(status="not_found", best=None, candidates=[item], weibo=weibo)
+
+    def test_hit_shows_name_fans_and_url(self) -> None:
+        text = formatting._best_block(
+            self._make(
+                {
+                    "status": "hit",
+                    "kind": "name",
+                    "query": "萌生w",
+                    "name": "萌生www",
+                    "followers": 194,
+                    "url": "https://weibo.com/u/2729265057",
+                    "source": "Grok 读数",
+                }
+            )
+        )
+        self.assertIn("📱 微博：萌生www（粉丝 194）https://weibo.com/u/2729265057", text)
+        self.assertIn("Grok 读数", text)
+
+    def test_none_says_what_it_found(self) -> None:
+        """只搜到路人号时要说「搜过」＋最大粉丝数，别让人以为没查。"""
+        text = formatting._best_block(
+            self._make(
+                {
+                    "status": "none",
+                    "query": "青生w",
+                    "max_fans": 102,
+                    "source": "水印",
+                }
+            )
+        )
+        self.assertIn("按「青生w」搜过", text)
+        self.assertIn("102", text)
+        self.assertIn("路人号", text)
+
+    def test_none_without_any_match(self) -> None:
+        text = formatting._best_block(
+            self._make({"status": "none", "query": "青生w", "max_fans": None})
+        )
+        self.assertIn("一个同名的都没有", text)
+
+    def test_absent_weibo_adds_nothing(self) -> None:
+        text = formatting._best_block(self._make(None))
+        self.assertNotIn("📱 微博", text)

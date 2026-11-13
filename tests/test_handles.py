@@ -279,3 +279,41 @@ class SignatureNameTest(unittest.TestCase):
     def test_empty_input(self) -> None:
         self.assertEqual(handles.signature_names([]), [])
         self.assertEqual(handles.signature_names(["", "   "]), [])
+
+
+class WeiboClueTest(unittest.TestCase):
+    """微博线索的抽取：明写「微博@某某」、给链接、以及水印上中文的 @昵称。
+
+    实测 s-20261113-1108-73e0：水印读成「轻颜 / @青生w」，Grok 读成「微博@萌生w」，
+    老抽取函数只认 ASCII 账号，两个都没抽出来，线索整条丢掉。
+    """
+
+    def test_weibo_at_nickname_in_chinese(self) -> None:
+        self.assertEqual(handles.weibo_targets(["微博@萌生w"]), [("name", "萌生w")])
+
+    def test_weibo_at_with_colon_and_space(self) -> None:
+        self.assertEqual(handles.weibo_targets(["微博：纸悦Etsu_ko 的水印"]), [("name", "纸悦Etsu_ko")])
+        self.assertEqual(handles.weibo_targets(["Weibo: 青生w"]), [("name", "青生w")])
+
+    def test_weibo_url_uid_and_name(self) -> None:
+        self.assertEqual(
+            handles.weibo_targets(["https://weibo.com/u/7012365432"]), [("uid", "7012365432")]
+        )
+        self.assertEqual(
+            handles.weibo_targets(["weibo.com/n/%E9%9D%92%E7%94%9Fw"]), [("name", "青生w")]
+        )
+
+    def test_plain_at_is_not_weibo(self) -> None:
+        """没有微博标记的 @ 不在这里处理：X 上查无此号才拐去微博，由插件决定。"""
+        self.assertEqual(handles.weibo_targets(["轻颜 / @青生w"]), [])
+        self.assertEqual(handles.weibo_targets(["@kuru_xox"]), [])
+
+    def test_domain_is_not_a_nickname(self) -> None:
+        """`weibo.com/x` 里不能被抽成昵称 com。"""
+        self.assertEqual(handles.weibo_targets(["weibo.com"]), [])
+        self.assertEqual(handles.weibo_targets(["tweeted on weibo"]), [])
+
+    def test_at_names_accepts_chinese(self) -> None:
+        self.assertEqual(handles.at_names(["轻颜 / @青生w"]), ["青生w"])
+        self.assertTrue(handles.has_cjk("青生w"))
+        self.assertFalse(handles.has_cjk("kuru_xox"))

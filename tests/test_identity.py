@@ -240,3 +240,59 @@ class NameMatchesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# s.weibo.com/user 搜索页的真实结构（2026-11-13 抓的原始 HTML，删掉了图片地址等无关部分）。
+# 用户卡片是 card-user-b，里面有 UID、昵称、粉丝数三项；搜索结果按相关度排，
+# 同名的路人号能占满整页，所以粉丝数必须解析出来。
+_WEIBO_SEARCH_HTML = """
+<div class="card-wrap" id="pl_user_feedList">
+<div class="card card-user-b s-brt1 card-user-b-padding">
+    <div class="avator"><a href="//weibo.com/u/2729265057" target="_blank" suda-data="key=tblog_search_weibo"><img src="x.jpg"></a></div>
+    <div class="info">
+        <div>
+            <a href="//weibo.com/u/2729265057" class="name" style="vertical-align: middle;" target="_blank">萌生www</a>
+        </div>
+                <p>
+            <span class="s-nobr">粉丝：194</span>
+        </p>
+    </div>
+    <div class="btn"><button uid=2729265057 action-type=login>关注</button></div>
+</div>
+<div class="card card-user-b s-brt1 card-user-b-padding">
+    <div class="avator"><a href="//weibo.com/u/2571733814"><img src="y.jpg"></a></div>
+    <div class="info">
+        <div>
+            <a href="//weibo.com/u/2571733814" class="name" target="_blank">宁次萌生win_454</a>
+        </div>
+                <p>
+            <span class="s-nobr">粉丝：3</span>
+        </p>
+    </div>
+</div>
+</div>
+"""
+
+
+class WeiboSearchTest(unittest.TestCase):
+    def test_reads_cards(self) -> None:
+        """昵称、UID、粉丝数、主页链接四项都要从搜索页里读出来。"""
+        rows = identity.parse_weibo_search(_WEIBO_SEARCH_HTML)
+        self.assertEqual([row["uid"] for row in rows], ["2729265057", "2571733814"])
+        self.assertEqual(rows[0]["name"], "萌生www")
+        self.assertEqual(rows[0]["followers"], 194)
+        self.assertEqual(rows[0]["url"], "https://weibo.com/u/2729265057")
+
+    def test_empty_page_is_not_an_error(self) -> None:
+        """搜不到人就是空列表——登录墙那类整页 HTML 也是空列表，由上层决定要不要报错。"""
+        for html in ("", "<html><title>Sina Visitor System</title></html>", None):
+            self.assertEqual(identity.parse_weibo_search(html), [])
+
+    def test_followers_text(self) -> None:
+        """粉丝数写法有「194」「1,234」「1.2万」三种，别把 1.2 万读成 1。"""
+        self.assertEqual(identity.weibo_fans("194"), 194)
+        self.assertEqual(identity.weibo_fans("1,234"), 1234)
+        self.assertEqual(identity.weibo_fans("1.2万"), 12000)
+        self.assertEqual(identity.weibo_fans("15万"), 150000)
+        self.assertEqual(identity.weibo_fans(""), 0)
+        self.assertEqual(identity.weibo_fans("粉丝"), 0)

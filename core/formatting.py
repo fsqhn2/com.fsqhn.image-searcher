@@ -293,6 +293,37 @@ def _x_guess_lines(outcome: SearchOutcome) -> list[str]:
     return lines
 
 
+def _weibo_lines(outcome: SearchOutcome) -> list[str]:
+    """微博站内反查的结果：搜到了谁，或者搜过但只有路人号。
+
+    微博昵称就是账号名（没有独立 handle），重名的路人号特别多——实测搜「青生w」
+    出来 15 个「阮青生w*」，粉丝 1~102。所以这条永远带着粉丝数，让用户一眼看出
+    是不是正主；没搜到像样的也照实写一句，别让人以为「没查」。
+    """
+    info = outcome.weibo or {}
+    status = str(info.get("status") or "")
+    if status == "hit":
+        name = str(info.get("name") or "").strip() or str(info.get("query") or "")
+        fans = int(info.get("followers") or 0)
+        url = str(info.get("url") or "").strip()
+        source = str(info.get("source") or "").strip()
+        line = f"📱 微博：{name}（粉丝 {_fans_text(fans)}）{url}".rstrip()
+        how = f"从{source}里认出的" if source else "按这个名字搜到的"
+        return [line, f"{how}同名号，微博昵称就是账号名，点开自己对一下是不是她。"]
+    query = str(info.get("query") or "").strip()
+    if not query:
+        return []
+    if status != "none":
+        return []
+    top = info.get("max_fans")
+    if top is None:
+        return [f"📱 微博：按「{query}」搜过，一个同名的都没有"]
+    return [
+        f"📱 微博：按「{query}」搜过，同名的都是路人号（粉丝最多 {_fans_text(int(top))}），"
+        "不像正主，没往结果里塞"
+    ]
+
+
 def _paywall_lines(outcome: SearchOutcome) -> list[str]:
     """确认作者之后找到的售卖页：卖在哪、多少钱、有没有免费预览。
 
@@ -550,6 +581,7 @@ def _best_block(outcome: SearchOutcome, *, skip_grok: bool = False, detail: bool
             extra.append(miss)
     extra.extend(_same_person_lines(outcome))
     extra.extend(_x_guess_lines(outcome))
+    extra.extend(_weibo_lines(outcome))
     extra.extend(_paid_lines(outcome))
     if extra:
         text = "\n".join([text, *extra])
