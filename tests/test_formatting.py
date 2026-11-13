@@ -322,6 +322,36 @@ class CandidateAccountTest(unittest.TestCase):
         self.assertIn("@someone", text)
 
 
+class WeiboPostRenderTest(unittest.TestCase):
+    """转载页反查出的微博帖当结论时，名字/账号/链接三行都得在。"""
+
+    def _weibo_outcome(self) -> SearchOutcome:
+        item = Candidate(
+            engine="weibo_post",
+            url="https://weibo.com/2727362643/Rr1ciyuH8",
+            image_url="https://wx1.sinaimg.cn/large/abc.jpg",
+            distance=1,
+            status="match",
+            note="转载页正文反查到原帖，配图指纹距离 1",
+            platform="微博",
+            name="G44不会受伤",
+            handle="2727362643",
+        ).finalize()
+        return SearchOutcome(status="ok", best=item, candidates=[item])
+
+    def test_identity_lines_survive(self) -> None:
+        text = build_text_summary(_task(self._weibo_outcome()), command="盆地找鸡")
+        self.assertIn("🌐 平台：微博", text)
+        self.assertIn("🔍 匹配：转载页正文反查到原帖", text)
+        self.assertIn("👤 名字：G44不会受伤", text)
+        self.assertIn("🆔 账号：2727362643", text)
+        self.assertIn("https://weibo.com/2727362643/Rr1ciyuH8", text)
+
+    def test_has_handle_so_no_repost_mislabel(self) -> None:
+        text = build_text_summary(_task(self._weibo_outcome()), command="盆地找鸡")
+        self.assertNotIn("不是作者主页", text)
+
+
 class EtaTextTest(unittest.TestCase):
     def test_running_task_uses_given_eta(self) -> None:
         task = SearchTask(task_id="s-test", stream_id="g1", user_id="u1", status="running")

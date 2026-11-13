@@ -456,6 +456,8 @@ def fetch_weibo_profile(
 
 
 WEIBO_USER_SEARCH = "https://s.weibo.com/user"
+WEIBO_POST_SEARCH = "https://s.weibo.com/weibo"
+WEIBO_TIMELINE = "https://weibo.com/ajax/statuses/mymblog"
 
 
 def search_weibo_users(
@@ -509,6 +511,118 @@ def search_weibo_users(
     kept = [row for row in rows if int(row.get("followers") or 0) >= max(0, min_fans)]
     kept.sort(key=lambda row: int(row.get("followers") or 0), reverse=True)
     return kept[: max(1, limit)]
+
+
+def search_weibo_posts(
+    query: str,
+    proxy: str = "",
+    timeout: float = 20.0,
+    cookie: str = "",
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    """按关键词搜微博帖子，返回作者 UID / 帖号 / 配图 id。
+
+    和 :func:`search_weibo_users` 不是一回事：那个核「这个昵称有没有这个人」，
+    这个搜的是**正文**。转载页（新浪这类）的正文往往就是原微博的正文，拿它来搜
+    能直接落回原帖——``s-20261113-1250-26a8`` 就靠这条路找回 G44不会受伤 那条。
+
+    需要登录态：没配 cookie 时 ``s.weibo.com`` 只回访客墙 HTML，这里直接抛
+    :class:`IdentityError`，让上层安静跳过，不要当成「搜不到」。
+    """
+    from . import weibopost
+
+    query = (query or "").strip()
+    if len(query) < 2:
+        return []
+    if not (cookie or "").strip():
+        raise IdentityError("微博帖搜索需要登录 cookie")
+    session = weibo_session(proxy, timeout, cookie)
+    try:
+        response = session.get(
+            WEIBO_POST_SEARCH,
+            params={"q": query},
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+                ),
+                "Referer": "https://weibo.com/",
+            },
+            timeout=timeout,
+        )
+    finally:
+        session.close()
+    if response.status_code != 200:
+        raise IdentityError(f"微博帖搜索 HTTP {response.status_code}")
+    if "Sina Visitor System" in (response.text or "")[:5000]:
+        raise IdentityError("微博帖搜索被访客墙挡住（没有登录态）")
+    return weibopost.parse_post_search(response.text, limit=limit)
+
+
+def fetch_weibo_timeline(
+    uid: str,
+    proxy: str = "",
+    timeout: float = 18.0,
+    cookie: str = "",
+    pages: int = 1,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """微博某人最近几页帖子 → 帖号、配图 id、正文。
+
+    用来核「她自己的帖子里有没有这张图」：配图 id 能拼大图直链，和 X 那条
+    ``_media_lookup`` 是同一个思路。没有登录态时接口回登录墙，这里抛
+    :class:`IdentityError`，上层跳过即可。
+    """
+    uid = (uid or "").strip()
+    if not uid.isdigit():
+        return []
+    if not (cookie or "").strip():
+        raise IdentityError("微博翻帖需要登录 cookie")
+    session = weibo_session(proxy, timeout, cookie)
+    rows: list[dict[str, Any]] = []
+    try:
+        for page in range(1, max(1, pages) + 1):
+            response = session.get(
+                WEIBO_TIMELINE,
+                params={"uid": uid, "page": page, "feature": 0},
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+                    ),
+                    "Referer": f"https://weibo.com/u/{uid}",
+                },
+                timeout=timeout,
+            )
+            if response.status_code != 200:
+                raise IdentityError(f"微博帖子列表 HTTP {response.status_code}")
+            try:
+                payload = response.json()
+            except ValueError as error:
+                raise IdentityError("微博帖子列表回的不是 JSON") from error
+            items = (payload.get("data") or {}).get("list") or []
+            if not isinstance(items, list) or not items:
+                break
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                mblogid = str(item.get("mblogid") or "").strip()
+                if not mblogid:
+                    continue
+                rows.append(
+                    {
+                        "mblogid": mblogid,
+                        "mid": str(item.get("mid") or item.get("idstr") or ""),
+                        "pic_ids": [str(pic) for pic in (item.get("pic_ids") or []) if pic],
+                        "created_at": str(item.get("created_at") or ""),
+                        "url": f"https://weibo.com/{uid}/{mblogid}",
+                    }
+                )
+                if len(rows) >= max(1, limit):
+                    return rows
+    finally:
+        session.close()
+    return rows
 
 
 def search_x_handles(

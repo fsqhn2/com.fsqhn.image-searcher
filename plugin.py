@@ -63,6 +63,7 @@ from .core.extract import (
     x_title_name,
 )
 from .core.gallery import is_gallery_site, is_repost_site, parse_source_accounts
+from .core import weibopost
 from .core.hashing import dhash, hamming, prepare_upload
 from .core.httpclient import HttpError, download_image_multi, fake_ip_networks, make_session
 from .core.keypool import KeyPool
@@ -438,6 +439,19 @@ class VisionConfig(PluginConfigBase):
             "水印兜底重读（原图）",
             "默认开。拼图和 Grok 两条线都没落下结论时才跑，每单最多多一次视觉调用；"
             "关掉就只认拼图和 Grok 读出来的水印。",
+        ),
+    )
+    watermark_locate: bool = Field(
+        default=True,
+        description=(
+            "水印两步读（原图兜底）：整图读不出水印时，先让模型只说「水印在哪」"
+            "（一次调用，不抄字），再按那个位置从原图裁下来放大读一次。"
+            "比切六块便宜得多——最多两次调用，而且裁的是原图，小字不会被缩放吃掉。"
+            "只在整图读完还没读到账号时才触发。"
+        ),
+        json_schema_extra=_ui(
+            "水印两步读（先定位再放大）",
+            "默认开。整图读不出水印时最多多两次视觉调用；读到就停。",
         ),
     )
     watermark_tiles: bool = Field(
@@ -956,6 +970,18 @@ class WeiboConfig(PluginConfigBase):
         json_schema_extra=_ui("粉丝门槛", "默认 200。低于这个数的同名号当路人，不往结果里塞。"),
         ge=0,
         le=1_000_000,
+    )
+    repost_search: bool = Field(
+        default=True,
+        description=(
+            "转载页反查：候选落在新浪这类转载页上时，抓页面正文去微博搜帖，"
+            "或者按页面标出来的微博作者核号，再用帖子配图比指纹——对上了才换结论。"
+            "只在配了登录 cookie、且这一单还没找到可靠出处时才会跑。"
+        ),
+        json_schema_extra=_ui(
+            "转载页反查微博原帖",
+            "默认开。需要登录 cookie；没配就一直跳过，行为和以前一样。",
+        ),
     )
 
 
@@ -2307,6 +2333,23 @@ class ImageSearcherPlugin(MaiBotPlugin):
         # 视觉命中但指纹对不上：翻不到那人自己发的这张，就只算线索，不当结论。
         # 放在所有兜底之后——先让水印、署名、按名字换号这些硬线索把结论换掉。
         best = await self._require_vision_proof(best, upload, route)
+
+        # 转载页（新浪这类）的正文往往就是原微博的正文：顺着它去微博搜帖、或者按
+        # 页面标出来的作者核号，再拿配图比指纹。对上了就是找到了，落点换成那条帖。
+        # 只在还没有可靠结论时跑，且必须配了登录 cookie（帖搜索要登录态）。
+        if (
+            upload
+            and ordered
+            and target_hash is not None
+            and (best is None or best.status != "match")
+        ):
+            try:
+                weibo_post = await self._hunt_weibo_repost(ordered, target_hash)
+            except Exception as error:  # noqa: BLE001 - 查不到不影响已经搜到的结果
+                self.ctx.logger.warning("转载页微博反查失败：%s", error)
+                weibo_post = None
+            if weibo_post and weibo_post.get("status") == "hit":
+                best = self._promote_weibo_post(best, weibo_post)
 
         # Grok 给了具体帖子或账号，也算有结论：前者是找到，后者是线索。
         grok_hit = bool(grok_info and grok_info.get("tier") in {"post", "account"})
@@ -3878,6 +3921,15 @@ class ImageSearcherPlugin(MaiBotPlugin):
         for label, raw in whole:
             if await read(raw, label if label != "原图" else ""):
                 return
+        # 整图都读空了才轮到「两步读」：先只问水印在哪（不抄字），再按坐标从原图
+        # 裁一块放大读。两次调用封顶，比切六块便宜一半以上，而且裁的是原图，小字
+        # 不会被缩放吃掉。用户 11-13 点名要的就是这个顺序：定位 → 放大 → 兜底。
+        if bool(getattr(section, "watermark_locate", True)):
+            for label, raw in whole[: self._WATERMARK_LOCATE_LIMIT]:
+                if calls >= self._WATERMARK_REREAD_BUDGET:
+                    break
+                if await self._locate_and_read(raw, label, read):
+                    return
         if not tiles_on:
             return
         for label, raw in whole:
@@ -3890,6 +3942,10 @@ class ImageSearcherPlugin(MaiBotPlugin):
     # 追查模式最多读几张候选图。候选图算指纹时都下载过，重取一张不贵，但视觉调用
     # 一次两三秒，三张够了——真带水印的那张通常就是距离最近的那条。
     _CANDIDATE_WATERMARK_LIMIT = 3
+
+    # 两步读最多对几张图跑（原图一张、最像的候选图一张）。每张最多两次视觉调用：
+    # 一次定位、一次读放大后的那一块。
+    _WATERMARK_LOCATE_LIMIT = 2
 
     # 这一轮兜底最多花多少次视觉调用。三张候选图 + 整图 + 六块，正好一轮；超了
     # 就按顺序砍掉后面的，兜底不能把整单拖成几分钟。
@@ -3908,6 +3964,66 @@ class ImageSearcherPlugin(MaiBotPlugin):
             key=lambda item: (item.distance if item.distance is not None else 999, item.rank)
         )
         return rows[: cls._CANDIDATE_WATERMARK_LIMIT]
+
+    async def _locate_watermark(self, data_url: str) -> dict[str, Any] | None:
+        """只问「水印在哪」，不抄字。一次视觉调用换一个坐标框。"""
+        section = self.config.vision
+        timeout = max(10, int(section.timeout))
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": vision.build_locate_prompt()},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }
+        ]
+        options: dict[str, Any] = {
+            "prompt": messages,
+            "task_name": section.task or "vlm",
+            "temperature": 0.0,
+            # 只要一个框，给多了模型会开始描述画面。
+            "max_tokens": 120,
+        }
+        if section.model:
+            options["model_name"] = section.model
+        try:
+            result = await asyncio.wait_for(
+                self.ctx.call_capability("llm.generate", timeout_ms=timeout * 1000, **options),
+                timeout=timeout + 5,
+            )
+        except Exception as error:  # noqa: BLE001 - 定位失败就退回切块
+            self._vlog("水印定位调用失败：%s", str(error)[:60])
+            return None
+        payload = result if isinstance(result, dict) else {"success": True, "response": str(result or "")}
+        if not payload.get("success", True):
+            self._vlog("水印定位返回失败：%s", str(payload.get("error"))[:60])
+            return None
+        text = str(payload.get("response") or payload.get("reasoning") or "")
+        return vision.parse_locate_reply(text)
+
+    async def _locate_and_read(self, source: bytes, label: str, read: Any) -> bool:
+        """两步读：定位 → 从原图裁下来放大 → 读字。返回 True 表示这一步就读到了。"""
+        where = f"[{label}]" if label and label != "原图" else ""
+        try:
+            data_url, _width, _height = await asyncio.to_thread(vision.data_url_for, source)
+        except Exception as error:  # noqa: BLE001 - 编码失败只影响这一步
+            self._vlog("水印定位跳过%s：原图编码失败 %s", where, str(error)[:40])
+            return False
+        located = await self._locate_watermark(data_url)
+        if not located or not located.get("box"):
+            self._vlog("水印定位%s：图上没找到小字", where)
+            return False
+        try:
+            crop_url, box = await asyncio.to_thread(vision.crop_data_url, source, located["box"])
+        except Exception as error:  # noqa: BLE001 - 裁不出来就退回切块
+            self._vlog("水印定位%s 裁剪失败：%s", where, str(error)[:40])
+            return False
+        spot = str(located.get("where") or "").strip() or "定位点"
+        self.ctx.logger.info(
+            "水印定位%s：%s，裁剪框=%s，放大后送读", where, spot, box
+        )
+        return await read(source, f"{label or '原图'}-{spot}", data_url=crop_url)
 
     async def _reread_one(
         self,
@@ -5046,6 +5162,239 @@ class ImageSearcherPlugin(MaiBotPlugin):
             ):
                 weaker = candidate
         return weaker
+
+    # 转载页反查的上限：抓两页、每页最多核 3 条帖、每条最多比 3 张配图。
+    # 这一路只在「还没找到可靠出处」时才跑，一次几十秒，不能拖成几分钟。
+    _WEIBO_REPOST_MAX_PAGES = 2
+    _WEIBO_REPOST_MAX_POSTS = 3
+    _WEIBO_REPOST_MAX_PICS = 3
+    _WEIBO_TIMELINE_POSTS = 20
+
+    async def _fetch_page_html(self, url: str) -> str:
+        """抓一页 HTML（给转载页反查用）。抓不到返回空串，不影响已有结论。"""
+
+        def fetch() -> str:
+            session = make_session(self._proxy())
+            try:
+                response = session.get(
+                    url,
+                    timeout=12,
+                    headers={
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/131.0 Safari/537.36"
+                        ),
+                        "Accept": "text/html,application/xhtml+xml",
+                    },
+                )
+                if response.status_code != 200:
+                    return ""
+                return response.text[:400000]
+            finally:
+                session.close()
+
+        try:
+            return await asyncio.wait_for(asyncio.to_thread(fetch), timeout=16)
+        except Exception:  # noqa: BLE001 - 页面读不到只少一条线索
+            return ""
+
+    async def _weibo_pic_hit(
+        self,
+        pic_ids: object,
+        url: str,
+        target_hash: int | None,
+    ) -> int | None:
+        """拿一条微博帖的配图比指纹，命中返回距离，没命中返回 None。
+
+        只比前几张：微博一条帖常带九宫格，水印和构图最靠前的通常就是主图。
+        """
+        if target_hash is None:
+            return None
+        threshold = int(self.config.plugin.hash_threshold)
+        section = self.config.plugin
+        for pic_url in weibopost.large_pic_urls(pic_ids, limit=self._WEIBO_REPOST_MAX_PICS):  # type: ignore[arg-type]
+            candidate = Candidate(engine="weibo", url=url, image_url=pic_url)
+            try:
+                checked = await asyncio.to_thread(
+                    verify_candidate,
+                    candidate,
+                    target_hash,
+                    threshold,
+                    self._proxy(),
+                    section.download_timeout,
+                    self._fake_ip_nets(),
+                )
+            except Exception:  # noqa: BLE001 - 单张取不到就试下一张
+                continue
+            if checked.distance is not None and checked.distance <= threshold:
+                return int(checked.distance)
+        return None
+
+    async def _weibo_author_post(
+        self,
+        author: str,
+        target_hash: int | None,
+    ) -> dict[str, Any] | None:
+        """转载页上写着微博作者名：核到这个号，翻她最近的带图帖比指纹。
+
+        比搜帖更便宜也更准——名字是页面自己标的，不依赖微博有没有把那条帖索引到
+        检索结果里。翻不到不返回 hit，交给搜帖那条路。
+        """
+        try:
+            rows = await self._search_weibo_users(author)
+        except Exception as error:  # noqa: BLE001 - 查不到就换搜帖那条路
+            self._vlog("转载页作者 %s 搜号失败：%s", author, str(error)[:60])
+            return None
+        if not rows:
+            return None
+        top = rows[0]
+        if not identity.weibo_name_matches(author, str(top.get("name") or "")):
+            return None
+        uid = str(top.get("uid") or "")
+        if not uid:
+            return None
+        try:
+            posts = await asyncio.to_thread(
+                identity.fetch_weibo_timeline,
+                uid,
+                self._proxy(),
+                18,
+                self._weibo_cookie(),
+                1,
+                self._WEIBO_TIMELINE_POSTS,
+            )
+        except Exception as error:  # noqa: BLE001 - 翻不到帖就换搜帖
+            self._vlog("转载页作者 %s 翻帖失败：%s", top.get("name"), str(error)[:60])
+            return None
+        for post in posts:
+            if not post.get("pic_ids"):
+                continue
+            distance = await self._weibo_pic_hit(post.get("pic_ids"), str(post.get("url") or ""), target_hash)
+            if distance is None:
+                continue
+            self.ctx.logger.info(
+                "转载页反查：作者 %s（UID %s）的帖子 %s 指纹距离 %s",
+                top.get("name"),
+                uid,
+                post.get("url"),
+                distance,
+            )
+            return {
+                "status": "hit",
+                "kind": "author",
+                "uid": uid,
+                "name": str(top.get("name") or ""),
+                "followers": int(top.get("followers") or 0),
+                "url": str(post.get("url") or ""),
+                "distance": distance,
+                "image": weibopost.large_pic_urls(post.get("pic_ids"), limit=1)[0],
+            }
+        return None
+
+    async def _hunt_weibo_repost(
+        self,
+        ordered: list[Candidate],
+        target_hash: int | None,
+    ) -> dict[str, Any] | None:
+        """转载页 → 微博原帖：页面标了作者就核她，没标就拿正文去搜帖，最后比指纹。
+
+        `s-20261113-1250-26a8` 的正确答案是 G44不会受伤 的微博，而候选里只有一条
+        `sina.cn` 的转载页（距离 11）。那页正文与微博原文一字不差，页头还写着
+        「G44不会受伤 / 微博认证：动漫博主」——两条路都能通，命中与否只看配图
+        指纹对不对得上。
+
+        只当结论用硬证据：搜帖只负责找人，认人仍然靠图。对不上就什么都不改。
+        """
+        section = self.config.weibo
+        if not bool(getattr(section, "enabled", True)):
+            return None
+        if not bool(getattr(section, "repost_search", True)):
+            return None
+        if not self._weibo_cookie():
+            return None
+        pages = [
+            item
+            for item in ordered
+            if weibopost.is_weibo_repost_page(item.url or "", item.platform or "")
+        ]
+        if not pages:
+            return None
+        pages.sort(key=lambda item: (item.distance if item.distance is not None else 999, item.rank))
+        for page in pages[: self._WEIBO_REPOST_MAX_PAGES]:
+            html = await self._fetch_page_html(page.url or "")
+            if not html:
+                continue
+            title, body = weibopost.page_text(html)
+            author = weibopost.page_author(body)
+            self._vlog(
+                "转载页反查：%s 标题=%s 作者=%s",
+                weibopost.host_of(page.url or ""),
+                (title or "无")[:40],
+                author or "无",
+            )
+            if author:
+                hit = await self._weibo_author_post(author, target_hash)
+                if hit:
+                    return hit
+            for query in weibopost.post_queries(title, body, author):
+                try:
+                    posts = await asyncio.to_thread(
+                        identity.search_weibo_posts,
+                        query,
+                        self._proxy(),
+                        20,
+                        self._weibo_cookie(),
+                        self._WEIBO_REPOST_MAX_POSTS,
+                    )
+                except Exception as error:  # noqa: BLE001 - 一次搜不到就试下一条检索词
+                    self._vlog("转载页搜帖失败（%s）：%s", query, str(error)[:60])
+                    continue
+                self._vlog("转载页搜帖：q=%s → %s 条", query, len(posts))
+                for post in posts:
+                    distance = await self._weibo_pic_hit(
+                        post.get("pic_ids"), str(post.get("url") or ""), target_hash
+                    )
+                    if distance is None:
+                        continue
+                    self.ctx.logger.info(
+                        "转载页反查命中：%s（%s）指纹距离 %s",
+                        post.get("name"),
+                        post.get("url"),
+                        distance,
+                    )
+                    return {
+                        "status": "hit",
+                        "kind": "post",
+                        "uid": str(post.get("uid") or ""),
+                        "name": str(post.get("name") or ""),
+                        "url": str(post.get("url") or ""),
+                        "distance": distance,
+                        "query": query,
+                        "image": weibopost.large_pic_urls(post.get("pic_ids"), limit=1)[0],
+                    }
+        return {"status": "miss"}
+
+    def _promote_weibo_post(self, best: Candidate | None, info: dict[str, Any]) -> Candidate:
+        """把转载页反查到的微博帖变成结论。"""
+        distance = int(info.get("distance") or 0)
+        name = str(info.get("name") or "")
+        uid = str(info.get("uid") or "")
+        post = Candidate(
+            engine="weibo_post",
+            url=str(info.get("url") or ""),
+            image_url=str(info.get("image") or ""),
+            distance=distance,
+            status="match",
+            note=f"转载页正文反查到原帖，配图指纹距离 {distance}",
+            platform="微博",
+            name=name,
+            handle=uid,
+        ).finalize()
+        if not post.title:
+            post.title = f"微博 {name}".strip()
+        self._vlog("转载页反查：结论换成微博 %s（%s）", name or uid, post.url)
+        return post
 
     async def _search_x_handles(self, name: str, limit: int = 3) -> list[str]:
         """昵称 → 疑似 X 号，跑一次网页检索。

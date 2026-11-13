@@ -794,5 +794,75 @@ class WatermarkTileTest(unittest.TestCase):
             vision.tile_data_urls(b"not an image")
 
 
+class WatermarkLocateTest(unittest.TestCase):
+    """水印两步读：先定位、再按坐标从原图裁剪放大（用户 11-13 定的顺序）。
+
+    背景：s-20261113-1250-78fc 的水印就写在右下角，整图那一次模型回空串，
+    Grok 读成「@清水如浊蛋黄」；把右下角裁出来放大，肉眼一清二楚——
+    「@清水奶油蛋糕」。
+    """
+
+    def test_parses_xywh_reply(self) -> None:
+        reply = (
+            '```json\n{"present": true, "x": 0.62, "y": 0.91, "w": 0.3, "h": 0.06,'
+            ' "where": "右下角"}\n```'
+        )
+        box = vision.parse_locate_reply(reply)
+        self.assertIsNotNone(box)
+        self.assertEqual(box["where"], "右下角")
+        left, top, width, height = box["box"]
+        self.assertAlmostEqual(left, 0.62)
+        self.assertAlmostEqual(top, 0.91)
+        self.assertAlmostEqual(width, 0.3)
+        self.assertAlmostEqual(height, 0.06)
+
+    def test_parses_box_array_and_percent(self) -> None:
+        box = vision.parse_locate_reply('{"present": true, "box": [10, 20, 30, 8]}')
+        self.assertIsNotNone(box)
+        left, top, width, height = box["box"]
+        self.assertAlmostEqual(left, 0.10)
+        self.assertAlmostEqual(top, 0.20)
+        self.assertAlmostEqual(width, 0.30)
+        self.assertAlmostEqual(height, 0.08)
+
+    def test_no_watermark_returns_none(self) -> None:
+        self.assertIsNone(vision.parse_locate_reply('{"present": false}'))
+        self.assertIsNone(vision.parse_locate_reply("图上没有水印"))
+        self.assertIsNone(vision.parse_locate_reply(""))
+
+    def test_tiny_or_broken_box_rejected(self) -> None:
+        self.assertIsNone(vision.parse_locate_reply('{"present": true, "x": 0.5, "y": 0.5, "w": 0.001, "h": 0.001}'))
+        self.assertIsNone(vision.parse_locate_reply('{"present": true, "x": "a", "y": 0.5}'))
+
+    def test_crop_uses_original_pixels_and_pads(self) -> None:
+        raw = _sample(11, (4000, 6000))
+        url, box = vision.crop_data_url(raw, (0.6, 0.85, 0.3, 0.1), pad=0.1, max_side=1400)
+        self.assertTrue(url.startswith("data:image/jpeg;base64,"))
+        left, top, right, bottom = box
+        # 按原图 4000×6000 算：0.6*4000=2400 起，留 10% 余量再往外扩一点。
+        self.assertLess(left, 2400)
+        self.assertGreater(right, 3600)
+        self.assertGreater(bottom, 5700)
+        self.assertLessEqual(right, 4000)
+        self.assertLessEqual(bottom, 6000)
+        image = Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1])))
+        self.assertLessEqual(max(image.size), 1401)
+
+    def test_crop_upscales_small_region(self) -> None:
+        """裁出来的那一块要比原图那块大，否则等于没放大。"""
+        raw = _sample(12, (2000, 2000))
+        url, box = vision.crop_data_url(raw, (0.4, 0.4, 0.1, 0.05), max_side=1200)
+        image = Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1])))
+        original_width = box[2] - box[0]
+        self.assertGreater(image.size[0], original_width)
+
+    def test_crop_rejects_tiny_box_and_bad_bytes(self) -> None:
+        raw = _sample(13, (800, 800))
+        with self.assertRaises(ValueError):
+            vision.crop_data_url(raw, (0.5, 0.5, 0.0001, 0.0001))
+        with self.assertRaises(ValueError):
+            vision.crop_data_url(b"not an image", (0.1, 0.1, 0.2, 0.2))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -225,6 +225,120 @@ def data_url_for(raw: bytes, *, max_side: int = 1600) -> tuple[str, int, int]:
     )
 
 
+LOCATE_PROMPT = """先不要抄字，只找位置。这张照片上如果有水印、署名、账号角标这类小字，
+请说出它在画面的哪个位置，并给一个紧贴它的矩形框。
+
+坐标用相对值（0 到 1，左上角是 0,0，右下角是 1,1）：
+- x、y 是矩形左上角，w、h 是宽和高；
+- 框要把那行字整个框住，别框整张图，也别只框一个字；
+- 拿不准就框大一点，宁可多带背景。
+
+只看图上的小字，不要描述画面内容，不要猜角色。没有水印就 present=false。
+
+只输出一行 JSON，不要解释、不要代码块：
+{"present": true, "x": 0.62, "y": 0.91, "w": 0.3, "h": 0.06, "where": "右下角"}
+没有就输出：{"present": false}
+"""
+
+# 定位框的解析下限：太小的框（几个百分点）多是把噪点当字，裁出来读也白读。
+LOCATE_MIN_SIDE = 0.02
+
+
+def build_locate_prompt() -> str:
+    return LOCATE_PROMPT
+
+
+def parse_locate_reply(text: str = "") -> dict[str, object] | None:
+    """解析「水印在哪」那一步的返回：{'box': (x, y, w, h), 'where': '右下角'}。
+
+    坐标一律归一化到 0~1；超出这个范围、或者宽高小得离谱的，当作没定位到。
+    读不出结构就返回 None，让上层退回原来的切块方案。
+    """
+    match = _JSON_BLOCK.search(_FENCE.sub("", text or ""))
+    if not match:
+        return None
+    try:
+        payload = json.loads(match.group(0))
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if not bool(payload.get("present", True)):
+        return None
+    box = payload.get("box") if isinstance(payload.get("box"), (list, tuple)) else None
+    if box and len(box) >= 4:
+        try:
+            values = [float(item) for item in box[:4]]
+        except (TypeError, ValueError):
+            values = []
+    else:
+        try:
+            values = [
+                float(payload.get("x")),
+                float(payload.get("y")),
+                float(payload.get("w")),
+                float(payload.get("h")),
+            ]
+        except (TypeError, ValueError):
+            return None
+    if len(values) != 4:
+        return None
+    # 有的模型会把百分比写成 62 而不是 0.62，按 100 归一一次。
+    if max(values) > 1.0 and max(values) <= 100.0:
+        values = [value / 100.0 for value in values]
+    left, top, width, height = (min(max(value, 0.0), 1.0) for value in values)
+    width = min(width, 1.0 - left)
+    height = min(height, 1.0 - top)
+    if width < LOCATE_MIN_SIDE or height < LOCATE_MIN_SIDE:
+        return None
+    return {
+        "box": (left, top, width, height),
+        "where": str(payload.get("where") or "").strip()[:20],
+    }
+
+
+def crop_data_url(
+    raw: bytes,
+    box: tuple[float, float, float, float],
+    *,
+    pad: float = 0.08,
+    max_side: int = 1600,
+    max_upscale: float = 3.0,
+) -> tuple[str, tuple[int, int, int, int]]:
+    """按归一化框从**原图**上裁一块，放大到能看清字，返回 (data_url, 像素框)。
+
+    这里绝不能用缩过的整图：水印本来就是小字，缩一次就没了。四周留一圈余量，
+    是因为模型给的框常常差半个字，切在字上等于白读。
+    """
+    image = _decode(raw)
+    if image is None:
+        raise ValueError("图片解码失败")
+    width, height = image.size
+    left, top, box_w, box_h = box
+    x0 = int(round(left * width))
+    y0 = int(round(top * height))
+    x1 = int(round((left + box_w) * width))
+    y1 = int(round((top + box_h) * height))
+    pad_x = int(round((x1 - x0) * pad))
+    pad_y = int(round((y1 - y0) * pad))
+    x0 = max(0, x0 - pad_x)
+    y0 = max(0, y0 - pad_y)
+    x1 = min(width, x1 + pad_x)
+    y1 = min(height, y1 + pad_y)
+    if x1 - x0 < 24 or y1 - y0 < 24:
+        raise ValueError("裁剪区域太小")
+    crop = image.crop((x0, y0, x1, y1))
+    crop_w, crop_h = crop.size
+    scale = float(max_side) / max(1, max(crop_w, crop_h))
+    scale = min(scale, max_upscale)
+    if abs(scale - 1.0) > 0.02:
+        crop = crop.resize((max(1, int(crop_w * scale)), max(1, int(crop_h * scale))))
+    buffer = io.BytesIO()
+    crop.convert("RGB").save(buffer, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+    url = "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+    return url, (x0, y0, x1, y1)
+
+
 def parse_watermark_reply(text: str) -> dict[str, str]:
     """读水印那次调用的返回：{'text': 原文, 'account': 账号}，读不到就是空串。"""
     match = _JSON_BLOCK.search(_FENCE.sub("", text or ""))
