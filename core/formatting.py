@@ -679,8 +679,10 @@ def _vision_watermark_line(outcome: SearchOutcome) -> str:
             detail = "已核实这个号存在" + (f"（用户 ID {user_id}）" if user_id else "")
             if note:
                 detail += f"，但{note}"
+            # 「可能读错」只说一次：note 自己讲了就不再在括号里叠一遍。
+            caveat = "" if "读错" in note else "（视觉模型识别，可能读错）"
             lines.append(
-                f"🔎 图上水印（线索，不是结论）：{text}（视觉模型识别，可能读错）：{url} —— {detail}"
+                f"🔎 图上水印（线索，不是结论）：{text}{caveat}：{url} —— {detail}"
             )
         elif disagree:
             # 两个模型读得不一样，连是哪个号都没定：这时候再附主页，用户点进去
@@ -689,7 +691,8 @@ def _vision_watermark_line(outcome: SearchOutcome) -> str:
         elif url:
             lines.append(f"🔎 图上水印：{text}（视觉模型识别，可能读错，可点开核对）：{url}")
         elif note:
-            lines.append(f"🔎 图上水印：{text}（视觉模型识别，可能读错；{note}）")
+            caveat = "" if "读错" in note else "视觉模型识别，可能读错；"
+            lines.append(f"🔎 图上水印：{text}（{caveat}{note}）")
         else:
             lines.append(f"🔎 图上水印：{text}（视觉模型识别，可能读错）")
     if disagree:

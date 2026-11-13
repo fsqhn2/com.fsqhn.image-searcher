@@ -3653,9 +3653,8 @@ class ImageSearcherPlugin(MaiBotPlugin):
             )
             self._vlog("水印核对命中：@%s → %s（距离 %s）", handle, post, distance)
             return
-        vision_info["watermark_note"] = (
-            "最近十几条带图帖和搜索结果里都没有这张，可能是模型读错了"
-        )
+        # 「可能读错」这句由渲染那边统一写在括号里，这里再说一次就重复了。
+        vision_info["watermark_note"] = "最近十几条带图帖和搜索结果里都没有这张"
         self._vlog("水印核对没命中：@%s", handle)
 
     # 关注列表最多看多少个号：接口一页就是 50 个，再多也拿不到。

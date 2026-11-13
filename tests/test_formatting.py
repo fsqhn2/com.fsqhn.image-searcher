@@ -1564,6 +1564,21 @@ class WatermarkProfileTest(unittest.TestCase):
         self.assertIn("线索，不是结论", text)
         self.assertNotIn("核对上了", text)
 
+    def test_wrong_read_hint_is_written_once(self) -> None:
+        """「可能读错」只能出现一次：note 自带这句时，括号里不再叠一遍。"""
+        outcome = SearchOutcome()
+        outcome.vision = {
+            "watermark": "X@Halloween",
+            "watermark_handle": "Halloween",
+            "watermark_url": "https://x.com/halloween",
+            "watermark_state": "ok",
+            "watermark_user_id": "388575726",
+            "watermark_note": "最近十几条带图帖和搜索结果里都没有这张，可能是模型读错了",
+        }
+        text = formatting._best_block(outcome)
+        self.assertEqual(text.count("读错"), 1, text)
+        self.assertIn("388575726", text)
+
 
 class WatermarkSameAccountTest(unittest.TestCase):
     """水印读法跟结论只差一个符号时，不能摆出另一个同名账号来打自己的脸。"""
