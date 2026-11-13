@@ -663,6 +663,10 @@ _WATERMARK_ID_PREFIX = re.compile(
 # 小字里 ``id=`` 的等号常被读成 c，``id=NothingLose`` 就成了 ``idcNothingLose``。
 # 只在紧挨着的时候才认这个 c，免得 ``id cosplay`` 也被当成账号。
 _WATERMARK_IDC = re.compile(r"@?\s*\bidc([A-Za-z0-9_]{4,15})", re.I)
+# 版权符后面跟名字也是常见署名写法：``© Ryomky``。实测 s-20261113-1402-6a76
+# 图上写着 © Ryomky，机器人自己的「理解图片」也读成 © Ryamky，可取号函数只认
+# @ 和 id=，于是这条唯一指向本人的线索被整条丢掉。
+_WATERMARK_COPY = re.compile(r"[©Ⓒ]\s*@?([A-Za-z0-9_.]{3,30})")
 # 模型说「没有」的各种写法。水印常常小到只有一个像素高，它照样会回一句「看不清」，
 # 这种不能当成「读到了一个 ID」。
 _WATERMARK_EMPTY = (
@@ -773,7 +777,7 @@ def handles_from_watermark(text: str, limit: int = 3) -> list[str]:
         if name not in found:
             found.append(name)
 
-    for pattern in (_WATERMARK_ID_PREFIX, _WATERMARK_IDC):
+    for pattern in (_WATERMARK_ID_PREFIX, _WATERMARK_IDC, _WATERMARK_COPY):
         for match in pattern.finditer(value):
             add(match.group(1))
     for match in _WATERMARK_HANDLE.finditer(value):

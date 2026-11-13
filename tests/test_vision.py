@@ -224,6 +224,21 @@ class WatermarkTest(unittest.TestCase):
         self.assertIn("NothingLose", found)
         self.assertGreaterEqual(len(found), 2)
 
+    def test_handles_from_watermark_reads_copyright_name(self):
+        """``© Ryomky`` 这种署名也要能取出来。
+
+        s-20261113-1402-6a76 图上写着 © Ryomky，旧代码只认 @ 和 id=，这条唯一
+        指向本人的线索被整条丢掉，最后结论停在斗鱼的报道页。
+        """
+        self.assertEqual(vision.handles_from_watermark("© Ryomky"), ["Ryomky"])
+        self.assertIn("Ryomky", vision.handles_from_watermark("水印 © Ryomky 2026"))
+        # 版权符后面跟年份、纯数字不能当账号
+        self.assertEqual(vision.handles_from_watermark("© 2026"), [])
+
+    def test_cjk_watermark_is_not_a_handle(self):
+        """中文昵称取不出 X 号——它只能是微博那类平台，交给上层去核。"""
+        self.assertEqual(vision.handles_from_watermark("@兔子兔子兔w"), [])
+
     def test_id_name_from_watermark(self):
         self.assertEqual(vision.id_name_from_watermark("Reng♡ @id.NothingLose"), "NothingLose")
         self.assertEqual(vision.id_name_from_watermark("@idcNothinglose"), "Nothinglose")

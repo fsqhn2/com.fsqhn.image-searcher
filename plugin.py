@@ -404,15 +404,16 @@ class VisionConfig(PluginConfigBase):
     watermark_on_repost: bool = Field(
         default=True,
         description=(
-            "搬运站命中时也读水印：指纹已经命中，但落点是 arca.live、dcinside、reddit、"
-            "贴吧这类社区/搬运站、又没给出账号时，仍然把原图交给视觉模型读一遍水印。"
-            "这类页面往往只是转贴，图上写的水印账号才是唯一还能指到本人的线索；"
-            "只在落点没有账号时触发，读到的水印仍只当线索，不会因此改掉已经命中的那条。"
+            "命中落点没有账号时也读水印：指纹已经对上，但落点是 arca.live、reddit、贴吧"
+            "这类社区/搬运站，或者新闻页、活动报道页这种说不出作者是谁的页面时，仍然把"
+            "原图交给视觉模型读一遍水印。这类页面往往只是转贴，图上写的水印账号才是唯一"
+            "还能指到本人的线索；只在落点没有账号时触发，读到水印仍只当线索，要核到本人"
+            "发过这张图才会换掉原来那条。"
         ),
         json_schema_extra=_ui(
-            "搬运站命中时也读水印",
-            "默认开。命中搬运站时额外跑一次视觉读水印，命中本人的带图帖才会顶掉搬运站那条；"
-            "关掉就沿用原来的行为——有命中就收工，不再花这一次调用。",
+            "落点没账号时也读水印",
+            "默认开。命中页面说不出作者（搬运站、新闻页、报道页）时额外跑一次视觉读水印，"
+            "核到本人的帖才会顶掉原来那条；关掉就沿用原来的行为——有命中就收工，不再花这一次调用。",
         ),
     )
     watermark_variants: bool = Field(
@@ -1948,7 +1949,11 @@ class ImageSearcherPlugin(MaiBotPlugin):
             and config.vision.watermark_on_repost
             and best is not None
             and not (best.handle or "").strip()
-            and is_repost_site(best.url or "", best.platform or "")
+            # 这里以前还要求落点在写死的搬运站名单里（arca、reddit、图集站…）。
+            # s-20261113-1402-6a76 命中的是斗鱼的活动报道页（指纹距离 1，同一张图），
+            # 斗鱼不在名单里，于是水印一次都没读——而图上右下角写着 © Ryomky，
+            # 正主就是这个名字的微博号。判据换成更本质的一条：命中落点根本没有
+            # 账号，就说不清是谁发的，值得读一次水印再往下核。
         )
         vision_info: dict[str, Any] | None = None
         grok_info: dict[str, Any] | None = None
@@ -2306,11 +2311,36 @@ class ImageSearcherPlugin(MaiBotPlugin):
         # 或者那个号在 X 上查无此人，都值得去微博搜一次。只当线索——微博没有独立
         # handle，昵称重名太常见，粉丝数就写在旁边让用户自己判断。
         weibo_clue: dict[str, Any] | None = None
-        if upload and ordered and not (best is not None and best.status == "match"):
+        # 已经有结论、且结论落在具体账号上时才跳过：那种情况本人已经知道了。
+        # 落点没有账号（新闻页、活动报道页那种）仍然要查——s-20261113-1402-6a76
+        # 命中斗鱼的报道页，图上却写着 © Ryomky，正主是微博号 Ryomky。
+        if (
+            upload
+            and ordered
+            and not (
+                best is not None
+                and best.status == "match"
+                and (best.handle or "").strip()
+            )
+        ):
             try:
-                weibo_clue = await self._hunt_weibo(ordered, vision_info, grok_info)
+                weibo_clue = await self._hunt_weibo(
+                    ordered, vision_info, grok_info, target_hash
+                )
             except Exception as error:  # noqa: BLE001 - 查不到不影响已经搜到的结果
                 self.ctx.logger.warning("微博反查失败：%s", error)
+            if weibo_clue and weibo_clue.get("post"):
+                # 微博那边指纹对上了：本人发的帖比「某网站的报道页」硬得多。
+                best = self._promote_weibo_post(
+                    best,
+                    {
+                        "distance": int(weibo_clue.get("distance") or 0),
+                        "name": str(weibo_clue.get("name") or ""),
+                        "uid": str(weibo_clue.get("uid") or ""),
+                        "url": str(weibo_clue.get("post") or ""),
+                        "image": str(weibo_clue.get("image") or ""),
+                    },
+                )
 
         # 付费内容线索：搬运站和泄露站按名字建页，有页就说明这个人确实在做
         # OnlyFans。它同样不改 best，只多给一个可以核对的号。
@@ -2349,7 +2379,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 self.ctx.logger.warning("转载页微博反查失败：%s", error)
                 weibo_post = None
             if weibo_post and weibo_post.get("status") == "hit":
-                best = self._promote_weibo_post(best, weibo_post)
+                best = self._promote_weibo_post(
+                    best, {**weibo_post, "note": "转载页正文反查到原帖"}
+                )
 
         # Grok 给了具体帖子或账号，也算有结论：前者是找到，后者是线索。
         grok_hit = bool(grok_info and grok_info.get("tier") in {"post", "account"})
@@ -4052,13 +4084,29 @@ class ImageSearcherPlugin(MaiBotPlugin):
             self._vlog("重读水印没成%s：%s", where, info.get("error") or "-")
             return False
         raw = str(info.get("watermark") or "").strip()
-        handles = vision.handles_from_watermark(raw)
-        if not handles:
-            self._vlog("重读水印%s：文字=%s，没读出账号", where, raw or "-")
+        found_handles = vision.handles_from_watermark(raw)
+        if not found_handles:
+            # 中文昵称不是 X 号，取号函数一个字符都抽不出来，但它是微博那类平台的
+            # 唯一线索。s-20261113-1402-bd67 就是这样：图上明明写着 @兔子兔子兔w，
+            # 这里回一句「没读出账号」把它丢了，最后报未找到，而正确答案就是她。
+            # 所以留下来交给微博反查，核不核得上是那一步的事。
+            names = [name for name in handles.at_names([raw], limit=2) if handles.has_cjk(name)]
+            if not names:
+                self._vlog("重读水印%s：文字=%s，没读出账号", where, raw or "-")
+                return False
+            if not str(vision_info.get("watermark") or "").strip():
+                vision_info["watermark"] = raw
+            if not str(vision_info.get("watermark_text") or "").strip():
+                vision_info["watermark_text"] = raw
+            self._vlog(
+                "重读水印%s：文字=%s 是中文昵称（X 上没有），留给微博核",
+                where,
+                "、".join(names),
+            )
             return False
-        fresh = [handle for handle in handles if handle.lower() not in known]
+        fresh = [handle for handle in found_handles if handle.lower() not in known]
         if not fresh:
-            self._vlog("重读水印%s：还是 @%s，不重复核", where, "、@".join(handles))
+            self._vlog("重读水印%s：还是 @%s，不重复核", where, "、@".join(found_handles))
             return False
         landed = False
         for index, handle in enumerate(fresh):
@@ -5016,11 +5064,38 @@ class ImageSearcherPlugin(MaiBotPlugin):
 
         return await asyncio.wait_for(asyncio.to_thread(fetch), timeout=32)
 
+    async def _with_weibo_post(
+        self, row: dict[str, Any], target_hash: int | None
+    ) -> dict[str, Any]:
+        """微博核到人之后再往前一步：翻她的带图帖比指纹，对上就把结论换成那条帖。
+
+        只报「主页 + 粉丝数」对用户没什么用——他还得自己点进去翻。
+        s-20261113-1402-bd67 的正确答案就是水印上那个 @兔子兔子兔w 的帖子，
+        翻到第几条都行，只要指纹对得上。翻不到就退回原来的线索。
+        """
+        if target_hash is None or not self._weibo_cookie():
+            # 没登录态翻不了帖（帖搜索、时间线都要 cookie），只报主页就行。
+            return row
+        hit = await self._weibo_uid_post(
+            str(row.get("uid") or ""),
+            str(row.get("name") or ""),
+            int(row.get("followers") or 0),
+            target_hash,
+        )
+        if not hit:
+            return row
+        merged = dict(row)
+        merged["post"] = str(hit.get("url") or "")
+        merged["distance"] = int(hit.get("distance") or 0)
+        merged["image"] = str(hit.get("image") or "")
+        return merged
+
     async def _hunt_weibo(
         self,
         ordered: list[Candidate],
         vision_info: dict[str, Any] | None,
         grok_info: dict[str, Any] | None,
+        target_hash: int | None = None,
     ) -> dict[str, Any] | None:
         """读到微博号时去微博站内搜一遍，把主页和粉丝数当线索留下来。
 
@@ -5062,6 +5137,15 @@ class ImageSearcherPlugin(MaiBotPlugin):
             if handle and handle not in names:
                 names.append(handle)
         if not uids and not names:
+            # 水印上写着「© Ryomky」这种署名时，既没有 @、也不是微博写法，上面两步
+            # 都抽不到东西。可那常常就是本人的昵称——s-20261113-1402-6a76 的正主
+            # 就是 Ryomky 的微博。只在别的线索一个都没有时才拿它去试，免得平白
+            # 多搜一遍、多出一堆同名的路人号。
+            for text in seal_texts:
+                for handle in vision.handles_from_watermark(text, limit=2):
+                    if handle not in names:
+                        names.append(handle)
+        if not uids and not names:
             return None
 
         def source_of(name: str) -> str:
@@ -5093,7 +5177,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 "min_fans": floor,
             }
             self._vlog("微博反查：UID %s → %s（粉丝 %s）", uid, row["name"], followers)
-            return row
+            return await self._with_weibo_post(row, target_hash)
         for name in names[:2]:
             try:
                 rows = await self._search_weibo_users(name)
@@ -5119,17 +5203,20 @@ class ImageSearcherPlugin(MaiBotPlugin):
                         followers,
                         source,
                     )
-                    return {
-                        "status": "hit",
-                        "kind": "name",
-                        "query": name,
-                        "uid": str(top.get("uid") or ""),
-                        "name": str(top.get("name") or ""),
-                        "followers": followers,
-                        "url": str(top.get("url") or ""),
-                        "source": source,
-                        "min_fans": floor,
-                    }
+                    return await self._with_weibo_post(
+                        {
+                            "status": "hit",
+                            "kind": "name",
+                            "query": name,
+                            "uid": str(top.get("uid") or ""),
+                            "name": str(top.get("name") or ""),
+                            "followers": followers,
+                            "url": str(top.get("url") or ""),
+                            "source": source,
+                            "min_fans": floor,
+                        },
+                        target_hash,
+                    )
                 candidate = {
                     "status": "none",
                     "kind": "name",
@@ -5169,6 +5256,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
     _WEIBO_REPOST_MAX_POSTS = 3
     _WEIBO_REPOST_MAX_PICS = 3
     _WEIBO_TIMELINE_POSTS = 20
+    # 水印昵称/署名那一路最多扫多少条帖：一条帖最多比 3 张图，扫 12 条就是上限 36 次
+    # 下载。不能再多——这一步在「还没结论」的单子上每次都要跑。
+    _WEIBO_CLUE_MAX_POSTS = 12
 
     async def _fetch_page_html(self, url: str) -> str:
         """抓一页 HTML（给转载页反查用）。抓不到返回空串，不影响已有结论。"""
@@ -5254,6 +5344,28 @@ class ImageSearcherPlugin(MaiBotPlugin):
         uid = str(top.get("uid") or "")
         if not uid:
             return None
+        hit = await self._weibo_uid_post(
+            uid, str(top.get("name") or ""), int(top.get("followers") or 0), target_hash
+        )
+        if not hit:
+            return None
+        hit["kind"] = "author"
+        return hit
+
+    async def _weibo_uid_post(
+        self,
+        uid: str,
+        name: str,
+        followers: int,
+        target_hash: int | None,
+    ) -> dict[str, Any] | None:
+        """翻某个微博号最近的带图帖，找指纹对得上的那张。
+
+        名字只负责找到人，认人仍然靠图：微博同名的号太多，昵称对得上不等于就是她。
+        翻到就返回命中信息（帖地址 + 距离 + 配图），翻不到返回 None。
+        """
+        if not uid or target_hash is None:
+            return None
         try:
             posts = await asyncio.to_thread(
                 identity.fetch_weibo_timeline,
@@ -5264,31 +5376,33 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 1,
                 self._WEIBO_TIMELINE_POSTS,
             )
-        except Exception as error:  # noqa: BLE001 - 翻不到帖就换搜帖
-            self._vlog("转载页作者 %s 翻帖失败：%s", top.get("name"), str(error)[:60])
+        except Exception as error:  # noqa: BLE001 - 翻不到帖就换别的路
+            self._vlog("微博 UID %s 翻帖失败：%s", uid, str(error)[:60])
             return None
-        for post in posts:
+        for post in posts[: self._WEIBO_CLUE_MAX_POSTS]:
             if not post.get("pic_ids"):
                 continue
-            distance = await self._weibo_pic_hit(post.get("pic_ids"), str(post.get("url") or ""), target_hash)
+            distance = await self._weibo_pic_hit(
+                post.get("pic_ids"), str(post.get("url") or ""), target_hash
+            )
             if distance is None:
                 continue
-            self.ctx.logger.info(
-                "转载页反查：作者 %s（UID %s）的帖子 %s 指纹距离 %s",
-                top.get("name"),
+            self._vlog(
+                "微博帖核对：%s（UID %s）的帖子 %s 指纹距离 %s",
+                name or uid,
                 uid,
                 post.get("url"),
                 distance,
             )
+            pictures = weibopost.large_pic_urls(post.get("pic_ids"), limit=1)
             return {
                 "status": "hit",
-                "kind": "author",
                 "uid": uid,
-                "name": str(top.get("name") or ""),
-                "followers": int(top.get("followers") or 0),
+                "name": name,
+                "followers": followers,
                 "url": str(post.get("url") or ""),
                 "distance": distance,
-                "image": weibopost.large_pic_urls(post.get("pic_ids"), limit=1)[0],
+                "image": pictures[0] if pictures else "",
             }
         return None
 
@@ -5376,24 +5490,26 @@ class ImageSearcherPlugin(MaiBotPlugin):
         return {"status": "miss"}
 
     def _promote_weibo_post(self, best: Candidate | None, info: dict[str, Any]) -> Candidate:
-        """把转载页反查到的微博帖变成结论。"""
+        """把微博那条帖变成结论（转载页反查、水印昵称反查都走这里）。"""
         distance = int(info.get("distance") or 0)
         name = str(info.get("name") or "")
         uid = str(info.get("uid") or "")
+        lead = str(info.get("note") or "").strip()
+        note = f"{lead}，配图指纹距离 {distance}" if lead else f"配图指纹距离 {distance}，本人发过这张"
         post = Candidate(
             engine="weibo_post",
             url=str(info.get("url") or ""),
             image_url=str(info.get("image") or ""),
             distance=distance,
             status="match",
-            note=f"转载页正文反查到原帖，配图指纹距离 {distance}",
+            note=note,
             platform="微博",
             name=name,
             handle=uid,
         ).finalize()
         if not post.title:
             post.title = f"微博 {name}".strip()
-        self._vlog("转载页反查：结论换成微博 %s（%s）", name or uid, post.url)
+        self._vlog("微博结论：换成 %s 的帖 %s（距离 %s）", name or uid, post.url, distance)
         return post
 
     async def _search_x_handles(self, name: str, limit: int = 3) -> list[str]:
