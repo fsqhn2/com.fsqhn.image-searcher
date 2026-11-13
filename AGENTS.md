@@ -199,7 +199,7 @@ core/maibot_compat.py  能力返回值解包
 43. **别让「没核实过的猜测」挡住硬线索**：`s-20261113-0106-ed9a` 里三条路同时被堵死——① 标题署名反查只在「没结论」或「结论是搬运页」时跑，视觉先猜了个 `@sleamPM`（距离 32），整条被跳过；② 疑似 X 号推断只要 Grok 报过 handle 就跳过，而 `@lazyfoam` 只是 Grok 读图上水印的读数；③ 搬运页找作者要求距离在阈值内，那张最接近的合集图是 15，够不着。结果 lens 四条候选的标题里明明写着「推特lazycataw」，插件一个名字都没用上。现在：`handles._SIG_TWITTER` 认「推特xxx／twitter: xxx／Твиттер: xxx」（`twitter.com/...` 这种网址不算，不然会抽出 `com`）；署名反查在 `best.status == "vision"` 时也跑；疑似号推断只在 Grok 真核到 `tier=post/account` 时才跳过；署名认到号但翻不到这张（`seen`）时放进 `x_guess`，文案写「她自己最近的带图帖里翻过，没有这张」。**边界**：抽出来的名字只是候选，仍然要 `_profile` 核账户存在、名字对得上、再翻带图帖比指纹才算 hit；`seen` 只当线索，不改结论（用户 11-13 07:43 明确确认：标题写着「推特xxx」也只能算线索，不写成「作者是她」）。另外注意 `_name_text()` 会把 X 帖标题里 `on X:` 之后的正文整段丢掉（防 `@halloween` 那种噪声），所以正文里的 @ 不会被当署名。
 
 44. **微博号读到了就要去微博核，别直接丢**：`s-20261113-1108-73e0` 的图上水印读出「轻颜 / @青生w」，Grok 单独读成「微博@萌生w」——两个都是微博号的写法，可插件的水印取号只认 ASCII（`[A-Za-z0-9_]`），中文昵称一个字符都抽不出来，线索整条消失。现在补了两段：`identity.search_weibo_users()` 拿一次访客 cookie（`passport.weibo.com/visitor`，和查 UID 资料同一套）去请求 `s.weibo.com/user?q=昵称`，这个页面是服务端渲染的，卡片里直接有 UID、昵称、粉丝数；`handles.weibo_targets()` 认「微博@某某」「微博：某某」和 `weibo.com/u|n/xxx` 链接，`handles.at_names()` 连中文 @ 一起认。插件侧 `_hunt_weibo()` 的触发条件有三条：文本里明写了微博、水印上 @ 后面跟着汉字（X 只认 ASCII，汉字的不可能是 X 号）、以及那个号在 X 上查无此人（`PROFILE_MISSING`）。**三条边界**：① 只当线索，不改 `best`、不参与匹配判定；② 微博昵称就是账号名，重名的路人号能占满整页（搜「青生w」出来 15 个「阮青生w*」，粉丝 1~102），所以 `[weibo] min_fans`（默认 200）以下的号不往结果里塞，只在文案里说一句「同名的都是路人号（粉丝最多 102）」；③ `m.weibo.cn` 那套接口不行——带上访客 cookie 也只回一页 `Sina Visitor System` HTML，`weibo.com/ajax/side/search` 的 `user` 字段恒为空，别再去试这两条路。
-45. **`s.weibo.com` 搜用户必须带 UA**：线上第一版 `search_weibo_users()` 只在请求上设了 `Referer`，忘了 `User-Agent`——访客 session 的默认头里没有 UA，requests 会填自己的 `python-requests/x.y`，微博直接回 **HTTP 432**（反爬状态码，不是 404、也不是空结果，看着特别像「这个昵称搜不到人」）。现在 UA 写进了 `_visitor_session()` 的 session 默认头，且每次请求也显式带上。**探针和线上代码要跑同一份**：以前用 `C:	emp` 里的独立探针跑通了 200，换成插件里的实现就 432，差别就藏在这种「探针里手写了 UA、实现里没写」的地方。
+45. **`s.weibo.com` 搜用户必须带 UA**：线上第一版 `search_weibo_users()` 只在请求上设了 `Referer`，忘了 `User-Agent`——访客 session 的默认头里没有 UA，requests 会填自己的 `python-requests/x.y`，微博直接回 **HTTP 432**（反爬状态码，不是 404、也不是空结果，看着特别像「这个昵称搜不到人」）。现在 UA 写进了 `_visitor_session()` 的 session 默认头，且每次请求也显式带上。**探针和线上代码要跑同一份**：以前用 `C:/temp` 里的独立探针跑通了 200，换成插件里的实现就 432，差别就藏在这种「探针里手写了 UA、实现里没写」的地方。另外**登录态失效必须说出来**：填了 `[weibo] cookie` 又收到 401/403/432 时，`_hunt_weibo()` 返回 `{"status":"error","reason":"cookie"}`，文案写「登录态失效了，重新复制一次就能恢复」——不说这句，用户只会以为微博反查整个没反应。用户 11-13 12:00 明确否掉「插件内私聊扫码登录」那条链路，发布版只走「README 教手工复制 cookie」，`tools/weibo_login.py` 留给能登服务器的人自己用。
 
 ## 排障顺序
 
@@ -227,7 +227,7 @@ SSRF 防护在 `core/httpclient.is_public_url()`：非公网 http(s) 一律拒�
 python -m unittest discover -s tests -v
 ```
 
-目前 652 项。新增引擎适配、改阈值、改指纹逻辑、改缓存或账号归一规则时补用例。改动 `_verify` / `_rank` / 取图链路后，用真实图跑一次端到端，确认「匹配 → 最佳匹配 → 带图」不断。
+目前 653 项。新增引擎适配、改阈值、改指纹逻辑、改缓存或账号归一规则时补用例。改动 `_verify` / `_rank` / 取图链路后，用真实图跑一次端到端，确认「匹配 → 最佳匹配 → 带图」不断。
 
 改完 `plugin.py` 必须重载验证：日志里应出现 `麦麦寻人已加载：… 上限=…` 与 `vX.Y.Z 加载成功`，且无 traceback。改源码会重启插件进程，内存里的任务表会重建。
 

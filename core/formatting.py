@@ -311,6 +311,12 @@ def _weibo_lines(outcome: SearchOutcome) -> list[str]:
         how = f"从{source}里认出的" if source else "按这个名字搜到的"
         return [line, f"{how}同名号，微博昵称就是账号名，点开自己对一下是不是她。"]
     query = str(info.get("query") or "").strip()
+    if status == "error":
+        # 填了登录 cookie 却失效时，不写这句用户只会觉得「微博反查没反应」。
+        return [
+            "📱 微博：登录态失效了，这次没搜成——重新复制一次 `[weibo] cookie` 就能恢复"
+            "（不填 cookie 也能用，走免登录）"
+        ]
     if not query:
         return []
     if status != "none":

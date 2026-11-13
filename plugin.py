@@ -4953,7 +4953,14 @@ class ImageSearcherPlugin(MaiBotPlugin):
             try:
                 rows = await self._search_weibo_users(name)
             except Exception as error:  # noqa: BLE001 - 查不到不影响已有结论
-                self._vlog("微博反查失败（%s）：%s", name, str(error)[:80])
+                text = str(error)
+                self._vlog("微博反查失败（%s）：%s", name, text[:80])
+                # 填了登录 cookie 却收到 401/403/432，多半是那串 cookie 过期（约 7 天）。
+                # 这时要明说一句，否则整条微博反查会静默变成「什么都没搜到」。
+                if str(section.cookie or "").strip() and any(
+                    code in text for code in ("401", "403", "432")
+                ):
+                    return {"status": "error", "reason": "cookie", "query": name}
                 continue
             source = source_of(name)
             top = rows[0] if rows else None

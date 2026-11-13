@@ -1986,3 +1986,11 @@ class WeiboClueLineTest(unittest.TestCase):
     def test_absent_weibo_adds_nothing(self) -> None:
         text = formatting._best_block(self._make(None))
         self.assertNotIn("📱 微博", text)
+
+    def test_expired_cookie_is_said_out_loud(self) -> None:
+        """填了登录 cookie 又失效时，必须说一句，否则看着像「微博反查没反应」。"""
+        text = formatting._best_block(
+            self._make({"status": "error", "reason": "cookie", "query": "青生w"})
+        )
+        self.assertIn("登录态失效", text)
+        self.assertIn("不填 cookie 也能用", text)
