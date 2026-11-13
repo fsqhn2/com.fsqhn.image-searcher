@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import re
 import time
 import tomllib
@@ -107,6 +108,13 @@ _MORE_PATTERN = build_more_pattern(["更多", "more"])
 _CAPTURE_PATTERN = r"^(?:\[[^\]]*\]\s*)+$"
 # X 账号只可能是这些字符；图集页编号会挂成 handle（"UID 1856233540"），别去翻它。
 _X_HANDLE_RE = re.compile(r"^[A-Za-z0-9_]{2,15}$")
+
+# 插件运行时被重启（任何插件文件被改都会触发）时，正在搜的单会随进程一起消失。
+# 卸载前把在跑的单记到盘上，重新加载后回一句，免得群里一直等不到结果。
+_INTERRUPTED_FILE = "image_searcher_interrupted.json"
+_INTERRUPTED_MAX_AGE = 2 * 3600
+_INTERRUPTED_DELAY = 5.0
+_INTERRUPTED_TEXT = "⚠️ 上一单搜图（{task_id}，{minutes} 分钟前）因为插件重启被打断了，没出结果，麻烦再发一次。"
 
 
 # ---------------------------------------------------------------------------
@@ -1200,6 +1208,8 @@ class ImageSearcherPlugin(MaiBotPlugin):
         self._engines: dict[str, Any] = {}
         self._background: set[asyncio.Task] = set()
         self._pending: dict[tuple[str, str], float] = {}
+        # 正在跑的任务：卸载时靠它把被打断的单记下来，重新加载后回一句。
+        self._live: dict[str, dict[str, Any]] = {}
         # 等待补图时记住这次要不要无视缓存重搜（「盆地找鸡 重搜」后只发图）
         self._pending_force: dict[tuple[str, str], bool] = {}
         self._pending_timers: dict[tuple[str, str], asyncio.Task] = {}
@@ -1259,8 +1269,13 @@ class ImageSearcherPlugin(MaiBotPlugin):
         if not enabled:
             self.ctx.logger.warning("没有启用任何搜索引擎，插件将无法返回结果")
         self._vlog("指令正则：%s", _COMMAND_PATTERN)
+        # 加载阶段 send 通道未必就绪，延后几秒再补话，失败了也只记日志。
+        waiting = asyncio.create_task(self._notify_interrupted())
+        self._background.add(waiting)
+        waiting.add_done_callback(self._background.discard)
 
     async def on_unload(self) -> None:
+        self._save_interrupted()
         for task in list(self._background):
             task.cancel()
         self._background.clear()
@@ -1275,6 +1290,65 @@ class ImageSearcherPlugin(MaiBotPlugin):
         self._engine_pool.shutdown(wait=False, cancel_futures=True)
         self._verify_pool.shutdown(wait=False, cancel_futures=True)
         self.ctx.logger.info("%s已卸载", PLUGIN_NAME)
+
+    # -- 重启打断 ---------------------------------------------------------
+
+    def _interrupted_path(self) -> Path:
+        return Path(self.ctx.paths.data_dir) / _INTERRUPTED_FILE
+
+    def _save_interrupted(self) -> None:
+        """卸载前把还在跑的单写到盘上。
+
+        插件运行时是整块重启的：任何插件文件被改动都会触发，进程一换，
+        正在搜的那一单连同 asyncio 任务一起消失，群里只会看到「正在搜图」。
+        """
+        now = time.time()
+        snapshot = {
+            task_id: dict(payload)
+            for task_id, payload in self._live.items()
+            if now - float(payload.get("started_at") or 0) <= _INTERRUPTED_MAX_AGE
+        }
+        self._live.clear()
+        if not snapshot:
+            return
+        try:
+            self._interrupted_path().write_text(
+                json.dumps(snapshot, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            self._vlog("已记下被打断的任务：%s", "、".join(snapshot))
+        except Exception as error:  # noqa: BLE001 - 记不下来本来也不影响卸载
+            self.ctx.logger.warning("记录被打断的任务失败：%s", error)
+
+    async def _notify_interrupted(self) -> None:
+        path = self._interrupted_path()
+        if not path.is_file():
+            return
+        # 加载阶段 send 通道未必就绪，等几秒再发；失败只记日志，不重试。
+        await asyncio.sleep(_INTERRUPTED_DELAY)
+        try:
+            snapshot = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            snapshot = {}
+        try:
+            for task_id, payload in sorted(snapshot.items()):
+                stream_id = str((payload or {}).get("stream_id") or "")
+                if not stream_id:
+                    continue
+                minutes = max(1, int((time.time() - float((payload or {}).get("started_at") or 0)) / 60))
+                sent = await self.ctx.send.text(
+                    _INTERRUPTED_TEXT.format(task_id=task_id, minutes=minutes),
+                    stream_id,
+                )
+                if not _send_ok(sent):
+                    self.ctx.logger.warning("中断提示发送失败：task=%s result=%s", task_id, sent)
+                    continue
+                self._vlog("中断提示已发送：task=%s 发往=%s", task_id, stream_id)
+        finally:
+            try:
+                path.unlink()
+            except OSError:
+                pass
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
         if scope != "self":
@@ -6705,6 +6779,11 @@ class ImageSearcherPlugin(MaiBotPlugin):
             raise RuntimeError("当前搜索任务太多，请稍后再试")
 
         task = self._tasks.new_task(stream_id, user_id)
+        self._live[task.task_id] = {
+            "stream_id": stream_id,
+            "user_id": user_id,
+            "started_at": time.time(),
+        }
         background = asyncio.create_task(self._run_task(task, raw, image_url, notify, force))
         self._background.add(background)
         background.add_done_callback(self._background.discard)
@@ -6789,6 +6868,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
         finally:
             # 任务收尾就掐掉补话定时器，别在结果已经发出后再补一句「还在找」。
             self._cancel_slow_ping(task.task_id)
+            self._live.pop(task.task_id, None)
 
     # QQ 单条合并转发的图片总量有上限，超过后 send_group_forward_msg 会被对端拒绝。
     # 实测 6 张图能过、13 张失败，所以「更多」按这个预算拆成几条发。
