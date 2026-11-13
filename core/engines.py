@@ -45,6 +45,43 @@ from .keypool import KeyPool
 SERP_ENDPOINT = "https://serpapi.com/search.json"
 SERP_IMAGE_ENDPOINT = "https://serpapi.com/image"
 SERP_UPLOAD_LIMIT = 500 * 1024
+# 转码重传用的长边：Lens 只认「这张图像什么」，不靠细节比对，1600 够用，
+# 再大只是多传几秒。
+_LENS_RETRY_SIDE = 1600
+
+
+def _reencode_for_lens(raw: bytes) -> bytes:
+    """把图重新编码成标准 JPEG（去掉 EXIF、统一 RGB、长边 1600），给 Lens 再传一次。
+
+    只在「重试完仍然 0 条」时用。编不出来返回空字节，调用方按原样收场。
+    """
+    if not raw:
+        return b""
+    try:
+        import io
+
+        from PIL import Image, ImageOps
+
+        with Image.open(io.BytesIO(raw)) as image:
+            image = ImageOps.exif_transpose(image)
+            if image.mode != "RGB":
+                image = image.convert("RGB")
+            width, height = image.size
+            scale = min(1.0, _LENS_RETRY_SIDE / max(1, max(width, height)))
+            if scale < 1.0:
+                image = image.resize(
+                    (max(1, int(width * scale)), max(1, int(height * scale))),
+                    Image.Resampling.LANCZOS,
+                )
+            for quality in (88, 80, 72, 64):
+                buffer = io.BytesIO()
+                image.save(buffer, format="JPEG", quality=quality, optimize=True)
+                payload = buffer.getvalue()
+                if 0 < len(payload) <= SERP_UPLOAD_LIMIT - 16 * 1024:
+                    return payload
+    except Exception:  # noqa: BLE001 - 转码失败就当没有这道兜底
+        return b""
+    return b""
 # Serper 的 Lens 只收公网图片链接（base64 会回 400 Missing "url"），所以要先把图
 # 传到 uguu 换一个直链。大图不传，省得白等一次上传。
 # 注意：tmpfiles.org 的 dl 直链喂给 Serper Lens 会回 organic=0（Google 抓不到那台机器），
@@ -302,6 +339,25 @@ class LensEngine:
                 return items
             if attempt < self.retries:
                 time.sleep(self.retry_delay)
+        # 三次都空：把图重新编码成标准 JPEG 再传一次。SerpAPI 的 Lens 对同一张图
+        # 会随机空返回（重试治的是这个），但也有一类是「图收下了、就是不出结果」——
+        # PNG/WebP、带 EXIF 的照片常这样。s-20261113-1758-d40d 就是重试三次加
+        # Serper 补枪全空，而机器上别的单都 59~60 条。换一种编码再试一次，代价只
+        # 是一次上传（上传不计搜索额度），比直接放弃划算。
+        if not items:
+            payload = _reencode_for_lens(raw)
+            if payload and payload != raw:
+                try:
+                    items = self._search_once(payload)
+                except EngineError as exc:
+                    items = []
+                    last_error = last_error or exc
+                self._say(
+                    "Lens 转码重传：%sKB → %sKB，%s 条",
+                    len(raw) // 1024,
+                    len(payload) // 1024,
+                    len(items),
+                )
         # 补一枪 Serper：只在主路全空、且上面没走过它的时候。它自己失败也要留一句
         # 日志——不然事后分不清「没补成」和「补了 0 条」。
         if not items and self.serper_pool is not None and self._last_channel != "serper":

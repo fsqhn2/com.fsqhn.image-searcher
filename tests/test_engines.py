@@ -429,6 +429,46 @@ class LensSerperFallbackTest(unittest.TestCase):
         key, _ = engine._pick_key()
         self.assertEqual(key, "")
 
+    def test_empty_result_retries_with_reencoded_jpeg(self) -> None:
+        """重试完仍空时，换一份 JPEG 编码再传一次；拿到结果就不再叫 Serper。"""
+        import core.engines as engines_mod
+        from core.keypool import KeyPool
+
+        engine = LensEngine(KeyPool(["serpapi-key"]), serper_pool=KeyPool(["a" * 40]), retries=0)
+        seen: list[bytes] = []
+
+        def fake_once(raw: bytes, image_url: str = "") -> list[Candidate]:
+            seen.append(raw)
+            if raw == b"\xff\xd8jpeg":
+                return [Candidate(engine="lens", url="https://x.com/foo/status/1")]
+            return []
+
+        engine._search_once = fake_once  # type: ignore[assignment]
+        original = engines_mod._reencode_for_lens
+        engines_mod._reencode_for_lens = lambda raw: b"\xff\xd8jpeg"  # type: ignore[assignment]
+        try:
+            items = engine.search(b"img")
+        finally:
+            engines_mod._reencode_for_lens = original  # type: ignore[assignment]
+        self.assertEqual(seen, [b"img", b"\xff\xd8jpeg"])
+        self.assertEqual(len(items), 1)
+
+    def test_reencode_for_lens_returns_jpeg(self) -> None:
+        """真拿一张 PNG 转码：出来必须是 JPEG，且比原图小。"""
+        import io
+
+        from PIL import Image
+
+        from core.engines import _reencode_for_lens
+
+        buffer = io.BytesIO()
+        Image.new("RGBA", (2400, 1600), (200, 30, 40, 255)).save(buffer, format="PNG")
+        raw = buffer.getvalue()
+        payload = _reencode_for_lens(raw)
+        self.assertTrue(payload.startswith(b"\xff\xd8"))
+        self.assertLess(len(payload), len(raw))
+        self.assertEqual(_reencode_for_lens(b"not an image"), b"")
+
     def test_empty_result_falls_back_to_serper(self) -> None:
         """s-20261112-1250-f895：SerpAPI 重试完仍空，用 Serper 的 Lens 补一枪。"""
         from core.keypool import KeyPool
