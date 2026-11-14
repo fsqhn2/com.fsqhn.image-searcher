@@ -215,6 +215,8 @@ core/maibot_compat.py  能力返回值解包
 
 53. **没搜到的时候，第一句就要说没搜到，每个来源只留一条**：`s-20261114-0901-499d` 的结果在群里是「Grok 最前、结论跑到后面」，视觉降级 5 条还整串摆着，`已比对 56 条` 与 `共收到 68 条` 并列看着像自相矛盾，参考区同一个 lolita 链接出现两次，距离 28 写了两遍。用户 11-14 09:21 定的口径：**结论在最前 → 每个引擎各 1 条（带那条的图）→ 视觉 1 条（带图）→ Grok 1 条（带图）→ 页脚**，视觉和 Grok 要写清自己做了什么努力（拼图比了多少张 / 挑了几条 / 换了几组关键词 / 核了几条帖 / 最近距离多少）。实现：`build_result_forwards()` 在 `best is None` 且 grok tier≠post 时直接走 `build_miss_nodes()`（`is_miss_layout()` 判是否走这条），`_miss_headline()` 出结论首句「⚠️ 没搜到：公开索引里没有这张图的原帖」，第二句给条数与最近距离；`engine_groups()` 现在按 URL 去重、同 URL 只留距离最近那条；`_footer_lines()` 的 `reference_note` 在 miss 布局下不输出「参考图是…」。**四条边界**：① 合并转发单条约 6 张图是 NapCat 上限，miss 布局最多 4 引擎 + 视觉 + Grok = 6 张，正好卡线，别再往里加；② 视觉挑中的那条如果正是某引擎那条（图 URL 相同），视觉节点只写「最像的就是上面 ▍X 那条（距离 N）」，不重复发图；③ Grok 已给出原帖（tier=post）时**不走** miss 布局，仍按「找到 X 上的原帖」输出；④ 找得到结果的单不改这块，别把 miss 的排版顺手套到命中单上。
 
+54. **「没搜到」和「命中」共用 `status=ok`，别再拿 status 判断要不要下配图**：`s-20261114-1007-5878` 群里收到一条 8 节点的转发，一张图都没有。原因是 Grok 只给了账号（`tier=account`）也算 `status=ok`，而 `_ensure_engine_images()` 的早退条件是 `if outcome.status == "ok" and not whole: return`——首次回复直接不下载任何候选图，可这单 `best` 是空的、走的是没搜到的排版，每个引擎那条本来就该带图。判据换成 `outcome.best is not None`：有结论才跳过，没结论就得下。同一处还补了视觉那条：它挑中的图不一定在各引擎的第一条里（没有 picked 时退到降级成 vision 的那条），不补这一张视觉就像没干活。另外 Grok 只给账号时插件把核对过的那张图存在 `image_b64`（`image_source` 指向 `grok.reference_url`），`grok_image_b64` 是空的，`build_miss_nodes()` 现在会在两处地址对上时拿它补图——否则 Grok 那条只剩文字。**三条边界**：① 只在 `grok_image_b64` 为空、`image_source` 与 `reference_url` 完全一致时兜底，用户原图（`upload`）绝不冒充 Grok 配图；② 视觉挑中的图如果就是某引擎那条，仍然不重复发；③ 修完这单的真实数据是 5 张图（4 引擎各 1 + Grok 1），视觉那条指向百度那条所以不重发。
+
 ## 排障顺序
 
 1. 插件没加载：看 `_manifest.json` 是否合法、`create_plugin()` 是否存在、生命周期方法是否齐全。
@@ -241,7 +243,7 @@ SSRF 防护在 `core/httpclient.is_public_url()`：非公网 http(s) 一律拒�
 python -m unittest discover -s tests -v
 ```
 
-目前 700 项。新增引擎适配、改阈值、改指纹逻辑、改缓存或账号归一规则时补用例。改动 `_verify` / `_rank` / 取图链路后，用真实图跑一次端到端，确认「匹配 → 最佳匹配 → 带图」不断。
+目前 702 项。新增引擎适配、改阈值、改指纹逻辑、改缓存或账号归一规则时补用例。改动 `_verify` / `_rank` / 取图链路后，用真实图跑一次端到端，确认「匹配 → 最佳匹配 → 带图」不断。
 
 改完 `plugin.py` 必须重载验证：日志里应出现 `麦麦寻人已加载：… 上限=…` 与 `vX.Y.Z 加载成功`，且无 traceback。改源码会重启插件进程，内存里的任务表会重建。
 

@@ -46,6 +46,7 @@ from .core.engines import (
     SauceNaoEngine,
     YandexEngine,
     detect_ai,
+    downgrade_kind,
     is_avatar_hit,
     reference_candidates,
     verify_candidate,
@@ -1832,8 +1833,10 @@ class ImageSearcherPlugin(MaiBotPlugin):
         outcome = task.outcome
         if outcome is None or not outcome.candidates:
             return
-        if outcome.status == "ok" and not whole:
-            # 命中时首次回复只有结论，参考区要等「更多」，不必提前下载这些配图。
+        if outcome.best is not None and not whole:
+            # 真有结论时首次回复只给结论，参考区要等「更多」，不必提前下载这些配图。
+            # 没有结论时不能跳：没搜到那条要逐引擎摆一条带图的，图得先下好。
+            # （s-20261114-1007-5878 就是因为 status=ok 但 best 为空被跳过，整条转发 0 张图。）
             return
         targets: list[str] = []
         for engine, items in formatting.engine_groups(outcome, outcome.best, limit):
@@ -1841,6 +1844,23 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 continue  # 首次回复只补其他引擎的图，命中那条所在引擎不重复给
             picked = items if whole else items[:1]
             targets.extend(item.image_url for item in picked if item.image_url)
+        if not whole and outcome.best is None:
+            # 没搜到那条里视觉单独占一条，它挑中的图不一定在各引擎的第一条里，
+            # 光靠上面那轮会把视觉配成空白。
+            picked = [str(url) for url in (outcome.vision or {}).get("picked_images") or [] if url]
+            targets.extend(picked[:1])
+            if not picked:
+                # 视觉没挑中、只给了「最像的」那一条时，那张也要有图。
+                fallback = next(
+                    (
+                        item.image_url
+                        for item in outcome.candidates
+                        if item.image_url and downgrade_kind(item) == "vision"
+                    ),
+                    "",
+                )
+                if fallback:
+                    targets.append(fallback)
         pending: list[str] = []
         for url in targets:
             if url in outcome.images or url in pending:

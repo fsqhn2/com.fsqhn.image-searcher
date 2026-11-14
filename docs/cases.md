@@ -271,6 +271,16 @@
 
 ---
 
+### s-20261114-1007-5878
+
+- **用户给的**：这条结果一张图都没带。
+- **日志事实**：status=ok、best=null，lens 60 / yandex 103 / baidu 30 / saucenao 8，68 条候选，route=photo；视觉 checked=16、picked 12；Grok tier=account、@PettyAI666、配图距离 27。发送日志写得很清楚：`块=1/1 节点=8 图=0`。
+- **根因**：Grok 只给到账号也算 `status=ok`，而 `_ensure_engine_images()` 只在 `status != "ok"` 或回「更多」时才下候选图。这单 best 是空的、走的是没搜到的排版（每个引擎那条本该带图），但预检看到 status=ok 就直接 return，一张都没下。8 节点对得上：结论 + 4 引擎 + 视觉 + Grok + 页脚。
+- **修复**：① 早退条件换成 `outcome.best is not None`——有结论才跳过，没结论就得下；② 视觉那条单独补一张（picked_images 的第一条，没有就退到降级成 vision 的那条），否则它挑中的图不在引擎第一条里时会空白；③ Grok 只给账号时 `grok_image_b64` 是空的，但它核对过的那张图在 `image_b64` 里（`image_source` 指向 `grok.reference_url`），`build_miss_nodes()` 在两处地址一致时拿它补图；用户原图（upload）不冒充。
+- **验证**：用这单真实 summary 跑 `build_miss_nodes()`，图数 0 → 5（4 引擎各 1 + Grok 1）；视觉那条指向百度那条，按规则不重发。服务器全量 702 项通过，v0.9.12 加载成功。
+
+---
+
 ## 排查一单的顺序
 
 1. 先看是按图缓存命中还是真跑了一遍（日志有「按图缓存命中」）。旧结论出现时，让用户重搜。

@@ -1705,8 +1705,21 @@ def build_miss_nodes(
     grok_text = _grok_miss_entry(outcome)
     if grok_text:
         content = [{"type": "text", "content": grok_text}]
-        if outcome.grok_image_b64:
-            content.append({"type": "image", "content": outcome.grok_image_b64})
+        # Grok 只给到账号时不会单独存 grok_image_b64，但它核对过的那张配图已经
+        # 存在 image_b64 里（image_source 指向它就是这张）。不补这一张，Grok 那条
+        # 就只剩文字。
+        grok_image = outcome.grok_image_b64
+        grok_ref = str((outcome.grok or {}).get("reference_url") or "")
+        if (
+            not grok_image
+            and outcome.image_b64
+            and grok_ref
+            and outcome.image_source == grok_ref
+            and grok_ref not in shown
+        ):
+            grok_image = outcome.image_b64
+        if grok_image:
+            content.append({"type": "image", "content": grok_image})
         nodes.append(_node(content, nickname, user_id))
 
     nodes.append(

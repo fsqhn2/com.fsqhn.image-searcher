@@ -1005,6 +1005,28 @@ class MissLayoutTest(unittest.TestCase):
         self.assertIn("@nprcie", text)
         self.assertEqual(self._images(grok), ["GROKIMG"])
 
+    def test_grok_entry_reuses_shared_image_when_no_grok_image(self) -> None:
+        """Grok 只给到账号时没有 grok_image_b64，但它核过的那张图已经存在 image_b64。"""
+        outcome = self._make_outcome()
+        outcome.grok_image_b64 = ""
+        outcome.grok["reference_url"] = "https://img/grok.jpg"
+        outcome.image_b64 = "SHARED"
+        outcome.image_source = "https://img/grok.jpg"
+        nodes = build_result_forwards(_task(outcome), command="盆地找鸡")[0]
+        grok = next(node for node in nodes if self._text(node).startswith("🔎 Grok"))
+        self.assertEqual(self._images(grok), ["SHARED"])
+
+    def test_grok_entry_does_not_pass_upload_as_grok_image(self) -> None:
+        """image_b64 是用户原图时不能冒充 Grok 的配图。"""
+        outcome = self._make_outcome()
+        outcome.grok_image_b64 = ""
+        outcome.grok["reference_url"] = "https://img/grok.jpg"
+        outcome.image_b64 = "UPLOAD"
+        outcome.image_source = "upload"
+        nodes = build_result_forwards(_task(outcome), command="盆地找鸡")[0]
+        grok = next(node for node in nodes if self._text(node).startswith("🔎 Grok"))
+        self.assertEqual(self._images(grok), [])
+
     def test_without_vision_or_grok_only_engines(self) -> None:
         outcome = SearchOutcome(
             status="not_found",
