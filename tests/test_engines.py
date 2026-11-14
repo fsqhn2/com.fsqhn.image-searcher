@@ -715,5 +715,61 @@ class LensTimeoutBudgetTest(unittest.TestCase):
         self.assertLessEqual(left, TIMEOUT_COOLDOWN + 1)
 
 
+class SauceNaoRouteTest(unittest.TestCase):
+    """代理偶发 TLS 握手失败时换直连再试，别因为一次握手丢掉整条。"""
+
+    def _engine(self):
+        from core.engines import SauceNaoEngine
+        from core.keypool import KeyPool
+
+        return SauceNaoEngine(KeyPool(["k"]), proxy="http://127.0.0.1:6789")
+
+    def test_falls_back_to_direct_when_proxy_tls_fails(self) -> None:
+        calls: list[str] = []
+
+        class _Resp:
+            status_code = 200
+
+            def json(self):
+                return {"header": {"status": 0}, "results": []}
+
+        class _Ok:
+            def post(self, *args, **kwargs):
+                return _Resp()
+
+            def close(self):
+                pass
+
+        class _Bad:
+            def post(self, *args, **kwargs):
+                raise SSLError("bad handshake")
+
+            def close(self):
+                pass
+
+        def fake_session(proxy=""):
+            calls.append(proxy)
+            return _Bad() if proxy else _Ok()
+
+        with mock.patch("core.engines.make_session", side_effect=fake_session):
+            self.assertEqual(self._engine().search(b"img"), [])
+        self.assertEqual(calls, ["http://127.0.0.1:6789", ""])
+
+    def test_both_routes_failing_reports_both(self) -> None:
+        class _Bad:
+            def post(self, *args, **kwargs):
+                raise SSLError("bad handshake")
+
+            def close(self):
+                pass
+
+        with mock.patch("core.engines.make_session", return_value=_Bad()):
+            with self.assertRaises(EngineError) as ctx:
+                self._engine().search(b"img")
+        message = str(ctx.exception)
+        self.assertIn("代理", message)
+        self.assertIn("直连", message)
+
+
 if __name__ == "__main__":
     unittest.main()

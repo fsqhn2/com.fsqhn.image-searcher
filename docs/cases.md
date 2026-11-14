@@ -291,6 +291,16 @@
 
 ---
 
+### s-20261114-1958-d6b0
+
+- **用户给的**：为什么有个引擎炸了（saucenao）。
+- **日志事实**：`errors={'saucenao': "EngineError: SSLError: HTTPSConnectionPool(host='saucenao.com', port=443): Max retries exceeded with url: /search.php (Caused by SSLE..."}`；其余引擎正常（lens 1 / yandex 94 / baidu 30，去重 41 条）。同一晚 19:15、19:24、19:51 三单的 saucenao 都回了 7~8 条，说明不是服务挂了。
+- **根因**：`SauceNaoEngine.search()` 只有一条线路（`make_session(self.proxy)`），代理那一下 TLS 握手被打断就直接判死，没有 Yandex 那样的「先代理、后直连」兜底。
+- **修复**：加 `_routes()`（`[代理, 直连]`，去重），post 抛网络层异常（SSL / 连接 / 超时 / 非 JSON）就换下一条线路，全失败才报错，错误里写清「代理SSLError；直连SSLError」。`EngineError`（401/402/403/429、header status 非 0）仍直接抛，不换线路也不做 `mark_failure`。
+- **补测**：`test_falls_back_to_direct_when_proxy_tls_fails`、`test_both_routes_failing_reports_both`。
+
+---
+
 ## 排查一单的顺序
 
 1. 先看是按图缓存命中还是真跑了一遍（日志有「按图缓存命中」）。旧结论出现时，让用户重搜。

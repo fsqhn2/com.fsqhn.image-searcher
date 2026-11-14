@@ -241,13 +241,15 @@ SSRF 防护在 `core/httpclient.is_public_url()`：非公网 http(s) 一律拒�
 
 56. **外层超时要按引擎的「步数」给，不然内层白跑、额度白扣**：`s-20261114-1646-19f7` 的 lens 整条消失，报 `TimeoutError`。算时间账：16:46:36 拿到图、16:47:31 报错，**正好 55 秒**——外层是 `engine_timeout + 5`，而 lens 内部一次 `search()` 要跑「上传图（最多 50 秒）+ 拿 image_id 检索（最多 50 秒）」两步，理论能到 100 秒。上传那步稍慢，外层到点先砍，`转码重传` 和 `Serper 补枪` 都还没轮到，线程还在后台继续跑（Python 线程取消不掉），额度照扣、结果丢掉。当天两单同时进来（16:46:30 / 16:46:36），一起撞上。现在 `LensEngine.deadline_factor = 2`，`plugin._engine_deadline()` 按 `engine_timeout × factor + 5` 给（lens 默认 105 秒），其他引擎仍是 1 倍。同时把**超时的 key 冷却从 60 秒降到 15 秒**（`core.engines.TIMEOUT_COOLDOWN`）：超时是网络抖，不是 key 坏了，60 秒会把并发那单的 key 一起锁死。**三条边界**：① 真正 401/403 仍走 `mark_failure` 默认 300 秒，别被这条带偏；② 用户实测 SerpAPI 本身很快（上传 0.8 秒、检索 2.9 秒），放宽时限只是兜住偶发抖动，不是常态慢；③ 同一张图连搜两次都只回 1 条时**不是丢结果**——那张图在 Google Lens 里本来就只有一条（一条 Twitter 镜像站的账号页），别照着「条数少」去查 bug。
 
+57. **网络层的错误要换线路重试，别直接判死**：`s-20261114-1958-d6b0` 的 saucenao 报 `EngineError: SSLError: HTTPSConnectionPool(host='saucenao.com', port=443): Max retries exceeded with url: /search.php`，而同一晚 19:15、19:24、19:51 三单都正常回了 7~8 条——就是代理那一下 TLS 握手被打断。原来 `SauceNaoEngine.search()` 只用 `make_session(self.proxy)` 一条线路，一次握手失败整条就没结果。现在跟 Yandex 一样两条线路：`_routes()` 返回 `[代理, 直连]`（去重），`post` 抛任何网络层异常就换下一条，全失败才报错，错误里点名「代理SSLError；直连SSLError」便于区分。**三条边界**：① `EngineError`（401/402/403/429、header status 非 0）**直接抛、不换线路**，那是 key 或服务端的明确答复，换线路没用；② 失败时不做 `mark_failure`（网络抖动不是 key 的错），只有 auth 失败才冷却；③ 直连能不能过取决于服务器出口，能过就省一次请求，过不了也只是多等一个超时。
+
 ## 测试
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-目前 715 项。新增引擎适配、改阈值、改指纹逻辑、改缓存或账号归一规则时补用例。改动 `_verify` / `_rank` / 取图链路后，用真实图跑一次端到端，确认「匹配 → 最佳匹配 → 带图」不断。
+目前 717 项。新增引擎适配、改阈值、改指纹逻辑、改缓存或账号归一规则时补用例。改动 `_verify` / `_rank` / 取图链路后，用真实图跑一次端到端，确认「匹配 → 最佳匹配 → 带图」不断。
 
 改完 `plugin.py` 必须重载验证：日志里应出现 `麦麦寻人已加载：… 上限=…` 与 `vX.Y.Z 加载成功`，且无 traceback。改源码会重启插件进程，内存里的任务表会重建。
 

@@ -832,6 +832,19 @@ class SauceNaoEngine:
             group_id=group_id,
         )
 
+    def _routes(self) -> list[str]:
+        """先走配置的代理，失败再试直连（"" 表示直连）。
+
+        代理到 saucenao.com 会偶发 TLS 握手失败（s-20261114-1958-d6b0：同一时段
+        别的单都正常，这一单直接 SSLError），换条线路通常就过了，比原地等一次
+        冷却划算——SauceNAO 是命中率最高的一条线之一，不该因为一次握手丢掉。
+        """
+        routes: list[str] = []
+        for route in (self.proxy, ""):
+            if route not in routes:
+                routes.append(route)
+        return routes
+
     def search(self, raw: bytes, image_url: str = "", stream_id: str = "") -> list[Candidate]:
         key = self.pool.acquire()
         if key is None:
@@ -843,31 +856,41 @@ class SauceNaoEngine:
         if key:
             data["api_key"] = key
 
-        session = make_session(self.proxy)
-        try:
-            resp = session.post(
-                SAUCENAO_ENDPOINT,
-                data=data,
-                files={"file": ("image.jpg", raw, "image/jpeg")},
-                timeout=_timeout(self.timeout),
-            )
-            if is_auth_failure(resp.status_code):
-                if key:
-                    self.pool.mark_failure(key)
-                raise EngineError(f"SauceNAO 返回 HTTP {resp.status_code}")
-            payload = json_or_raise(resp, "SauceNAO")
-            header = payload.get("header") or {}
-            if header.get("status") not in (None, 0, "0"):
-                message = str(header.get("message") or "未知错误")[:160]
-                if key:
-                    self.pool.mark_failure(key)
-                raise EngineError(message)
-        except EngineError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            raise EngineError(f"{type(exc).__name__}: {str(exc)[:160]}") from exc
-        finally:
-            session.close()
+        payload: dict[str, Any] | None = None
+        failures: list[str] = []
+        for route in self._routes():
+            route_name = "代理" if route else "直连"
+            session = make_session(route)
+            try:
+                resp = session.post(
+                    SAUCENAO_ENDPOINT,
+                    data=data,
+                    files={"file": ("image.jpg", raw, "image/jpeg")},
+                    timeout=_timeout(self.timeout),
+                )
+                if is_auth_failure(resp.status_code):
+                    if key:
+                        self.pool.mark_failure(key)
+                    raise EngineError(f"SauceNAO 返回 HTTP {resp.status_code}")
+                payload = json_or_raise(resp, "SauceNAO")
+                header = payload.get("header") or {}
+                if header.get("status") not in (None, 0, "0"):
+                    message = str(header.get("message") or "未知错误")[:160]
+                    if key:
+                        self.pool.mark_failure(key)
+                    raise EngineError(message)
+                break
+            except EngineError:
+                # key 有问题、服务端明确报错：换线路也没用，别白试。
+                raise
+            except Exception as exc:  # noqa: BLE001
+                # 网络层失败（TLS、连接、超时、非 JSON）：换下一条线路。
+                failures.append(f"{route_name}{type(exc).__name__}")
+                continue
+            finally:
+                session.close()
+        if payload is None:
+            raise EngineError(_attempt_summary(failures) or "SauceNAO 无响应")
 
         if key:
             self.pool.mark_success(key)
