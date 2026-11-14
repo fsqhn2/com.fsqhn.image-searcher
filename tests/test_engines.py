@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -671,6 +672,47 @@ class YandexEngineRouteTest(unittest.TestCase):
         self.assertTrue(is_yandex_shell_page(shell))
         self.assertFalse(is_yandex_shell_page("<html>" + "x" * 6000 + "under construction</html>"))
         self.assertFalse(is_yandex_shell_page("<html><div data-state='{}'></div></html>"))
+
+
+class LensTimeoutBudgetTest(unittest.TestCase):
+    """6440：lens 一次要跑「上传图 + 检索」两步，外部时限按两步给。
+
+    原来外层统一给 engine_timeout+5=55 秒，而内部上传和检索各能等 50 秒，
+    上传那步稍慢整条 lens 就先被外层砍掉，转码重传和 Serper 补枪全来不及跑。
+    """
+
+    def test_deadline_factor_is_two(self) -> None:
+        self.assertEqual(LensEngine.deadline_factor, 2)
+
+    def test_timeout_cools_key_briefly(self) -> None:
+        """超时是网络抖，不是 key 坏了：只冷却十几秒，别把并发的那单一起锁死。"""
+        from core.engines import TIMEOUT_COOLDOWN
+        from core.keypool import KeyPool
+
+        class _Resp:
+            status_code = 200
+
+            def json(self):
+                return {"image_id": "id1"}
+
+        class _Session:
+            def post(self, *args, **kwargs):
+                return _Resp()
+
+            def get(self, *args, **kwargs):
+                raise TimeoutError("timed out")
+
+            def close(self):
+                pass
+
+        pool = KeyPool(["k"])
+        engine = LensEngine(pool, retries=0)
+        with mock.patch("core.engines.make_session", return_value=_Session()):
+            with self.assertRaises(EngineError):
+                engine._search_once(b"img")
+        left = pool._cooldown_until["k"] - time.time()
+        self.assertGreater(left, TIMEOUT_COOLDOWN - 6)
+        self.assertLessEqual(left, TIMEOUT_COOLDOWN + 1)
 
 
 if __name__ == "__main__":

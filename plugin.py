@@ -860,8 +860,14 @@ class PluginSectionConfig(PluginConfigBase):
     )
     engine_timeout: int = Field(
         default=50,
-        description="单个搜索引擎最多等多少秒，超时就跳过它、继续用其他引擎的结果。",
-        json_schema_extra=_ui("单个引擎超时（秒）", "默认 50。Yandex 走代理容易抖，网络差可以再调到 60。"),
+        description=(
+            "单个搜索引擎每次请求最多等多少秒，超时就跳过它、继续用其他引擎的结果。"
+            "Lens 要先上传图片再检索，是两步，实际按两倍算。"
+        ),
+        json_schema_extra=_ui(
+            "单个引擎超时（秒）",
+            "默认 50。Yandex 走代理容易抖，网络差可以再调到 60。Lens 自动按两倍给（默认 100 秒）。",
+        ),
         ge=5,
         le=180,
     )
@@ -1927,6 +1933,18 @@ class ImageSearcherPlugin(MaiBotPlugin):
             raise EngineError(f"未知引擎 {name}")
         return engine.search(image, image_url, stream_id)
 
+    def _engine_deadline(self, name: str) -> float:
+        """外部给某个引擎的总时限。
+
+        大多数引擎一次只发一个请求，engine_timeout 加 5 秒余量就够。Lens 不一样：
+        它得先上传图片拿 image_id、再拿 image_id 检索，是两步，得按两步给。否则上
+        传那一步稍慢，整条 lens 就先被外层砍掉，内部的重传和 Serper 补枪根本没跑
+        到，白占额度还拿不到结果（s-20261114-1646-19f7 就是这么丢的）。
+        """
+        engine = self._engines.get(name)
+        factor = float(getattr(engine, "deadline_factor", 1) or 1)
+        return float(self.config.plugin.engine_timeout) * factor + 5.0
+
     async def _search(self, raw: bytes, image_url: str = "", stream_id: str = "", force: bool = False) -> SearchOutcome:
         config = self.config
         section = config.plugin
@@ -1962,12 +1980,11 @@ class ImageSearcherPlugin(MaiBotPlugin):
         if not names:
             raise RuntimeError("没有启用任何搜索引擎，请先在配置里开启至少一个引擎")
 
-        timeout = section.engine_timeout + 5
         loop = asyncio.get_running_loop()
         coros = [
             asyncio.wait_for(
                 loop.run_in_executor(self._engine_pool, self._call_engine, name, upload, image_url, stream_id),
-                timeout=timeout,
+                timeout=self._engine_deadline(name),
             )
             for name in names
         ]

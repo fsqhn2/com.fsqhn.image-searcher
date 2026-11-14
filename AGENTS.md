@@ -239,13 +239,15 @@ SSRF 防护在 `core/httpclient.is_public_url()`：非公网 http(s) 一律拒�
 
 `0.5.5` 把 `vision_*` / `grok_*` 从 `[plugin]` 拆成了 `[vision]` / `[grok]`（字段名去掉前缀，`fallback` 改名 `enabled`）。老配置靠 `core/config.py` 的 `migrate_legacy_sections()` 走 `normalize_plugin_config` 一次性搬过去，只在目标键还不存在时写入，别删掉这段，否则已有用户的 Grok key 会丢。
 
+56. **外层超时要按引擎的「步数」给，不然内层白跑、额度白扣**：`s-20261114-1646-19f7` 的 lens 整条消失，报 `TimeoutError`。算时间账：16:46:36 拿到图、16:47:31 报错，**正好 55 秒**——外层是 `engine_timeout + 5`，而 lens 内部一次 `search()` 要跑「上传图（最多 50 秒）+ 拿 image_id 检索（最多 50 秒）」两步，理论能到 100 秒。上传那步稍慢，外层到点先砍，`转码重传` 和 `Serper 补枪` 都还没轮到，线程还在后台继续跑（Python 线程取消不掉），额度照扣、结果丢掉。当天两单同时进来（16:46:30 / 16:46:36），一起撞上。现在 `LensEngine.deadline_factor = 2`，`plugin._engine_deadline()` 按 `engine_timeout × factor + 5` 给（lens 默认 105 秒），其他引擎仍是 1 倍。同时把**超时的 key 冷却从 60 秒降到 15 秒**（`core.engines.TIMEOUT_COOLDOWN`）：超时是网络抖，不是 key 坏了，60 秒会把并发那单的 key 一起锁死。**三条边界**：① 真正 401/403 仍走 `mark_failure` 默认 300 秒，别被这条带偏；② 用户实测 SerpAPI 本身很快（上传 0.8 秒、检索 2.9 秒），放宽时限只是兜住偶发抖动，不是常态慢；③ 同一张图连搜两次都只回 1 条时**不是丢结果**——那张图在 Google Lens 里本来就只有一条（一条 Twitter 镜像站的账号页），别照着「条数少」去查 bug。
+
 ## 测试
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-目前 713 项。新增引擎适配、改阈值、改指纹逻辑、改缓存或账号归一规则时补用例。改动 `_verify` / `_rank` / 取图链路后，用真实图跑一次端到端，确认「匹配 → 最佳匹配 → 带图」不断。
+目前 715 项。新增引擎适配、改阈值、改指纹逻辑、改缓存或账号归一规则时补用例。改动 `_verify` / `_rank` / 取图链路后，用真实图跑一次端到端，确认「匹配 → 最佳匹配 → 带图」不断。
 
 改完 `plugin.py` 必须重载验证：日志里应出现 `麦麦寻人已加载：… 上限=…` 与 `vX.Y.Z 加载成功`，且无 traceback。改源码会重启插件进程，内存里的任务表会重建。
 

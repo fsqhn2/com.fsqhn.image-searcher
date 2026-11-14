@@ -45,6 +45,9 @@ from .keypool import KeyPool
 SERP_ENDPOINT = "https://serpapi.com/search.json"
 SERP_IMAGE_ENDPOINT = "https://serpapi.com/image"
 SERP_UPLOAD_LIMIT = 500 * 1024
+# 请求超时（网络抖动，不是 key 坏了）只冷却这么久就再试。原来是 60 秒，两单
+# 同时进来时会把对方的 key 一起锁死，谁都用不了。
+TIMEOUT_COOLDOWN = 15
 # 转码重传用的长边：Lens 只认「这张图像什么」，不靠细节比对，1600 够用，
 # 再大只是多传几秒。
 _LENS_RETRY_SIDE = 1600
@@ -270,6 +273,10 @@ class LensEngine:
     """
 
     name = "lens"
+    # 一次 search() 要跑「上传图 + 检索」两步，外部超时必须按两步给。否则上网
+    # 上传那一步慢一点，整条 lens 就先被外层砍掉，转码重传和 Serper 补枪都还没来得及跑
+    # （s-20261114-1646-19f7：两步没跑完，55 秒到点，lens 整条消失）。
+    deadline_factor = 2
 
     def __init__(
         self,
@@ -419,7 +426,7 @@ class LensEngine:
         except EngineError:
             raise
         except Exception as exc:  # noqa: BLE001
-            pool.mark_failure(key, cooldown_seconds=60)
+            pool.mark_failure(key, cooldown_seconds=TIMEOUT_COOLDOWN)
             raise EngineError(f"{type(exc).__name__}: {str(exc)[:160]}") from exc
         finally:
             session.close()
@@ -501,7 +508,7 @@ class LensEngine:
         except EngineError:
             raise
         except Exception as exc:  # noqa: BLE001
-            target.mark_failure(key, cooldown_seconds=60)
+            target.mark_failure(key, cooldown_seconds=TIMEOUT_COOLDOWN)
             raise EngineError(f"{type(exc).__name__}: {str(exc)[:160]}") from exc
         finally:
             session.close()
