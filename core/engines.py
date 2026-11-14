@@ -381,7 +381,7 @@ class LensEngine:
     def _search_once(self, raw: bytes, image_url: str = "") -> list[Candidate]:
         key, pool = self._pick_key()
         if not key:
-            raise EngineError("没有可用的检索 key（未配置或全部冷却）")
+            raise EngineError("没有可用的检索 key（未配置、额度用尽或全部冷却）")
         if is_serper_key(key):
             self._last_channel = "serper"
             return self._search_serper(key, raw, image_url, pool)
@@ -405,7 +405,15 @@ class LensEngine:
             data = json_or_raise(resp, "SerpAPI")
             if data.get("error"):
                 message = str(data["error"])[:160]
-                if any(token in message.lower() for token in ("key", "quota", "plan", "limit")):
+                low = message.lower()
+                if any(
+                    token in low
+                    for token in ("run out", "runout", "quota", "exceeded", "no searches", "searches left")
+                ):
+                    # 月额度跑完了：冷却几分钟救不回来，按自然月记住，别再每单撞一次。
+                    # s-20261114 那把 641968394@qq.com 的免费额度就是这样用完的。
+                    pool.mark_exhausted(key)
+                elif any(token in low for token in ("key", "plan", "limit")):
                     pool.mark_failure(key)
                 raise EngineError(message)
         except EngineError:

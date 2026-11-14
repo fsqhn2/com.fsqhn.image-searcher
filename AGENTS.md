@@ -217,6 +217,8 @@ core/maibot_compat.py  能力返回值解包
 
 54. **「没搜到」和「命中」共用 `status=ok`，别再拿 status 判断要不要下配图**：`s-20261114-1007-5878` 群里收到一条 8 节点的转发，一张图都没有。原因是 Grok 只给了账号（`tier=account`）也算 `status=ok`，而 `_ensure_engine_images()` 的早退条件是 `if outcome.status == "ok" and not whole: return`——首次回复直接不下载任何候选图，可这单 `best` 是空的、走的是没搜到的排版，每个引擎那条本来就该带图。判据换成 `outcome.best is not None`：有结论才跳过，没结论就得下。同一处还补了视觉那条：它挑中的图不一定在各引擎的第一条里（没有 picked 时退到降级成 vision 的那条），不补这一张视觉就像没干活。另外 Grok 只给账号时插件把核对过的那张图存在 `image_b64`（`image_source` 指向 `grok.reference_url`），`grok_image_b64` 是空的，`build_miss_nodes()` 现在会在两处地址对上时拿它补图——否则 Grok 那条只剩文字。**三条边界**：① 只在 `grok_image_b64` 为空、`image_source` 与 `reference_url` 完全一致时兜底，用户原图（`upload`）绝不冒充 Grok 配图；② 视觉挑中的图如果就是某引擎那条，仍然不重复发；③ 修完这单的真实数据是 5 张图（4 引擎各 1 + Grok 1），视觉那条指向百度那条所以不重发。
 
+55. **额度用尽的 key 要按月记住，别每单白撞一次**：`s-20261114` 那批单子的 Lens 有三把 SerpAPI key，其中 `641968394@qq.com` 那把免费额度（250 次/月）已经跑完，另外两把分别剩几十和两百。额度跑完的 key 再请求只会回一次错误、插件多等一个往返，5 分钟冷却到期后又被轮到，一单白花几秒。现在分两层：`core/keystate.py` 把「用尽」状态落到 `data/plugins/com.fsqhn.image-searcher/key_quota.json`（**只存 sha256 前 16 位**，文件泄露也拿不到 key），到期时间是下一个自然月 1 日 + 1 天缓冲（SerpAPI 按 UTC 月重置）；`KeyPool` 多了 `exhausted` / `mark_exhausted()` / `snapshot()` / `on_change`，`acquire()` 同时看冷却和用尽，插件在 `_remember_key_quota()` 里整份覆盖写回。顺手把 `engines.py` 的错误分类拆开：只有明确写着 `run out` / `quota` / `exceeded` / `no searches` / `searches left` 的才记成「本月用尽」，`key` / `plan` / `limit` 仍只冷却 300 秒——不然一个填错的 key 会被禁到月底。**三条边界**：① Serper 是预付费余额，充值就能恢复，**不要**套这个按月逻辑；② 想立刻恢复某把 key，删掉 json 里对应条目（或整个文件）即可；③ `on_change` 回调抛异常只吞掉、不影响本次搜索，写盘失败等于没记住。上线时用一次性脚本查了一次 `serpapi.com/account.json` 把已经用完的那把预先写进去，插件运行时**不会**主动查余额。
+
 ## 排障顺序
 
 1. 插件没加载：看 `_manifest.json` 是否合法、`create_plugin()` 是否存在、生命周期方法是否齐全。
@@ -243,7 +245,7 @@ SSRF 防护在 `core/httpclient.is_public_url()`：非公网 http(s) 一律拒�
 python -m unittest discover -s tests -v
 ```
 
-目前 702 项。新增引擎适配、改阈值、改指纹逻辑、改缓存或账号归一规则时补用例。改动 `_verify` / `_rank` / 取图链路后，用真实图跑一次端到端，确认「匹配 → 最佳匹配 → 带图」不断。
+目前 713 项。新增引擎适配、改阈值、改指纹逻辑、改缓存或账号归一规则时补用例。改动 `_verify` / `_rank` / 取图链路后，用真实图跑一次端到端，确认「匹配 → 最佳匹配 → 带图」不断。
 
 改完 `plugin.py` 必须重载验证：日志里应出现 `麦麦寻人已加载：… 上限=…` 与 `vX.Y.Z 加载成功`，且无 traceback。改源码会重启插件进程，内存里的任务表会重建。
 

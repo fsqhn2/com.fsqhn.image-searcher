@@ -28,6 +28,7 @@ from .core import (
     grok,
     handles,
     identity,
+    keystate,
     paid,
     paywall,
     resultcache,
@@ -1375,6 +1376,22 @@ class ImageSearcherPlugin(MaiBotPlugin):
             parts.append(f"{name}={engine.max_results}")
         return "、".join(parts) or "无"
 
+    def _remember_key_quota(self, pool: str, snapshot: dict[str, float]) -> None:
+        """某个池的额度用尽状态变了，写回磁盘。
+
+        snapshot 是这个池当前所有「用尽」记录，整份覆盖；空就删掉这一段。
+        """
+        if not pool:
+            return
+        state = getattr(self, "_key_quota", None)
+        if state is None:
+            state = self._key_quota = {}
+        if snapshot:
+            state[pool] = dict(snapshot)
+        else:
+            state.pop(pool, None)
+        keystate.save(self.ctx.paths.data_dir, state)
+
     def _rebuild(self, keep_tasks: bool = True) -> None:
         config = self.config
         section = config.plugin
@@ -1393,16 +1410,38 @@ class ImageSearcherPlugin(MaiBotPlugin):
         )
 
         global_proxy = _proxy_of(section.proxy)
+        # 额度用尽的记忆落盘在 data 目录，重启和改配置都不会丢；key 只存哈希。
+        self._key_quota = keystate.load(self.ctx.paths.data_dir)
         self._pools = {
-            "lens": KeyPool(config.lens.keys),
-            "saucenao": KeyPool(config.saucenao.keys),
-            "ai": KeyPool(config.ai_detect.keys),
+            "lens": KeyPool(
+                config.lens.keys,
+                name="lens",
+                exhausted=self._key_quota.get("lens"),
+                on_change=self._remember_key_quota,
+            ),
+            "saucenao": KeyPool(
+                config.saucenao.keys,
+                name="saucenao",
+                exhausted=self._key_quota.get("saucenao"),
+                on_change=self._remember_key_quota,
+            ),
+            "ai": KeyPool(
+                config.ai_detect.keys,
+                name="ai",
+                exhausted=self._key_quota.get("ai"),
+                on_change=self._remember_key_quota,
+            ),
         }
         # Serper 单独一个池：它跟 SerpAPI 不是一家，key 也不通用，别混进 lens 池。
         # 总开关关掉或者没填 key，这个池就不存在，后面各处自然跳过它。
         serper_keys = list(config.serper.keys) if config.serper.enabled else []
         if serper_keys:
-            self._pools["serper"] = KeyPool(serper_keys)
+            self._pools["serper"] = KeyPool(
+                serper_keys,
+                name="serper",
+                exhausted=self._key_quota.get("serper"),
+                on_change=self._remember_key_quota,
+            )
         # Lens 只在「允许替补」且「允许上传图床」时才把 Serper 那把挂上去。
         lens_serper_pool = self._pools.get("serper") if config.serper.lens_fallback else None
         if lens_serper_pool is not None and not config.serper.upload:
