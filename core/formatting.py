@@ -1015,6 +1015,12 @@ def _engine_name(engine: str) -> str:
     return ENGINE_LABELS.get(engine, engine or "未知引擎")
 
 
+def _host_of(url: str) -> str:
+    """从链接里取域名，候选没带 platform 时用它顶一下。"""
+    value = (url or "").strip()
+    return urlparse(value).netloc.lower() if "://" in value else ""
+
+
 def _candidate_identity(item: Candidate) -> str:
     """没下载比对过、或指纹明确不符的候选，账号并不是原作者，不能当结论发出去。"""
     if item.status in {"unverified", "mismatch"}:
@@ -1022,14 +1028,30 @@ def _candidate_identity(item: Candidate) -> str:
     return item.handle or item.name or "（未识别）"
 
 
-def _candidate_text(item: Candidate, index: int) -> str:
+def _candidate_text(item: Candidate, index: int, short: bool = False) -> str:
     tag = f"[{item.platform}]"
     identity = _candidate_identity(item)
-    status = item.note or "未验证"
+    status = _short_status(item) if short else (item.note or "未验证")
     lines = [f"{index}. {tag} {identity} · {status}"]
     if item.url:
         lines.append(f"   {item.url}")
     return "\n".join(lines)
+
+
+def _short_status(item: Candidate) -> str:
+    """一条候选只用一句话交代：距离多少、是不是同一张，别把长备注抄进来。"""
+    gap = f"（距离 {item.distance}）" if item.distance is not None else ""
+    if item.status == "match":
+        return f"指纹一致{gap}"
+    if item.status == "mismatch":
+        return f"不是同一张{gap}"
+    if item.status == "suspect":
+        if item.distance is None and item.similarity is not None:
+            return f"相似度 {item.similarity}%"
+        return f"同款或同角色的另一张{gap}"
+    if item.status == "unverified":
+        return "图没下到，没验证"
+    return item.note or "未验证"
 
 
 def engine_groups(
@@ -1058,7 +1080,18 @@ def engine_groups(
                 -(item.similarity or 0),
             ),
         )
-        result.append((engine, ordered[: max(1, limit)]))
+        # 同一个页面上的多张图会各算一条候选（Lens 常这么给），参考区里连着摆
+        # 两行一模一样的链接，看着像搜重了。同一 URL 只留最接近的那条。
+        unique: list[Candidate] = []
+        seen: set[str] = set()
+        for item in ordered:
+            key = _bare_url(item.url or "") or (item.image_url or "")
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            unique.append(item)
+        result.append((engine, unique[: max(1, limit)]))
     return result
 
 
@@ -1200,15 +1233,15 @@ def _reference_hint(outcome: SearchOutcome, source: str) -> str:
     )
 
 
-def _footer_lines(outcome: SearchOutcome, command: str, ttl_minutes: int, replay: bool, task_id: str = "") -> list[str]:
+def _footer_lines(outcome: SearchOutcome, command: str, ttl_minutes: int, replay: bool, task_id: str = "", reference_note: bool = True) -> list[str]:
     # 「怎么找的」只在「更多」里写：首次回复给了结论就走，路线与 AI 检测属于详情。
     lines: list[str] = [_route_line(outcome), _ai_line(outcome.ai)] if replay else []
     if outcome.cached:
         # 说清这是复用，不是刚跑出来的：同一张图结果一样，但引擎这次一条都没调。
         lines.append("💾 这张图之前搜过，直接复用了当时的结果（引擎没有重新跑）")
-    if outcome.image_b64 and outcome.image_source == "upload":
+    if reference_note and outcome.image_b64 and outcome.image_source == "upload":
         lines.append("（没有可用的候选图，转发里的图是你发的原图）")
-    elif outcome.image_b64 and outcome.best is None:
+    elif reference_note and outcome.image_b64 and outcome.best is None:
         phrase = _distance_phrase(_reference_distance(outcome, outcome.image_source))
         kind = reference_kind(outcome, outcome.image_source)
         if _is_avatar_source(outcome, outcome.image_source):
@@ -1491,6 +1524,215 @@ def count_forward_images(nodes: list[dict]) -> int:
     )
 
 
+# Grok 调过哪些工具，说给人听时用中文：原始工具名是 x_user_search 这种。
+_GROK_TOOL_NAMES = {
+    "x_user_search": "用户搜索",
+    "x_semantic_search": "语义搜索",
+    "x_keyword_search": "关键词搜索",
+    "x_post_search": "帖子搜索",
+}
+
+
+def _grok_tool_text(tools: list) -> str:
+    names: list[str] = []
+    for tool in tools:
+        name = _GROK_TOOL_NAMES.get(str(tool), str(tool))
+        if name and name not in names:
+            names.append(name)
+    return "、".join(names)
+
+
+def _pick_line(item: Candidate) -> str:
+    """「最像的那条」：一行说明 + 一行链接，别再抄一遍候选里那句长备注。"""
+    where = item.platform or _host_of(item.url)
+    identity = _candidate_identity(item)
+    gap = f"（指纹距离 {item.distance}）" if item.distance is not None else ""
+    line = f"👉 {identity} · {where}{gap}" if where else f"👉 {identity}{gap}"
+    if item.url:
+        line += f"\n   {item.url}"
+    return line
+
+
+def _miss_headline(outcome: SearchOutcome) -> str:
+    """没找到时的第一句：先说结论，再说比了多少条、最近的那条是什么。"""
+    lines = ["⚠️ 没搜到：公开索引里没有这张图的原帖"]
+    counts = outcome.engine_counts or {}
+    parts = [f"{_engine_name(name)} {value}" for name, value in counts.items() if isinstance(value, int) and value]
+    raw = sum(value for value in counts.values() if isinstance(value, int))
+    total = outcome.total_candidates or len(outcome.candidates)
+    detail: list[str] = []
+    if parts:
+        detail.append(" / ".join(parts))
+    if raw and total and raw != total:
+        detail.append(f"共 {raw} 条原始结果、去重后 {total} 条")
+    elif total:
+        detail.append(f"共 {total} 条结果")
+    compared = [item for item in outcome.candidates if item.distance is not None]
+    nearest = min(compared, key=lambda item: item.distance or 0, default=None)
+    if nearest is not None:
+        where = nearest.platform or _host_of(nearest.url)
+        gap = f"距离 {nearest.distance}"
+        bits = f"最近的一条是 {where}（{gap}）" if where else f"最近的一条（{gap}）"
+        detail.append(bits + "，同款或同角色的另一张，不是这张图")
+    if detail:
+        lines.append("；".join(detail) + "。")
+    return "\n".join(lines)
+
+
+def _vision_miss_entry(outcome: SearchOutcome) -> tuple[str, Candidate | None]:
+    """没找到时视觉那一条：挑了哪张、给的理由、单图。"""
+    vision = outcome.vision or {}
+    checked = int(vision.get("checked") or 0)
+    if not vision.get("ok"):
+        error = str(vision.get("error") or "").strip()
+        return (f"🧠 视觉复核没做完：{error}" if error else ""), None
+    if not checked:
+        return "", None
+    picked = [str(url) for url in (vision.get("picked_images") or []) if url]
+    by_image = {item.image_url: item for item in outcome.candidates if item.image_url}
+    pick = next((by_image[url] for url in picked if url in by_image), None)
+    if pick is None:
+        pick = next((item for item in outcome.candidates if downgrade_kind(item) == "vision"), None)
+    if picked:
+        head = f"🧠 视觉复核：把 {checked} 张候选拼成一张对照图逐格看，挑了 {len(picked)} 条"
+    else:
+        head = f"🧠 视觉复核：把 {checked} 张候选拼成一张对照图逐格看，没有一条对得上"
+    lines = [head]
+    reason = str(vision.get("reason") or "").strip()
+    if reason:
+        lines.append(f"它给的理由：{reason}（照着服装、发型判的，不一定准）")
+    return "\n".join(lines), pick
+
+
+def _grok_miss_entry(outcome: SearchOutcome) -> str:
+    """没找到时 Grok 那一条：它换了哪些搜法、核了几条帖子、最近差多少。"""
+    grok = outcome.grok or {}
+    if not grok.get("ok") or grok.get("tier") == "none":
+        error = str(grok.get("error") or "").strip()
+        return f"🔎 Grok 找人没做完：{error}" if error else ""
+    hints = int(grok.get("hints") or 0)
+    tools = _grok_tool_text(list(grok.get("tools") or []))
+    checked = int(grok.get("checked_posts") or 0)
+    distance = grok.get("distance")
+    bits: list[str] = []
+    if hints and tools:
+        bits.append(f"在 X 上换了 {hints} 组关键词搜（{tools}）")
+    elif hints:
+        bits.append(f"在 X 上换了 {hints} 组关键词搜")
+    else:
+        bits.append("在 X 上搜过")
+    if checked:
+        bits.append(f"逐条核了 {checked} 条帖子")
+    if isinstance(distance, int) and distance >= 0:
+        bits.append(f"最近的一条配图距离 {distance}")
+    lines = ["🔎 Grok：" + "，".join(bits) + "，都不是这张"]
+    handle = str(grok.get("handle") or "").strip()
+    post = str(grok.get("post_url") or "").strip()
+    if handle and post:
+        lines.append(f"👉 @{handle}：{post}")
+    elif handle:
+        lines.append(f"👉 @{handle}：https://x.com/{handle}")
+    return "\n".join(lines)
+
+
+def is_miss_layout(outcome: SearchOutcome) -> bool:
+    """没搜到、而且也没有可靠结论时走「一条条摆出来」的结构。
+
+    Grok 已经给出原帖（tier=post）时不走这里：那种情况有真结论，
+    再写「没搜到」就是自相矛盾。
+    """
+    if outcome.status == "error" or outcome.best is not None:
+        return False
+    grok = outcome.grok or {}
+    return grok.get("tier") != "post"
+
+
+def build_miss_nodes(
+    task: SearchTask,
+    *,
+    command: str,
+    nickname: str,
+    ttl_minutes: int,
+    replay: bool,
+    user_id: str,
+) -> list[dict]:
+    """没找到时的转发：结论打头，接着每个引擎一条、视觉一条、Grok 一条。
+
+    用户 2026-11-14 的要求：什么都没搜到的时候，先直说没搜到，别把线索摆前头；
+    每个引擎只给最近的那一条并配图，视觉和 Grok 有结果也各占一条，还要说清
+    它们各自做了什么。
+    """
+    outcome = task.outcome or SearchOutcome(status="error")
+    nodes: list[dict] = [_node([{"type": "text", "content": _miss_headline(outcome)}], nickname, user_id)]
+    shown: set[str] = set()
+    shown_urls: dict[str, str] = {}
+
+    order = {name: index for index, name in enumerate(ENGINE_LABELS)}
+    groups = sorted(
+        engine_groups(outcome, outcome.best, 1),
+        key=lambda pair: order.get(pair[0], len(order)),
+    )
+    for engine, items in groups:
+        total = (outcome.engine_counts or {}).get(engine)
+        head = f"▍{_engine_name(engine)}：{total} 条里最近的一条" if total else f"▍{_engine_name(engine)}"
+        content: list[dict] = [{"type": "text", "content": head}]
+        for index, item in enumerate(items, start=1):
+            content.append({"type": "text", "content": _candidate_text(item, index, short=True)})
+            image = candidate_image(outcome, item)
+            if image:
+                content.append({"type": "image", "content": image})
+                shown.add(item.image_url)
+            if item.url:
+                shown_urls.setdefault(_bare_url(item.url), _engine_name(engine))
+        nodes.append(_node(content, nickname, user_id))
+
+    vision_text, pick = _vision_miss_entry(outcome)
+    if vision_text:
+        if pick is not None:
+            owner = shown_urls.get(_bare_url(pick.url or "")) if pick.url else ""
+            gap = f"（距离 {pick.distance}）" if pick.distance is not None else ""
+            if owner:
+                vision_text += f"\n👉 最像的就是上面 ▍{owner} 那条{gap}"
+            else:
+                vision_text += "\n" + _pick_line(pick)
+        content = [{"type": "text", "content": vision_text}]
+        image = candidate_image(outcome, pick) if pick is not None else ""
+        if image and pick.image_url not in shown:
+            content.append({"type": "image", "content": image})
+            shown.add(pick.image_url)
+        nodes.append(_node(content, nickname, user_id))
+
+    grok_text = _grok_miss_entry(outcome)
+    if grok_text:
+        content = [{"type": "text", "content": grok_text}]
+        if outcome.grok_image_b64:
+            content.append({"type": "image", "content": outcome.grok_image_b64})
+        nodes.append(_node(content, nickname, user_id))
+
+    nodes.append(
+        _node(
+            [
+                {
+                    "type": "text",
+                    "content": "\n".join(
+                        _footer_lines(
+                            outcome,
+                            command,
+                            ttl_minutes,
+                            replay,
+                            task.task_id,
+                            reference_note=False,
+                        )
+                    ),
+                }
+            ],
+            nickname,
+            user_id,
+        )
+    )
+    return nodes
+
+
 def build_result_forwards(
     task: SearchTask,
     *,
@@ -1509,6 +1751,19 @@ def build_result_forwards(
     是一条转发，点开是三条。两边都没内容时返回原来的单条结构。
     """
     outcome = task.outcome or SearchOutcome(status="error")
+
+    if is_miss_layout(outcome):
+        # 什么都没搜到：结论打头，然后每个引擎一条、视觉一条、Grok 一条。
+        return [
+            build_miss_nodes(
+                task,
+                command=command,
+                nickname=nickname,
+                ttl_minutes=ttl_minutes,
+                replay=replay,
+                user_id=user_id,
+            )
+        ]
 
     blocks: list[list[dict]] = []
     vision = _vision_block(outcome)

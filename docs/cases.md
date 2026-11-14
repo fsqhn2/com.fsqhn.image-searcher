@@ -260,6 +260,17 @@
 
 ---
 
+### s-20261114-0901-499d
+
+- **用户给的**：这张为什么搜不到，另外结果展示还得改。
+- **日志事实**：status=ok、best=null，走的是照片路线（SauceNAO 最高 44.2%，没到插画阈值 75%）；engine_counts：lens 60、yandex 113、baidu 30、saucenao 8，去重后 68 条候选；视觉 checked=16、picked=5、downgraded=5；Grok tier=account、handle=nprcie、verified=miss、distance=28、checked_posts=2、三个工具都跑了。原图从服务器捞回来看过（1707×4096）：粉红短发、蓝白裙、翅膀、站水里，是二次元立绘。
+- **根因**：插画被当照片搜。照片路线下 Lens / Yandex / 百度拿回的全是同款裙子或同角色 cosplay，最近的是 lolita 商品页（距离 20）；SauceNAO 那 8 条最高 44.2%，达不到 75% 就触发不了插画路线，于是这条真正可能命中的路一次没走。Grok 指的 @nprcie 是《妮姬》灰姑娘 cosplay，我把那帖 4 张配图全下载比了指纹：与原图最近 28、其余 30~36，她最近 11 条带图帖也没有，判 miss 是诚实的。
+- **附带发现**：视觉复核出假阳性——把插画和真人 cosplay 判成「同一个人」，理由「银发双马尾、脸型与五官比例一致、黑色长手套与白色连衣裙细节匹配」，据此降级了 5 条。插画与照片的可比性这块要单独一单处理，不跟展示改动混在一起。
+- **修复（展示）**：用户 09:21 给的展示口径——结论在最前、每个引擎各 1 条带图、视觉与 Grok 各 1 条带图并写清做了什么。`core/formatting.py` 新增 `is_miss_layout()` / `build_miss_nodes()` / `_miss_headline()` / `_vision_miss_entry()` / `_grok_miss_entry()`，`build_result_forwards()` 在 `best is None` 且 Grok 未给原帖时直接走这套；`engine_groups()` 按 URL 去重留距离最近那条；miss 布局不再输出「参考图是…」。用这单真实数据本地复现：1 块 6 节点（结论 + Lens + SauceNAO + 视觉 + Grok + 页脚）。
+- **待办**：用户还没给这张插画的真实出处（pixiv / X / 微博都行），所以「SauceNAO 漏收录」还是「路走错」暂时定不了。
+
+---
+
 ## 排查一单的顺序
 
 1. 先看是按图缓存命中还是真跑了一遍（日志有「按图缓存命中」）。旧结论出现时，让用户重搜。

@@ -757,20 +757,24 @@ class SplitForwardsTest(unittest.TestCase):
         footer = blocks[2][0]["content"][0]["content"]
         self.assertIn("任务编号", footer)
 
-    def test_not_found_with_grok_keeps_footer_block_separate(self) -> None:
+    def test_not_found_puts_conclusion_first_and_keeps_grok_after_engines(self) -> None:
         outcome = self._make_outcome(best=False)
         blocks = build_result_forwards(_task(outcome), command="盆地找鸡")
-        self.assertEqual(len(blocks), 2)
-        # Grok 单独一条，尾部那条只讲「没找到」和参考区，不再重复 Grok 结论。
-        tail = "\n".join(
+        # 没搜到时只发一条：先说没搜到，引擎各一条，视觉/Grok 跟在后面，页脚收尾。
+        self.assertEqual(len(blocks), 1)
+        nodes = blocks[0]
+        first = nodes[0]["content"][0]["content"]
+        self.assertTrue(first.startswith("⚠️ 没搜到"), first)
+        blob = "\n".join(
             part["content"]
-            for node in blocks[1]
+            for node in nodes
             for part in node.get("content") or []
-            if part["type"] == "text"
+            if part.get("type") == "text"
         )
-        self.assertIn("未找到可靠出处", tail)
-        self.assertNotIn("X 搜索指向这个账号", tail)
-        self.assertIn("任务编号", tail)
+        self.assertIn("Grok", blob)
+        self.assertIn("@someone", blob)
+        self.assertLess(blob.index("没搜到"), blob.index("Grok"))
+        self.assertIn("任务编号", nodes[-1]["content"][0]["content"])
 
     def test_grok_found_post_does_not_contradict_with_not_found(self) -> None:
         """Grok 已给出原帖时，尾部再说「未找到可靠出处」就是自相矛盾（s-20261106-1659）。"""
@@ -821,15 +825,25 @@ class SplitForwardsTest(unittest.TestCase):
             total_candidates=2,
         )
         blocks = build_result_forwards(_task(outcome), command="盆地找鸡")
-        tail = "\n".join(
-            part["content"]
-            for node in blocks[-1]
-            for part in node.get("content") or []
-            if part["type"] == "text"
+        head = blocks[0][0]["content"][0]["content"]
+        self.assertIn("没搜到", head)
+        self.assertIn("共 2 条结果", head)
+        self.assertIn("距离 24", head)
+        self.assertNotIn("疑似同图", head)
+        # 同一引擎只摆最近的一条，另一条留到「更多」里。
+        yandex_nodes = [
+            node
+            for node in blocks[0][1:]
+            if "Yandex" in str(node.get("content")[0].get("content"))
+        ]
+        self.assertEqual(len(yandex_nodes), 1)
+        text = "\n".join(
+            str(part.get("content"))
+            for part in yandex_nodes[0]["content"]
+            if part.get("type") == "text"
         )
-        self.assertIn("另有 2 条是同角色或同款服装的图", tail)
-        self.assertIn("指纹距离 24～31", tail)
-        self.assertNotIn("疑似同图", tail)
+        self.assertIn("example.com/a", text)
+        self.assertNotIn("example.com/b", text)
 
     def test_avatar_hits_are_not_counted_as_same_character(self) -> None:
         """头像命中不算「同角色或同款服装」，note 被视觉改写后也要认出来。"""
@@ -850,12 +864,12 @@ class SplitForwardsTest(unittest.TestCase):
             candidates=[avatar, other],
             total_candidates=2,
         )
-        blocks = build_result_forwards(_task(outcome), command="盆地找鸡")
+        nodes = build_forward_nodes(_task(outcome), command="盆地找鸡", replay=True)
         tail = "\n".join(
             part["content"]
-            for node in blocks[-1]
+            for node in nodes
             for part in node.get("content") or []
-            if part["type"] == "text"
+            if part.get("type") == "text"
         )
         self.assertIn("另有 1 条是站点账号头像", tail)
         self.assertIn("指纹对上了，但那是头像不是原帖", tail)
@@ -875,6 +889,131 @@ class SplitForwardsTest(unittest.TestCase):
         outcome.grok = {"ok": True, "tier": "none", "error": ""}
         blocks = build_result_forwards(_task(outcome), command="盆地找鸡")
         self.assertEqual(len(blocks), 1)
+
+
+class MissLayoutTest(unittest.TestCase):
+    """没搜到时：结论打头，引擎各一条带图，视觉与 Grok 各一条并说清做了什么。"""
+
+    def _make_outcome(self) -> SearchOutcome:
+        lens = Candidate(
+            engine="lens",
+            url="https://shop.example/p/1",
+            image_url="https://img/lens.jpg",
+            distance=20,
+            status="suspect",
+            platform="shop.example",
+            name="Susin",
+        )
+        lens.finalize()
+        sauce = Candidate(
+            engine="saucenao",
+            url="https://pixiv.example/art/5",
+            image_url="https://img/sauce.jpg",
+            similarity=44.2,
+            status="suspect",
+            platform="pixiv.net",
+            name="鳴",
+        )
+        sauce.finalize()
+        outcome = SearchOutcome(
+            status="not_found",
+            best=None,
+            candidates=[lens, sauce],
+            images={"https://img/lens.jpg": "LENSIMG", "https://img/sauce.jpg": "SAUCEIMG"},
+            total_candidates=68,
+            engine_counts={"lens": 60, "yandex": 113, "baidu": 30, "saucenao": 8},
+            vision={
+                "ok": True,
+                "checked": 16,
+                "picked_images": ["https://img/lens.jpg"],
+                "downgraded": 5,
+                "reason": "银发双马尾、黑色长手套",
+                "model": "m",
+                "error": "",
+                "elapsed": 8.5,
+            },
+            grok={
+                "ok": True,
+                "tier": "account",
+                "handle": "nprcie",
+                "name": "n",
+                "post_url": "https://x.com/nprcie/status/1",
+                "distance": 28,
+                "reason": "帖子配图对不上（最近距离 28），帖子只当参考",
+                "tools": ["x_user_search", "x_semantic_search", "x_keyword_search"],
+                "hints": 8,
+                "checked_posts": 2,
+                "verified": "miss",
+            },
+        )
+        outcome.grok_image_b64 = "GROKIMG"
+        return outcome
+
+    def _text(self, node: dict) -> str:
+        return "\n".join(
+            str(part.get("content")) for part in node.get("content") or [] if part.get("type") == "text"
+        )
+
+    def _images(self, node: dict) -> list[str]:
+        return [part["content"] for part in node.get("content") or [] if part.get("type") == "image"]
+
+    def test_headline_and_order(self) -> None:
+        blocks = build_result_forwards(_task(self._make_outcome()), command="盆地找鸡")
+        self.assertEqual(len(blocks), 1)
+        nodes = blocks[0]
+        head = self._text(nodes[0])
+        self.assertTrue(head.startswith("⚠️ 没搜到"), head)
+        self.assertIn("共 211 条原始结果、去重后 68 条", head)
+        self.assertIn("距离 20", head)
+        # 引擎 → 视觉 → Grok → 页脚
+        order = [self._text(node)[:12] for node in nodes]
+        self.assertTrue(any(text.startswith("▍Google Lens") for text in order))
+        self.assertTrue(any(text.startswith("▍SauceNAO") for text in order))
+        self.assertTrue(any(text.startswith("🧠 视觉复核") for text in order))
+        self.assertTrue(any(text.startswith("🔎 Grok") for text in order))
+        self.assertIn("任务编号", self._text(nodes[-1]))
+
+    def test_each_engine_one_entry_with_image(self) -> None:
+        nodes = build_result_forwards(_task(self._make_outcome()), command="盆地找鸡")[0]
+        lens = next(node for node in nodes if self._text(node).startswith("▍Google Lens"))
+        self.assertIn("60 条里最近的一条", self._text(lens))
+        self.assertIn("同款或同角色的另一张（距离 20）", self._text(lens))
+        self.assertEqual(self._images(lens), ["LENSIMG"])
+        sauce = next(node for node in nodes if self._text(node).startswith("▍SauceNAO"))
+        self.assertIn("相似度 44.2%", self._text(sauce))
+        self.assertEqual(self._images(sauce), ["SAUCEIMG"])
+
+    def test_vision_entry_says_what_it_did(self) -> None:
+        nodes = build_result_forwards(_task(self._make_outcome()), command="盆地找鸡")[0]
+        vision = next(node for node in nodes if self._text(node).startswith("🧠 视觉复核"))
+        text = self._text(vision)
+        self.assertIn("16 张候选", text)
+        self.assertIn("挑了 1 条", text)
+        self.assertIn("银发双马尾", text)
+        self.assertIn("上面 ▍Google Lens 那条", text)
+        # 图跟 Lens 那条重复，就不再发一次
+        self.assertEqual(self._images(vision), [])
+
+    def test_grok_entry_says_what_it_did(self) -> None:
+        nodes = build_result_forwards(_task(self._make_outcome()), command="盆地找鸡")[0]
+        grok = next(node for node in nodes if self._text(node).startswith("🔎 Grok"))
+        text = self._text(grok)
+        self.assertIn("8 组关键词", text)
+        self.assertIn("用户搜索", text)
+        self.assertIn("核了 2 条帖子", text)
+        self.assertIn("距离 28", text)
+        self.assertIn("@nprcie", text)
+        self.assertEqual(self._images(grok), ["GROKIMG"])
+
+    def test_without_vision_or_grok_only_engines(self) -> None:
+        outcome = SearchOutcome(
+            status="not_found",
+            candidates=[],
+            total_candidates=1,
+        )
+        nodes = build_result_forwards(_task(outcome), command="盆地找鸡")[0]
+        self.assertTrue(self._text(nodes[0]).startswith("⚠️ 没搜到"))
+        self.assertIn("任务编号", self._text(nodes[-1]))
 
 
 class XGuessTest(unittest.TestCase):
