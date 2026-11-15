@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from core.engines import (  # noqa: E402
     Candidate,
     EngineError,
+    host_image_publicly,
     LensEngine,
     YandexEngine,
     is_yandex_shell_page,
@@ -773,3 +774,60 @@ class SauceNaoRouteTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HostImageTest(unittest.TestCase):
+    """图床上传失败必须留下原因。
+
+    以前 except 一把吞掉，日志里只剩「图床没换成」，事后分不清是超时、被拒还是
+    回了空（s-20261115-2237-0365 就是这样）。而且 uguu 会整段 502，过一次往往
+    就通了，所以第一次失败要再试一次。
+    """
+
+    def _session(self, status=502, text="<html>502 Bad Gateway</html>", exc=None):
+        session = mock.MagicMock()
+        if exc is not None:
+            session.post.side_effect = exc
+        else:
+            resp = mock.MagicMock()
+            resp.status_code = status
+            resp.text = text
+            session.post.return_value = resp
+        return session
+
+    def test_http_error_is_reported_and_retried_once(self) -> None:
+        notes: list[str] = []
+        with mock.patch("core.engines.make_session", return_value=self._session()):
+            with mock.patch("core.engines.time.sleep"):
+                link = host_image_publicly(b"x" * 64, note=notes.append)
+        self.assertEqual(link, "")
+        self.assertEqual(len(notes), 2, notes)
+        self.assertTrue(all("HTTP 502" in item for item in notes), notes)
+
+    def test_transport_error_names_the_exception(self) -> None:
+        notes: list[str] = []
+        with mock.patch(
+            "core.engines.make_session",
+            return_value=self._session(exc=RuntimeError("connection reset")),
+        ):
+            with mock.patch("core.engines.time.sleep"):
+                link = host_image_publicly(b"x" * 64, note=notes.append)
+        self.assertEqual(link, "")
+        self.assertTrue(any("RuntimeError" in item for item in notes), notes)
+
+    def test_second_attempt_can_succeed(self) -> None:
+        bad = self._session()
+        good = self._session(status=200, text="https://d.uguu.se/abc.jpg ")
+        notes: list[str] = []
+        with mock.patch("core.engines.make_session", side_effect=[bad, good]):
+            with mock.patch("core.engines.time.sleep"):
+                link = host_image_publicly(b"x" * 64, note=notes.append)
+        self.assertEqual(link, "https://d.uguu.se/abc.jpg")
+        self.assertEqual(len(notes), 1, notes)
+
+    def test_empty_body_is_reported(self) -> None:
+        notes: list[str] = []
+        with mock.patch("core.engines.make_session", return_value=self._session(status=200, text="")):
+            link = host_image_publicly(b"x" * 64, note=notes.append)
+        self.assertEqual(link, "")
+        self.assertTrue(any("没回直链" in item for item in notes), notes)

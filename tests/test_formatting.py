@@ -14,6 +14,7 @@ from core.formatting import (
     build_text_summary,
     count_forward_images,
     engine_groups,
+    forward_notice,
     stale_image_hint,
     ttl_text,
 )
@@ -764,7 +765,8 @@ class SplitForwardsTest(unittest.TestCase):
         self.assertEqual(len(blocks), 1)
         nodes = blocks[0]
         first = nodes[0]["content"][0]["content"]
-        self.assertTrue(first.startswith("⚠️ 没搜到"), first)
+        self.assertTrue(first.startswith("[s-test] "), first)
+        self.assertIn("⚠️ 没搜到", first)
         blob = "\n".join(
             part["content"]
             for node in nodes
@@ -962,7 +964,8 @@ class MissLayoutTest(unittest.TestCase):
         self.assertEqual(len(blocks), 1)
         nodes = blocks[0]
         head = self._text(nodes[0])
-        self.assertTrue(head.startswith("⚠️ 没搜到"), head)
+        self.assertTrue(head.startswith("[s-test] "), head)
+        self.assertIn("⚠️ 没搜到", head)
         self.assertIn("共 211 条原始结果、去重后 68 条", head)
         self.assertIn("距离 20", head)
         # 引擎 → 视觉 → Grok → 页脚
@@ -1034,7 +1037,8 @@ class MissLayoutTest(unittest.TestCase):
             total_candidates=1,
         )
         nodes = build_result_forwards(_task(outcome), command="盆地找鸡")[0]
-        self.assertTrue(self._text(nodes[0]).startswith("⚠️ 没搜到"))
+        self.assertTrue(self._text(nodes[0]).startswith("[s-test] "))
+        self.assertIn("⚠️ 没搜到", self._text(nodes[0]))
         self.assertIn("任务编号", self._text(nodes[-1]))
 
 
@@ -2210,3 +2214,41 @@ class WeiboClueLineTest(unittest.TestCase):
         )
         self.assertIn("登录态失效", text)
         self.assertIn("不填 cookie 也能用", text)
+
+
+class ForwardNoticeTest(unittest.TestCase):
+    """转发卡片发出去之后补的那句话。
+
+    卡片会「发成功、服务端有、客户端看不见」（s-20261114-1216-5cf2、
+    s-20261115-2237-0365 两条都是），这句纯文字是最后的兜底：必须带上任务编号，
+    用户才知道回哪一条去捞全部。
+    """
+
+    def test_not_found_says_so_and_carries_task_id(self) -> None:
+        task = _task(SearchOutcome(status="not_found", candidates=[], total_candidates=3))
+        line = forward_notice(task, "盆地找鸡")
+        self.assertIn("s-test", line)
+        self.assertIn("没搜到", line)
+        self.assertIn("盆地找鸡 更多 s-test", line)
+
+    def test_match_mentions_the_name(self) -> None:
+        outcome = SearchOutcome(
+            status="match",
+            best=Candidate(
+                url="https://x.com/someone/status/1",
+                platform="X",
+                name="某人",
+                handle="someone",
+                status="match",
+                distance=3,
+                engine="lens",
+            ),
+        )
+        line = forward_notice(_task(outcome), "麦麦寻人")
+        self.assertIn("找到原帖", line)
+        self.assertIn("某人", line)
+
+    def test_error_status_is_not_called_not_found(self) -> None:
+        line = forward_notice(_task(SearchOutcome(status="error")), "麦麦寻人")
+        self.assertIn("搜索失败", line)
+        self.assertNotIn("没搜到", line)

@@ -229,7 +229,12 @@ def serper_lens_candidates(payload: Any, engine: str = "lens") -> list[Candidate
     return items
 
 
-def host_image_publicly(raw: bytes, proxy: str = "", timeout: float = 40.0) -> str:
+def host_image_publicly(
+    raw: bytes,
+    proxy: str = "",
+    timeout: float = 40.0,
+    note: Callable[[str], None] | None = None,
+) -> str:
     """把图传到 uguu 换一个三小时左右自动失效的直链。
 
     Serper 的 Lens 不收 base64（回 400 ``Missing "url"``），只认公网链接。换不到
@@ -238,25 +243,63 @@ def host_image_publicly(raw: bytes, proxy: str = "", timeout: float = 40.0) -> s
 
     用 uguu 是因为实测 Google 抓得到它：``d.uguu.se`` 的直链喂 Lens 能回 60 条。
     tmpfiles 的 dl 直链则回 0 条，别换回去。
+
+    以前这里把失败原因整个吞掉，日志只剩一句「图床没换成」，事后查不出是超时、
+    拒绝还是回了空——s-20261115-2237-0365 那单就是这样，只能重跑一遍才知道。
+    现在每一步失败都经 ``note`` 写一行。
     """
-    if not raw or len(raw) > SERPER_HOST_LIMIT:
+
+    def _say(message: str, *args: Any) -> None:
+        if note is None:
+            return
+        try:
+            note(message % args if args else message)
+        except Exception:  # noqa: BLE001 - 日志写不出去不能影响检索
+            pass
+
+    if not raw:
+        _say("图床：图为空，跳过")
         return ""
-    session = make_session(proxy)
-    try:
-        resp = session.post(
-            SERPER_HOST_UPLOAD,
-            files={"files[]": ("upload.jpg", raw, "image/jpeg")},
-            timeout=_timeout(timeout),
-        )
-        if resp.status_code != 200:
+    if len(raw) > SERPER_HOST_LIMIT:
+        _say("图床：%sKB 超过 %sKB 上限，跳过", len(raw) // 1024, SERPER_HOST_LIMIT // 1024)
+        return ""
+    # uguu 会整段返回 502（实测直连和代理都一样，是它自己的故障），过一次再试一次
+    # 往往就通了；不值得为它等太久。
+    for attempt in (1, 2):
+        session = make_session(proxy)
+        try:
+            resp = session.post(
+                SERPER_HOST_UPLOAD,
+                files={"files[]": ("upload.jpg", raw, "image/jpeg")},
+                timeout=_timeout(timeout),
+            )
+            if resp.status_code != 200:
+                _say(
+                    "图床 uguu 第%s次回 HTTP %s：%s",
+                    attempt,
+                    resp.status_code,
+                    (resp.text or "（空）")[:120].replace("\n", " "),
+                )
+                if attempt == 1:
+                    time.sleep(2)
+                    continue
+                return ""
+            # output=text 让 uguu 直接回一行纯文本直链，不用解 JSON。
+            text = resp.text.strip()
+            link = text.splitlines()[0].strip() if text else ""
+            if not link.startswith("http"):
+                _say("图床 uguu 没回直链：%s", (text[:120] or "（空响应）").replace("\n", " "))
+                return ""
+            return link
+        except Exception as exc:  # noqa: BLE001 - 图床抽风就当这条路不通
+            _say("图床 uguu 第%s次出错：%s: %s", attempt, type(exc).__name__, str(exc)[:120])
+            if attempt == 1:
+                time.sleep(2)
+                continue
             return ""
-        # output=text 让 uguu 直接回一行纯文本直链，不用解 JSON。
-        link = resp.text.strip().splitlines()[0].strip() if resp.text.strip() else ""
-        return link if link.startswith("http") else ""
-    except Exception:  # noqa: BLE001 - 图床抽风就当这条路不通
-        return ""
-    finally:
-        session.close()
+        finally:
+            session.close()
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -486,7 +529,7 @@ class LensEngine:
         target = pool if pool is not None else self.pool
         link = str(image_url or "").strip()
         if not link.startswith("http"):
-            link = host_image_publicly(raw, self.proxy, self.timeout)
+            link = host_image_publicly(raw, self.proxy, self.timeout, note=self._say)
             if not link:
                 raise EngineError("Serper Lens 需要公网图片链接，图床没换成")
         session = make_session(self.proxy)

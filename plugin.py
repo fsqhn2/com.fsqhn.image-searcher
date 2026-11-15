@@ -7133,6 +7133,15 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 # 连着发多条容易被适配器判成刷屏，隔一秒。
                 await asyncio.sleep(1)
 
+        # 转发卡片会「发成功、服务端有、客户端看不见」（见 formatting.forward_notice
+        # 的注释），补一句纯文字兜底。只在首次结果时补：「更多」是用户主动要的，
+        # 再补一句就成刷屏了。
+        if delivered and not replay:
+            try:
+                await self.ctx.send.text(formatting.forward_notice(task, COMMAND), where)
+            except Exception as error:  # noqa: BLE001 - 兜底失败不影响已经发出的结果
+                self.ctx.logger.warning("结果提示文字发送失败：%s", error)
+
         if delivered == 0:
             self.ctx.logger.warning("合并转发全部失败，退回文字消息：%s", last_error or "被拒绝")
             text = formatting.build_text_summary(

@@ -1663,7 +1663,11 @@ def build_miss_nodes(
     它们各自做了什么。
     """
     outcome = task.outcome or SearchOutcome(status="error")
-    nodes: list[dict] = [_node([{"type": "text", "content": _miss_headline(outcome)}], nickname, user_id)]
+    # 同一张图重搜时两次的首行可能一字不差，QQ 会按首行判成重复内容：消息体留在
+    # 服务端，客户端却整条不渲染（s-20261115-2237-0365 的 22:20 与 22:43 两次，
+    # 电脑端和手机端都看不见）。前面挂上任务编号，保证每张卡片的开头都不一样。
+    headline = f"[{task.task_id}] {_miss_headline(outcome)}"
+    nodes: list[dict] = [_node([{"type": "text", "content": headline}], nickname, user_id)]
     shown: set[str] = set()
     shown_urls: dict[str, str] = {}
 
@@ -1878,6 +1882,37 @@ def stale_image_hint(stale_seconds: int) -> str:
         f"当前会话最近一张图是约 {minutes} 分钟前发的，超出 3 分钟的自动取图窗口，所以没取到。"
         "这不是图片服务故障，不要反复重试。那条消息在上下文里有 msg_id，"
         "把它作为 image_search 的 msg_id 参数再调一次即可；也可以请用户引用那张图。"
+    )
+
+
+def _notice_word(outcome: SearchOutcome) -> str:
+    """一句话说清这次是什么结论，给转发后的那句文字兜底用。"""
+    best = outcome.best
+    if best is not None and best.status == "match":
+        name = (best.name or "").strip()
+        return f"找到原帖{f'（{name}）' if name else ''}"
+    if (outcome.vision or {}).get("picked_images"):
+        return "视觉复核挑了疑似，不是同一张图"
+    if best is not None:
+        return "有线索，但不是同一张图"
+    if outcome.status == "not_found":
+        return "没搜到"
+    if outcome.status == "error":
+        return "搜索失败"
+    return "结果已出"
+
+
+def forward_notice(task: SearchTask, command: str = "麦麦寻人") -> str:
+    """合并转发发出去之后补的一句话。
+
+    转发卡片会「发成功、服务端有、客户端看不见」：s-20261114-1216-5cf2 与
+    s-20261115-2237-0365 两条都是这样，手机端和电脑端都不渲染。卡片该发还发，
+    但后面补一句纯文字，至少让人知道搜完了、结论是什么、怎么捞全部。
+    """
+    outcome = task.outcome or SearchOutcome(status="error")
+    return (
+        f"🔍 结果已发（{task.task_id}）：{_notice_word(outcome)}"
+        f"｜回「{command} 更多 {task.task_id}」看全部"
     )
 
 
