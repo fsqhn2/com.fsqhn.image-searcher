@@ -429,7 +429,7 @@ def match_score(handle: str, texts: list[str]) -> int:
 # 约稿平台和电商页的标题里出现用户名，说明的是「页面主人」而不是被搜的这张图
 # 的作者。实测 skeb.jp/@murabitoufu/works/69 这条候选把 @murabitoufu（22 万粉）
 # 顶成了「疑似同一个人」，而那页只是别人接稿/委托的页面，跟图毫无关系。
-BLOCKED_SOURCES = (
+OWNER_SOURCES = (
     "skeb.jp",
     "joom.com",
     "aliexpress",
@@ -438,11 +438,75 @@ BLOCKED_SOURCES = (
     "ebay.",
 )
 
+# reddit 的标题是「求图/约炮」这类整句话（「Control my account choose my pfp」），
+# 自由抽词抽出来的都是 choose、looking 这种普通词。实测 s-20261118-1838-b495
+# 抽出了 @Choose（6683 粉）和 onlyfans.com/looking + leakgallery.com/looking，
+# 三条跟这张图半点关系没有。这类帖只当搬运页看，不拿来推作者。
+BLOCKED_SOURCES = (*OWNER_SOURCES, "reddit.com", "redd.it")
+
+# reddit 这种「别人在说话」的站点可以走署名这条路：正经转载常把原作者原样抄在
+# 标题里（「Vivian cosplay by KURU」「[source] @xxx」），那是整条标题里唯一指向
+# 本人的部分，一刀切屏蔽会把它一起丢掉。署名本身仍要过指纹核对才算数。
+SIGNATURE_SOURCES = ("reddit.com", "redd.it")
+
 
 def is_blocked_source(source: str) -> bool:
-    """这类站点的标题不能拿来推作者。"""
+    """这类站点的标题不能拿来自由抽词推作者。"""
     host = (source or "").strip().lower()
     return any(token in host for token in BLOCKED_SOURCES)
+
+
+def is_signature_blocked(source: str) -> bool:
+    """这类站点的标题连「署名」都不能认。
+
+    只有页面主人型的站点如此：skeb 的接稿页、电商页标题里的 @号是店主或接稿人。
+    reddit 反过来——它只是别人在转发，署名反而是唯一能通向本人的线索。
+    """
+    host = (source or "").strip().lower()
+    if any(token in host for token in SIGNATURE_SOURCES):
+        return False
+    return any(token in host for token in OWNER_SOURCES)
+
+
+def is_signature_only(source: str) -> bool:
+    """这个站点的署名只能当「找号的入口」：翻不到这张图就什么都不提。
+
+    reddit 的署名能指对人，但那页毕竟是别人转的，只看名字分不清是原作者还是
+    帖子里提到的别人。翻她自己帖子里有没有这张图，有才是结论。
+    """
+    host = (source or "").strip().lower()
+    return any(token in host for token in SIGNATURE_SOURCES)
+
+
+# 标题里直接贴原帖链接的情况（「[Source] https://x.com/kuru_xox/status/123」）：
+# 这比「cosplay by KURU」更明确，链接本身就指着那个号。搬运帖常这么写，而正文
+# 我们抓不到（reddit 页面直接返回 403），所以标题里出现的链接得认出来。
+_LINK_X = re.compile(
+    r"(?:https?://)?(?:www\.|mobile\.)?(?:x\.com|twitter\.com)/([A-Za-z0-9_]{2,20})",
+    re.I,
+)
+# 这些不是账号，是链接里的功能段。
+_LINK_X_SKIP = {
+    "i", "intent", "share", "home", "search", "hashtag", "explore", "settings",
+    "login", "signup", "tos", "privacy", "about", "download",
+}
+
+
+def link_handles(texts: list[str], limit: int = 3) -> list[str]:
+    """标题里贴着的 X／推特链接指向的账号，按出现顺序去重。"""
+    seen: set[str] = set()
+    found: list[str] = []
+    for text in texts:
+        for match in _LINK_X.finditer(text or ""):
+            handle = match.group(1)
+            low = handle.lower()
+            if low in _LINK_X_SKIP or low in seen:
+                continue
+            seen.add(low)
+            found.append(handle)
+            if len(found) >= max(1, limit):
+                return found
+    return found
 
 
 def shares_anchor(handle: str, texts: list[str]) -> bool:

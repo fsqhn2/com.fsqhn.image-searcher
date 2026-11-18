@@ -7,6 +7,7 @@ SerpAPI 和 twimg 在国内直连不通，需要走本地代理；引擎与图�
 from __future__ import annotations
 
 import ipaddress
+import re
 import socket
 import time
 from typing import Any
@@ -254,3 +255,35 @@ def json_or_raise(resp: requests.Response, engine: str) -> dict[str, Any]:
 def is_auth_failure(status_code: int) -> bool:
     """这些状态码说明 key 有问题或额度用完，应当冷却换 key。"""
     return status_code in (401, 402, 403, 429)
+
+
+_META_CHARSET = re.compile(rb"<meta[^>]+charset=[\"']?([\w-]+)", re.I)
+_HEADER_CHARSET = re.compile(r"charset=([\w-]+)", re.I)
+
+
+def decode_body(raw: bytes, content_type: str = "") -> str:
+    """把网页字节解成文字：先认响应头，再认页面里写的 charset。
+
+    ``requests`` 在响应头没声明字符集时按 RFC 把 ``text/html`` 当 latin-1，
+    新浪这类只靠 ``<meta charset>`` 的页面就会被解成 ``Cosæ­£ç`` 这种乱码，
+    拿这串去搜等于白搜（s-20261118-1647-b0a3 的新浪转载页就是这么废的）。
+    所以这里自己定顺序：响应头 → 页面 meta → utf-8 → gb18030。
+    """
+    if not raw:
+        return ""
+    header = _HEADER_CHARSET.search(content_type or "")
+    meta = _META_CHARSET.search(raw[:4096])
+    candidates = [
+        header.group(1) if header else "",
+        meta.group(1).decode("ascii", "ignore") if meta else "",
+        "utf-8",
+        "gb18030",
+    ]
+    for encoding in candidates:
+        if not encoding:
+            continue
+        try:
+            return raw.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", errors="replace")

@@ -229,5 +229,75 @@ class PickTeaserTest(unittest.TestCase):
         self.assertFalse(picked["same_period"])
 
 
+class PaywallUrlTest(unittest.TestCase):
+    """结论本身就落在付费页帖子上时，从链接反推作者与帖子。"""
+
+    def test_reads_patreon_post_url(self) -> None:
+        target = paywall.paywall_url(
+            "https://www.patreon.com/chizucheese/posts/michinoku-komaro-173372197"
+        )
+        self.assertEqual(
+            target,
+            {"platform": "patreon", "name": "chizucheese", "post_id": "173372197"},
+        )
+
+    def test_reads_c_prefixed_url_with_slash(self) -> None:
+        target = paywall.paywall_url(
+            "https://www.patreon.com/c/oioioi525/posts/rossi-108p-171677785/"
+        )
+        self.assertEqual(target["name"], "oioioi525")
+        self.assertEqual(target["post_id"], "171677785")
+
+    def test_reads_fanbox_post_url(self) -> None:
+        target = paywall.paywall_url("https://ran3.fanbox.cc/posts/7325110")
+        self.assertEqual(target, {"platform": "fanbox", "name": "ran3", "post_id": "7325110"})
+        other = paywall.paywall_url("https://www.fanbox.cc/@ran3/posts/7325110")
+        self.assertEqual(other["name"], "ran3")
+
+    def test_ignores_pages_that_are_not_posts(self) -> None:
+        """作者主页、X 帖子都不是付费页帖子，不能拿去反推。"""
+        self.assertIsNone(paywall.paywall_url("https://www.patreon.com/chizucheese"))
+        self.assertIsNone(paywall.paywall_url("https://x.com/ChizuCheese8/status/1794991614"))
+        self.assertIsNone(paywall.paywall_url(""))
+
+    def test_post_id_of_url(self) -> None:
+        self.assertEqual(
+            paywall.post_id_of("https://www.patreon.com/a/posts/x-173372197"), "173372197"
+        )
+        self.assertEqual(paywall.post_id_of("https://ran3.fanbox.cc/posts/7325110"), "7325110")
+        self.assertEqual(paywall.post_id_of("https://ran3.fanbox.cc/"), "")
+
+    def test_handle_of_social_url(self) -> None:
+        """campaign 里挂的 X 号要能认出来，功能页不算账号。"""
+        self.assertEqual(paywall.handle_of("https://twitter.com/ChizuCheese8"), "ChizuCheese8")
+        self.assertEqual(paywall.handle_of("https://x.com/ChizuCheese8"), "ChizuCheese8")
+        self.assertEqual(paywall.handle_of("https://x.com/intent/follow"), "")
+        self.assertEqual(paywall.handle_of(""), "")
+
+    def test_social_url(self) -> None:
+        payload = {
+            "data": {
+                "attributes": {"twitter": {"url": "https://twitter.com/ChizuCheese8", "user_id": "1"}}
+            }
+        }
+        self.assertEqual(paywall.social_url(payload), "https://twitter.com/ChizuCheese8")
+        self.assertEqual(paywall.social_url({"data": {"attributes": {"twitter": None}}}), "")
+        self.assertEqual(paywall.social_url(None), "")
+
+    def test_social_url_from_social_connections(self) -> None:
+        """真实 campaign 把 X 号放在 attributes.social_connections 下面。"""
+        payload = {
+            "data": {
+                "attributes": {
+                    "social_connections": {
+                        "twitter": {"url": "https://twitter.com/ChizuCheese8", "user_id": "9797698"}
+                    }
+                }
+            }
+        }
+        self.assertEqual(paywall.social_url(payload), "https://twitter.com/ChizuCheese8")
+        self.assertEqual(paywall.handle_of(paywall.social_url(payload)), "ChizuCheese8")
+
+
 if __name__ == "__main__":
     unittest.main()

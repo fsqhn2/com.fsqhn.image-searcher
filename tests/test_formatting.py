@@ -1448,7 +1448,7 @@ class DowngradedByKindTest(unittest.TestCase):
         self.assertNotIn("👤 名字：弟弟中考换亲姐", text)
         self.assertIn("搬运页命中", text)
         self.assertIn("https://www.gamersky.com/ent/202601/13451846.shtml", text)
-        self.assertIn("仅能找到其他网站的转发，并未能找到原始出处", text)
+        self.assertIn("只找到别的网站的转发，没能找到原始出处", text)
 
     def test_request_post_is_not_a_conclusion(self) -> None:
         """0.7.93 把求图帖降成 suspect，文案这边也得跟着走「未找到」。"""
@@ -1871,6 +1871,13 @@ class PaywallTest(unittest.TestCase):
         text = formatting._best_block(outcome)
         self.assertIn("免费预览", text)
         self.assertNotIn("🔒", text)
+
+    def test_x_profile_line_when_known(self) -> None:
+        """结论落在付费页、没有 X 账号时，campaign 里挂的 X 就是唯一能落到人身上的信息。"""
+        outcome = self._paid_case()
+        outcome.paywall["x_url"] = "https://twitter.com/ChizuCheese8"
+        text = formatting._best_block(outcome)
+        self.assertIn("🐦 她的 X：https://twitter.com/ChizuCheese8", text)
 
     def test_free_only_tier_line_is_dropped(self) -> None:
         """只有 Free 档时「档位：Free（免费）」等于没说。"""

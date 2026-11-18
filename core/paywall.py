@@ -99,6 +99,96 @@ def links_of(*texts: str) -> dict[str, str]:
     return found
 
 
+# 付费页帖子链接：``patreon.com/<作者>/posts/<slug>-<id>``、
+# ``<作者>.fanbox.cc/posts/<id>``。有的单子结论本身就落在这种页面上，这时没有
+# X 账号可反查，只能从链接本身把作者与帖子认回来。
+_PATREON_POST = re.compile(
+    r"patreon\.com/(?:c/)?([A-Za-z0-9_-]{2,40})/posts/(?:[^/?#]*?-)?(\d{4,})", re.I
+)
+_PATREON_BARE_POST = re.compile(r"patreon\.com/posts/(?:\d+-)?(\d{4,})", re.I)
+_FANBOX_POST = re.compile(
+    r"(?:([A-Za-z0-9_-]{2,40})\.fanbox\.cc/posts/(\d{3,})"
+    r"|fanbox\.cc/(?:@)?([A-Za-z0-9_-]{2,40})/posts/(\d{3,}))",
+    re.I,
+)
+
+
+def paywall_url(url: str) -> dict[str, str] | None:
+    """从一条 Patreon／FANBOX 帖子链接里认出平台、作者名与帖子 id。
+
+    图搜引擎常常只给到「这一页有这张图」，页面本身就是作者的售卖帖，链接里
+    已经带着作者名和帖子 id（``chizucheese`` + ``173372197``）。有这两个就能
+    直接换到 campaign 与那一期，不必先猜出她的 X 账号。
+    """
+    text = str(url or "").strip()
+    if not text:
+        return None
+    hit = _PATREON_POST.search(text)
+    if hit:
+        name = hit.group(1).strip("/ ")
+        if name.lower() not in _NOT_VANITY:
+            return {"platform": "patreon", "name": name, "post_id": hit.group(2)}
+    hit = _PATREON_BARE_POST.search(text)
+    if hit:
+        return {"platform": "patreon", "name": "", "post_id": hit.group(1)}
+    hit = _FANBOX_POST.search(text)
+    if hit:
+        return {
+            "platform": "fanbox",
+            "name": (hit.group(1) or hit.group(3) or "").strip("/ "),
+            "post_id": hit.group(2) or hit.group(4) or "",
+        }
+    return None
+
+
+_TRAILING_ID = re.compile(r"(\d{3,})/?$")
+_X_HANDLE = re.compile(r"(?:twitter\.com|x\.com)/([A-Za-z0-9_]{2,15})", re.I)
+# 这些是 X 站内功能页，不是账号。
+_NOT_HANDLE = {"intent", "share", "home", "search", "hashtag", "i", "login", "signup"}
+
+
+def post_id_of(url: str) -> str:
+    """取链接末尾的帖子 id（``…-173372197`` / ``/posts/173372197``）。"""
+    hit = _TRAILING_ID.search(str(url or "").strip())
+    return hit.group(1) if hit else ""
+
+
+def handle_of(url: str) -> str:
+    """从 X 链接里取账号名；不是账号链接就返回空串。"""
+    hit = _X_HANDLE.search(str(url or ""))
+    if not hit:
+        return ""
+    name = hit.group(1)
+    return "" if name.lower() in _NOT_HANDLE else name
+
+
+def social_url(payload: dict | None, name: str = "twitter") -> str:
+    """读作者挂的社交链接（``twitter``／``discord``…）。
+
+    Patreon 把她挂的 X 号写在用户对象的 ``attributes.social_connections`` 里，
+    通常在帖子接口的 ``included`` 段带回来；campaign 详情偶尔也有。所以两处都看。
+    """
+    sources: list[dict] = []
+    data_attrs = ((payload or {}).get("data") or {}).get("attributes")
+    if isinstance(data_attrs, dict):
+        sources.append(data_attrs)
+    for item in (payload or {}).get("included") or []:
+        attrs = item.get("attributes") if isinstance(item, dict) else None
+        if isinstance(attrs, dict):
+            sources.append(attrs)
+    for attrs in sources:
+        node = attrs.get(name)
+        if node is None:
+            node = (attrs.get("social_connections") or {}).get(name)
+        if isinstance(node, dict):
+            url = str(node.get("url") or "").strip()
+        else:
+            url = str(node or "").strip()
+        if url:
+            return url
+    return ""
+
+
 def keywords(*texts: str) -> list[str]:
     """从帖子正文、候选标题里抽能对上作品名的词（罗马音 + 中日文名）。
 

@@ -35,10 +35,41 @@
 | s-20261113-2025（群 780957479） | 用户：「为啥这个群的搜图一直没结果」 | 群里只看到「正在搜图」就没有下文。20:25:35 开搜，20:25:51 四引擎回来 49 条候选，20:27:52 插件被卸载、20:28:05 重载——卸载原因是 file_watcher 发现 `plugins/com.fsqhn.torrent-analyze/plugin.py` 被改，`reason=host_stop` 把整个 Runner 重启了（当天 20:12 后这么重启 7 次，触发文件全是别的插件） | `_start_task()` 登记在跑的单 → `on_unload()` 写 `image_searcher_interrupted.json`（只留 2 小时内的）→ 重载 5 秒后 `_notify_interrupted()` 往原会话回一句「上一单被插件重启打断了，麻烦再发一次」，发完删文件；只提示不续搜 | 0.9.8 |
 | s-20261113-2147-2f31 | 用户：「这个的结果展示好乱」 | 指纹距离 0 命中 `https://x.com/ranrankanu/status/2116861599533477933`，但结果里：① 名字成「甘雨ランのお家 () / X」（标题抽走账号后剩空括号和后缀）；② 标题单独占一个只有「🔍 盆地找鸡结果」的空节点；③「跟这张图对上的那条」在两个号上各出现一次；④ 水印那行「可能读错」出现两遍（note 自带一句 + 渲染再补一句括号） | ① `extract._X_PAGE_SUFFIX_RE` 清空括号／` / X` 后缀；② 标题并进结论节点（3 节点 → 2 节点）；③ `_hunt_same_person()` 增 `exact`，只给 `status == "match"` 的号标那句话；④ note 只写事实，渲染侧在 note 已含「读错」时不再补括号 | 0.9.9 / 0.9.10 |
 | s-20261112-1511-7496 | 追查模式跑了，但没落到作者身上 | 候选1 距离 3（几乎同一张），从中读出「水印」`@kufu_xox`，X 上 404；插件记 `状态=unknown` 就放过了，没拿标题署名 `KURU` 去纠这一个字母。随后按名字搜 X 拿到 `@helicopterfood`（11.8 万粉）／`@kuruupdates`／`@kuru8k`，三个号翻带图帖全不中；再翻 `@miya1st`、`@_ray_wing_` 也不中。真号是 `@kuru_xox`（クル / KURU，6859 粉，显示名带日文），没进候选 | 水印号查无此号时用署名纠一个字母（`signature_fix`，等长差 1 才改），改出来的号排在最前面先试；按名字搜 X 时 handle 含这个名字的优先、候选放宽到 8 个 | 0.8.7 |
+| s-20261118-1646-0bb7 | 用户：都找到 `patreon.com/chizucheese/posts/michinoku-komaro-173372197` 了，怎么不走付费页反查 | `best` 就是这个 Patreon 帖子页、`handle` 是空串，而付费页那一步要求「`best.handle` 有值，或 Grok 抓到过一条 X 帖」，于是 `_track_paywall()` 一次都没跑，卡片按「没找到出处」发出去。可这个 URL 本身够用：`/api/posts/173372197` 读到标题与发布时间（2026-10-25，非订阅者看不了），vanity `chizucheese` 换到 campaign `12710702` 与 Free／US$1／10／20／30／40／60 六档 | `paywall.paywall_url()` 从 best 地址反查平台与 post id，`_track_paywall_direct()` 串 `_patreon_post_track()`／`_fanbox_post_track()`，不再依赖 handle；单帖接口的 `included` 里有 `attributes.social_connections`，顺手把作者 X 号补进结果（`🐦 她的 X：https://twitter.com/ChizuCheese8`） | 0.9.20 |
+| s-20261118-1647-b0a3 | 用户：「这单更是不知道找了啥」 | lens 0 / yandex 93 / baidu 30 / saucenao 7，去重 47 条；视觉 15 条 0 命中；微博反查的两条检索词是 `Cosæ­£ç7`、`æ¯ Is this a boy?_`——转载页没写 charset，requests 按 ISO-8859-1 解出来的，每条只回 3 条无关帖，这条线等于白跑；与此同时没结论的卡片还贴了三张不相干的 coser 图 | ① `core/httpclient.decode_body()` 按「响应头 → meta → utf-8 → gb18030」解码，`_fetch_page_html()` 不再用 `response.text`；② 无结论时的配图口径按用户纠正保持「每个引擎距离最近 1 张 + 视觉挑的那张」（中途误改成「不贴图」，已完全回滚） | 0.9.20 |
+| s-20261118-1838-b495 | 用户：「展示太凌乱，其实是找到了，reddit 的一个贴，帖子里完全没提图哪来的」 | status=ok、best 是 reddit 帖（距离 0、`suspect`、`downgrade=repost`）、68 条候选、103.9 秒。卡片已经写了「未找到可靠出处」+ 搬运页提示，但多出两段毫无关系的线索：`@Choose`（6683 粉）与 OnlyFans「Looking」——都是 `_hunt_x_handle()`／`_hunt_paid()` 从 reddit 整句标题里逐词抽出来的（源句「Control my account choose my pfp」「looking for anyone to sext」） | ① reddit 不再参与自由抽词（`handles.BLOCKED_SOURCES`），但保留显式署名与标题里贴着的 `x.com/<号>` 链接，走 `_hunt_signature_author()` 并用指纹核对，翻不到这张图就什么都不写；②「未找到可靠出处」与「仅能找到其他网站的转发」两句合成一行 | 0.9.20 |
 
 ---
 
 ## 逐单记录
+
+### s-20261118-1838-b495
+
+- **用户给的**：这段的展示感觉需要优化，太凌乱了；其实是找到了，但那是 reddit 的一个贴，帖子内完全没提图哪来的，只是随手配了几张图。
+- **日志事实**：`status=ok`、`best` 是 `reddit.com/r/jerkbudsHentai/comments/1wzhqoz/...`（距离 0、`status=suspect`、`downgrade=repost`）、68 条候选、103.9 秒。卡片本身没错（「⚠️ 未找到可靠出处」+「搬运页命中：这页上确实有这张图，但那是转载」+ 链接），多出来的是两段：`🐦 疑似同一个人的 X：@Choose`（6683 粉）与 `💳 疑似同一个人的 OnlyFans：Looking`（`onlyfans.com/looking` + `leakgallery.com/looking`）。
+- **根因**：这两段由 `_hunt_x_handle()`／`_hunt_paid()` 产生，两者都从候选标题里逐词抽名字。reddit 的标题是正常人说的话（「Control my account choose my pfp」「looking for anyone to sext or feed me」），抽出来就是 `choose`、`looking` 这种普通词；碰巧 X 上有 `@Choose` 这个真号、泄露站上也真有 `/looking` 收录页，于是两条都「验证通过」。
+- **修复**：`core/handles.py` 分三档——`is_blocked_source()` 拦自由抽词（reddit、skeb、电商页）；`is_signature_blocked()` 只拦页面主人型站点（skeb／joom／aliexpress／amazon／eBay／market.yandex，标题里的号是店主或接稿人）；`is_signature_only()` 标 reddit 这类「署名只能当找号入口」的站点。`_hunt_signature_author()` 现在收 reddit 行，除了 `by XXX`／`credit:`／`推特xxx` 还认标题里贴着的 `x.com/<号>`（新增 `handles.link_handles()`），抽出来一律翻那个号自己的带图帖比指纹，翻不到就不写（连「疑似」也不留）。顺手把「未找到可靠出处」和「仅能找到其他网站的转发」两句合成一行。
+- **验证**：服务器 788 项测试通过（新增 9 项）、23:08 热重载 18 插件 0 失败；同一单的 summary 重拼卡片，`x_guess`／`paid` 清空后那两段完全消失，只剩一行「未找到可靠出处：只找到别的网站的转发，没能找到原始出处。」。实测 reddit 正文抓不到（页面 403 `blocked by network security`，`.json`／`old.reddit`／`api.reddit.com`／`.rss` 都不通，镜像要过 Anubis 的 PoW），只有 `oembed` 回 200 且只给标题与发帖人，所以正文里的原链这条路没做。
+
+---
+
+### s-20261118-1647-b0a3
+
+- **用户给的**：这单更是不知道找了啥。
+- **日志事实**：lens 0 / yandex 93 / baidu 30 / saucenao 7，去重 47 条；视觉复核 15 条 0 命中；微博反查的检索词是 `Cosæ­£ç7` 与 `æ¯ Is this a boy?_`，各回 3 条无关帖；卡片上还挂着三张不相干的 coser 图。
+- **根因**：转载页没写 charset，`requests` 的 `response.text` 按 ISO-8859-1 解，中文全变成乱码，拿去做站内检索自然是空结果。乱码不影响指纹，所以卡片的其它部分是准的——只是「什么都没找到」这件事本来还能再推一步。
+- **修复**：`core/httpclient.py` 新增 `decode_body()`，顺序是「响应头 → 页面 meta → utf-8 → gb18030」，`plugin._fetch_page_html()` 改用它。
+- **边界**：无结论时的配图口径**不是**「不贴图」——中途按错误理解把疑似缩略图收起来了，被用户纠正（「无结论时每个引擎展示距离最近 1 张 + 视觉模型挑出来的那张」）后已完全回滚。
+
+---
+
+### s-20261118-1646-0bb7
+
+- **用户给的**：这单都找到 `https://www.patreon.com/chizucheese/posts/michinoku-komaro-173372197` 了，不走这个界面反查么，还是反查找错了？
+- **日志事实**：没查错，是根本没跑。付费页那一步的前置条件是 `best.handle` 有值、或者 Grok 抓到过一条 X 帖；这单的 `best` 就是 Patreon 帖子页本身，`handle` 是空串，于是 `_track_paywall()` 直接跳过。
+- **根因**：把「作者账号」当成了必经之路，而售卖页的 URL 本身就带 campaign 与 post id。
+- **修复**：`paywall.paywall_url()`／`post_id_of()` 从地址反推平台与帖子 id，`_track_paywall_direct()` 分派到 `_patreon_post_track()`／`_fanbox_post_track()`；单帖接口 `included` 里的 `attributes.social_connections` 还能取回作者 X 号，结果里多一行 `🐦 她的 X`。只在 `best.status == "match"` 且地址能解析出帖子 id 时触发。
+- **验证**：拿这单真实地址跑，输出售卖页、`🐦 她的 X：https://twitter.com/ChizuCheese8`、档位 Free／US$1／10／20 与免费预览。
 
 ### s-20261112-0858-c44f
 

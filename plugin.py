@@ -68,7 +68,13 @@ from .core.extract import (
 from .core.gallery import is_gallery_site, is_repost_site, parse_source_accounts
 from .core import weibopost
 from .core.hashing import dhash, hamming, prepare_upload
-from .core.httpclient import HttpError, download_image_multi, fake_ip_networks, make_session
+from .core.httpclient import (
+    HttpError,
+    decode_body,
+    download_image_multi,
+    fake_ip_networks,
+    make_session,
+)
 from .core.keypool import KeyPool
 from .core.maibot_compat import unwrap_capability
 from .core.tasks import SearchOutcome, SearchTask, TaskStore
@@ -2478,6 +2484,23 @@ class ImageSearcherPlugin(MaiBotPlugin):
                     )
                 except Exception as error:  # noqa: BLE001 - 付费页查不到不影响结论
                     self.ctx.logger.warning("付费页追踪失败：%s", error)
+                    paywall_info = None
+            elif (
+                best is not None
+                and best.status == "match"
+                and (direct := paywall.paywall_url(best.url or ""))
+            ):
+                # 结论本身就是 Patreon／FANBOX 帖子时没有 X 账号可查（图搜给的是售卖
+                # 页），但链接里就带着作者名与帖子 id，直接按链接反推这一期。
+                texts = [best.title or ""]
+                texts.append(str((grok_info or {}).get("reason") or ""))
+                texts.extend(str(item.title or "") for item in ordered[:8])
+                try:
+                    paywall_info = await asyncio.wait_for(
+                        self._track_paywall_direct(best.url or "", texts, direct), timeout=40
+                    )
+                except Exception as error:  # noqa: BLE001 - 付费页查不到不影响结论
+                    self.ctx.logger.warning("付费页直查失败：%s", error)
                     paywall_info = None
 
         self._vlog(
@@ -5557,7 +5580,11 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 )
                 if response.status_code != 200:
                     return ""
-                return response.text[:400000]
+                # 不能直接用 response.text：响应头没声明 charset 时 requests 按
+                # latin-1 解，中文标题会变成 ``Cosæ­£ç``，拿这串当搜索词等于白搜。
+                return decode_body(
+                    response.content, response.headers.get("Content-Type", "")
+                )[:400000]
             finally:
                 session.close()
 
@@ -6086,6 +6113,8 @@ class ImageSearcherPlugin(MaiBotPlugin):
         准，也比盲改字母省事。
 
         找到号还不够：必须那个号自己的带图帖里真有这张图才算数，翻不到就当没有。
+        reddit 这类搬运页也走这条路——它的标题是别人在说话，不能拿来自由抽词，但
+        署名声明确实常写在那儿；翻不到那张图就什么都不提，不留「疑似」。
         """
         if not upload:
             return None
@@ -6095,7 +6124,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 for item in ordered[:12]
                 if (item.title or item.name)
                 and item.status != "mismatch"
-                and not handles.is_blocked_source(item.source)
+                # 这里只排页面主人型站点（skeb 的接稿页、电商页），reddit 这类
+                # 搬运页反而要留着：正经转载常把原作者署名抄在标题里。
+                and not handles.is_signature_blocked(item.source)
             ),
             key=self._x_hunt_priority,
         )
@@ -6103,6 +6134,13 @@ class ImageSearcherPlugin(MaiBotPlugin):
             return None
         texts = [self._name_text(item) for item in rows]
         names = handles.signature_names(texts, limit=self._SIGNATURE_NAME_LIMIT)
+        # 标题里直接贴了原帖链接的，比「cosplay by KURU」还明确：链接指着谁就是谁，
+        # 不用再猜名字。正文抓不到（reddit 403），标题里的链接是唯一能拿到的那份。
+        linked = handles.link_handles(texts, limit=self._SIGNATURE_SEARCH_LIMIT)
+        if linked:
+            self._vlog("标题里的原帖链接：%s", "、".join("@" + item for item in linked))
+            known = {name.lower() for name in names}
+            names = [*names, *(item for item in linked if item.lower() not in known)]
         if not names:
             return None
         self._vlog("标题署名：%s", "、".join(names))
@@ -6192,11 +6230,30 @@ class ImageSearcherPlugin(MaiBotPlugin):
                         if source is not None
                         else "",
                     }
-                seen_note = str(holder.get("watermark_note") or "")
+                matched_rows = [
+                    item for item in rows if name.lower() in self._name_text(item).lower()
+                ]
+                # 同一名字可能既出现在 reddit 标题里、也出现在图集站标题里：只要后者
+                # 在，就按后者算来源，别因为 reddit 那条把整条线索丢掉。
                 source = next(
-                    (item for item in rows if name.lower() in self._name_text(item).lower()),
+                    (
+                        item
+                        for item in matched_rows
+                        if not handles.is_signature_only(item.source)
+                    ),
                     None,
                 )
+                # reddit 这类搬运页的署名只当「找号的入口」：她自己帖子里没有这张图，
+                # 就什么都不提。否则又变成「给个名字让你自己去猜」——那正是这单里
+                # @Choose、OnlyFans「Looking」两条噪声的来路。
+                if matched_rows and source is None:
+                    self._vlog(
+                        "署名 %s 只出现在 %s，自己的帖子里没有这张图，不当线索",
+                        name,
+                        matched_rows[0].source or "搬运页",
+                    )
+                    continue
+                seen_note = str(holder.get("watermark_note") or "")
                 seen_info = {
                     "status": "seen",
                     "name": name,
@@ -6672,6 +6729,141 @@ class ImageSearcherPlugin(MaiBotPlugin):
             if preview is not None and preview.get("url") != post.get("url"):
                 info["preview"] = {"title": preview.get("title"), "url": preview.get("url")}
         return info
+
+    async def _track_paywall_direct(
+        self, url: str, texts: list[str], target: dict[str, str]
+    ) -> dict[str, Any] | None:
+        """结论本身就是付费页帖子时，按这条链接反推「卖在哪、多少钱」。
+
+        图搜命中的页面常常就是作者的售卖帖：链接里带着作者名与帖子 id，页面
+        本身却不告诉你她的 X 号。所以这里不猜账号，直接拿链接换 campaign
+        （档位、作者挂的 X 号）与那一期，再按作品名找免费预览。
+        """
+        platform = str(target.get("platform") or "")
+        name = str(target.get("name") or "")
+        post_id = str(target.get("post_id") or "")
+        if not post_id:
+            return None
+        words = paywall.keywords(*texts)
+        try:
+            if platform == "patreon":
+                found = await self._patreon_post_track(name, post_id)
+            else:
+                found = await self._fanbox_post_track(name, post_id)
+        except Exception as error:  # noqa: BLE001 - 付费页查不到不影响结论
+            self._vlog("付费页直查失败：%s %s", platform, str(error)[:80])
+            return None
+        if not found:
+            return None
+        handle = str(found.pop("handle", "") or "")
+        if handle and found.get("post"):
+            try:
+                teaser = await self._hunt_teaser(handle, words, found["post"], exclude=url)
+            except Exception as error:  # noqa: BLE001 - 翻不到预告不影响售卖页
+                self._vlog("免费预告查找失败：%s", str(error)[:80])
+                teaser = None
+            if teaser:
+                found["teaser"] = teaser
+        self._vlog(
+            "付费页命中（直查）：%s %s → %s",
+            platform,
+            name,
+            str((found.get("post") or {}).get("url") or found.get("shop") or "")[:80],
+        )
+        return found
+
+    async def _patreon_post_track(self, vanity: str, post_id: str) -> dict[str, Any] | None:
+        """Patreon：作者名换 campaign，按帖子 id 取这一期（顺带档位与作者 X 号）。"""
+        if not vanity:
+            return None
+        base = "https://www.patreon.com/api"
+        listing = await self._fetch_json(f"{base}/campaigns?filter[vanity]={vanity}")
+        items = (listing or {}).get("data") or []
+        campaign_id = str((items[0] or {}).get("id") or "") if items else ""
+        if not campaign_id:
+            return None
+        # 单帖接口一次就带回这一期的标题、锁没锁、档位，以及 included 里作者的
+        # social_connections（X 号就在那儿），比先读 campaign 再列帖更省一步。
+        single = await self._fetch_json(f"{base}/posts/{post_id}")
+        found = paywall.patreon_posts({"data": [(single or {}).get("data") or {}]})
+        post = found[0] if found else None
+        tiers = paywall.patreon_rewards(single)
+        if not tiers:
+            # 单帖没带档位时（旧帖或接口变动）退回 campaign 详情。
+            tiers = paywall.patreon_rewards(
+                await self._fetch_json(f"{base}/campaigns/{campaign_id}?include=rewards")
+            )
+        posts = paywall.patreon_posts(
+            await self._fetch_json(
+                f"{base}/posts?filter[campaign_id]={campaign_id}&page[count]=20&sort=-published_at"
+            )
+        )
+        if post is None:
+            post = next(
+                (item for item in posts if paywall.post_id_of(item.get("url") or "") == post_id),
+                None,
+            )
+        currency = next((tier["currency"] for tier in tiers if tier.get("currency")), "")
+        if post is not None and not post.get("currency"):
+            post["currency"] = currency
+        x_url = paywall.social_url(single)
+        info: dict[str, Any] = {
+            "platform": "patreon",
+            "shop": f"https://www.patreon.com/{vanity}",
+            "post": post,
+            "tiers": tiers,
+            "preview": None,
+            "x_url": x_url,
+            "handle": paywall.handle_of(x_url),
+        }
+        if post is not None:
+            preview = paywall.free_post(posts, paywall.keywords(post.get("title") or ""))
+            if preview is not None and preview.get("url") != post.get("url"):
+                info["preview"] = {"title": preview.get("title"), "url": preview.get("url")}
+        if post is None and not tiers:
+            return None
+        return info
+
+    async def _fanbox_post_track(self, creator: str, post_id: str) -> dict[str, Any] | None:
+        """FANBOX：作者名列公开帖，按帖子 id 认这一期，档位另取。"""
+        if not creator:
+            return None
+        headers = {
+            "Origin": "https://www.fanbox.cc",
+            "Referer": f"https://{creator}.fanbox.cc/",
+        }
+        posts = paywall.fanbox_posts(
+            await self._fetch_json(
+                f"https://api.fanbox.cc/post.listCreator?creatorId={creator}&limit=20",
+                headers=headers,
+            ),
+            creator,
+        )
+        post = next(
+            (item for item in posts if paywall.post_id_of(item.get("url") or "") == post_id),
+            None,
+        )
+        if post is None:
+            single = await self._fetch_json(
+                f"https://api.fanbox.cc/post.info?postId={post_id}", headers=headers
+            )
+            body = (single or {}).get("body") or {}
+            found = paywall.fanbox_posts({"body": {"posts": [body]}}, creator) if body else []
+            post = found[0] if found else None
+        tiers = paywall.fanbox_plans(
+            await self._fetch_json(
+                f"https://api.fanbox.cc/plan.listCreator?creatorId={creator}", headers=headers
+            )
+        )
+        if post is None and not tiers:
+            return None
+        return {
+            "platform": "fanbox",
+            "shop": f"https://{creator}.fanbox.cc",
+            "post": post,
+            "tiers": tiers,
+            "preview": None,
+        }
 
     async def _hunt_teaser(
         self, handle: str, words: list[str], paid_post: dict, exclude: str = ""

@@ -154,10 +154,59 @@ class BlockedSourceTest(unittest.TestCase):
         self.assertTrue(handles.is_blocked_source("joom.com"))
         self.assertTrue(handles.is_blocked_source("aliexpress.ru"))
 
+    def test_reddit_blocked_for_guessing(self) -> None:
+        """reddit 标题是整句话，自由抽词只会抽出 choose、looking 这种词。"""
+        self.assertTrue(handles.is_blocked_source("reddit.com"))
+        self.assertTrue(handles.is_blocked_source("www.reddit.com"))
+        self.assertTrue(handles.is_blocked_source("redd.it"))
+
     def test_normal_site_kept(self) -> None:
         self.assertFalse(handles.is_blocked_source("galleryepic.com"))
         self.assertFalse(handles.is_blocked_source("masterfap.net"))
         self.assertFalse(handles.is_blocked_source(""))
+
+
+class SignatureSourceTest(unittest.TestCase):
+    """reddit 这类搬运页能认署名，页面主人型站点连署名都不认。"""
+
+    def test_owner_site_blocks_signature(self) -> None:
+        self.assertTrue(handles.is_signature_blocked("skeb.jp"))
+        self.assertTrue(handles.is_signature_blocked("www.amazon.co.jp"))
+
+    def test_reddit_allows_signature(self) -> None:
+        self.assertFalse(handles.is_signature_blocked("reddit.com"))
+        self.assertFalse(handles.is_signature_blocked("www.reddit.com"))
+
+    def test_reddit_signature_is_only_a_lead(self) -> None:
+        """署名只能拿来找号：翻不到这张图就不提。"""
+        self.assertTrue(handles.is_signature_only("reddit.com"))
+        self.assertFalse(handles.is_signature_only("galleryepic.com"))
+        self.assertFalse(handles.is_signature_only("skeb.jp"))
+
+    def test_reddit_signature_still_recognised(self) -> None:
+        """「cosplay by KURU」写在 reddit 标题里照样要能认出来。"""
+        names = handles.signature_names(["Vivian cosplay by KURU"])
+        self.assertIn("KURU", names)
+
+
+class LinkHandleTest(unittest.TestCase):
+    """标题里直接贴原帖链接时，链接指向的账号就是署名。"""
+
+    def test_twitter_and_x_links(self) -> None:
+        texts = ["[Source] https://twitter.com/kuru_xox/status/123", "via x.com/fox_9"]
+        found = [item.lower() for item in handles.link_handles(texts)]
+        self.assertEqual(found, ["kuru_xox", "fox_9"])
+
+    def test_skips_function_segments(self) -> None:
+        texts = ["https://x.com/intent/follow?screen_name=x", "https://x.com/i/status/1"]
+        self.assertEqual(handles.link_handles(texts), [])
+
+    def test_dedupes_and_limits(self) -> None:
+        texts = ["https://x.com/aaa_1", "https://twitter.com/AAA_1", "https://x.com/bbb_2"]
+        self.assertEqual(handles.link_handles(texts), ["aaa_1", "bbb_2"])
+
+    def test_no_link(self) -> None:
+        self.assertEqual(handles.link_handles(["Vivian cosplay by KURU"]), [])
 
 
 class TypoVariantTest(unittest.TestCase):

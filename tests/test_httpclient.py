@@ -21,6 +21,26 @@ from core.httpclient import (
 )
 
 
+class DecodeBodyTest(unittest.TestCase):
+    """网页字符集：响应头没声明时别把 UTF-8 页面按 latin-1 解成乱码。"""
+
+    def test_header_charset_wins(self) -> None:
+        raw = "中文".encode("gb18030")
+        self.assertEqual(httpclient.decode_body(raw, "text/html; charset=gb18030"), "中文")
+
+    def test_meta_charset_when_header_is_bare(self) -> None:
+        raw = b'<meta charset="gbk"><p>Cos\xd5\xfd\xc6\xac</p>'
+        self.assertIn("Cos正片", httpclient.decode_body(raw, "text/html"))
+
+    def test_utf8_page_without_any_declaration(self) -> None:
+        """新浪这类页面只在正文里写中文、不带 charset，按 utf-8 解才不是 Cosæ­£ç。"""
+        raw = "<title>Cos正片——战舰少女R：埃塞克斯</title>".encode("utf-8")
+        self.assertIn("战舰少女R：埃塞克斯", httpclient.decode_body(raw, "text/html"))
+
+    def test_empty(self) -> None:
+        self.assertEqual(httpclient.decode_body(b""), "")
+
+
 class PublicUrlTest(unittest.TestCase):
     def test_loopback_and_private_are_rejected(self) -> None:
         for url in (

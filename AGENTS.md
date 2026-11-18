@@ -18,7 +18,7 @@ core/engines.py        Lens / Yandex / 百度 / SauceNAO 适配 + detect_ai + ve
 core/hashing.py        dHash 指纹 + prepare_upload（压到 480KB）
 core/formatting.py     合并转发节点、路线行、重放文案
 core/extract.py        平台识别、账号页判定与归一、账号去重
-core/handles.py        从候选标题里认疑似 X 账号名（纯函数，不碰网络）
+core/handles.py        从候选标题里认疑似 X 账号名（纯函数，不碰网络）；三档来源判定：自由抽词 / 只认署名 / 连署名都不认
 core/identity.py       微博 UID 换昵称、昵称找 X 号（解析与检索；cookie/检索要网络）
 core/weibopost.py      转载页回微博原帖：帖子卡片与配图解析（纯函数，不碰网络）
 core/gallery.py        图集站 / 搬运站页面标的来源账号（纯函数，不碰网络）
@@ -169,6 +169,7 @@ flowchart TD
 | 百度 `image_src` 是 `w=889&h=500` 裁剪图 | 真实匹配常落「疑似」（距离 10~14），不要为此放宽 `hash_threshold` |
 | 部分 CDN 直接封服务器 IP（`cdn.donmai.us` 403、`lookaside.instagram.com` 返回非图片） | 只能标「未验证」放参考区 |
 | Sightengine 单次 `genai` 计 5 ops | 只在低置信分支调用 |
+| reddit 只回 JS 挑战页，解完挑战也回 403 `You've been blocked by network security`；`.json`、`old.reddit.com`、`api.reddit.com`、`.rss` 全不通（404／429／403），第三方镜像（redlib、safereddit）要过 Anubis 的 PoW | 正文和评论都读不到，`oembed` 是唯一通的接口（200，给标题 + 发帖人）。从 reddit 拿线索只能靠标题：显式署名和标题里贴着的 `x.com/<号>` 链接，其余一律不猜 |
 
 ## 疑难案例台账
 
@@ -275,13 +276,19 @@ SSRF 防护在 `core/httpclient.is_public_url()`：非公网 http(s) 一律拒�
 
 60. **图床是一条链，顺序固定为 uguu、ChatGLM、CliIm，前一家失败自动换下一家**：Serper 的 Lens 只收公网链接，`host_image_publicly()` 按 `[hosting]` 里开着的顺序依次试，关掉的那家直接跳过、全关就返回空串（上层报「图床没换成」，不要拿假链接去搜）。三家的直链 2026-11-16 都用一张 Unsplash 照片实测过：`d.uguu.se`、`t1.chatglm.cn`（带签名、有时效）、`oss-cn-hangzhou.aliyuncs.com`（CliIm，http 也抓得到），喂 Lens 各回 60 条。**四条边界**：① tmpfiles 的 dl 直链回 organic=0，telegra.ph 400、file.io 回网页，这三条别再换回去；② 每一步失败都要经 `note` 写一行（HTTP 码、异常类型、空响应），别用 except 吞掉，s-20261115-2237-0365 就是只剩一句「图床没换成」查不出原因的；③ uguu 自己会整段 502，所以它单独留了「隔 2 秒再试一次」；④ ChatGLM 接口按浏览器 UA 才收，requests 默认 UA 会被挡。
 
+61. **reddit 的标题是整句话，不能拿来自由抽词；但署名和贴着的链接必须认**：`s-20261118-1838-b495` 里 `_hunt_x_handle()`／`_hunt_paid()` 从 reddit 的两句求约炮标题里抽出 `@Choose`（6683 粉）和 `onlyfans.com/looking`＋`leakgallery.com/looking`，三条全跟图无关，卡片上就多了两段莫名其妙的线索。但一刀切屏蔽会连正经转载一起丢掉——搬运帖常把原作者写在标题里（`Vivian cosplay by KURU`、`credit: xxx`、`推特xxx`、或直接贴 `x.com/<号>`）。所以 `core/handles.py` 分三档：`is_blocked_source()` 拦自由抽词（reddit、skeb、电商页都拦）、`is_signature_blocked()` 只拦「连署名都不认」的页面主人型站点（skeb／joom／aliExpress／amazon／eBay／market.yandex，那上面写的是店主或接稿人）、`is_signature_only()` 标「署名只能当找号入口」的站点（reddit）。reddit 的署名走 `_hunt_signature_author()`，抽出来（含 `link_handles()` 从标题里取的 `x.com/<号>`）一律要翻她自己帖子里有没有这张图，翻不到**什么都不写**，不留「疑似」；同一名字同时出现在别的好站点标题里时按好站点算来源。**三条边界**：① 别把 reddit 加回自由抽词，`choose`／`looking` 这种词会立刻回来；② 别让它直接进「疑似同一个人的 X」那行——那条只核账号存在和粉丝数，噪声照进；③ 正文里的原链接拿不到，别再试（见「平台事实」里 reddit 那一行）。
+
+62. **网页解码不要用 `response.text`**：`s-20261118-1647-b0a3` 的转载页没写 charset，requests 按 ISO-8859-1 解出 `Cosæ­£ç7`、`æ¯ Is this a boy?_`，拿这两句去搜微博只回 3 条无关帖，整条反查白跑。现在 `core/httpclient.py` 的 `decode_body()` 按「响应头 → 页面 meta → utf-8 → gb18030」顺序解，`plugin._fetch_page_html()` 改用它。**边界**：`gb18030` 是最后兜底，不要把前面的 utf-8 去掉——国内站点九成是 utf-8，先猜 gb18030 会把正常页面解坏。
+
+63. **付费页反查不能等 handle，best 本身就是售卖页时按 URL 直连**：`s-20261118-1646-0bb7` 的 `best` 就是 `patreon.com/chizucheese/posts/...`，`handle` 是空串，老逻辑要求 `best.handle` 或 Grok 给过帖子才跑，于是整步跳过。现在 `paywall_url()` 从 best 地址反推平台与 post id（`/api/posts/<id>` 能读标题、发布时间、是否锁定；vanity 换 campaign 拿档位），单帖接口的 `included` 里还有 `attributes.social_connections`，顺手把作者的 X 号补回结果（`🐦 她的 X`）。**边界**：只在 `best.status == "match"` 且地址能解析出帖子 id 时触发，别拿猜错的候选去配售卖页。
+
 ## 测试
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-目前 766 项。新增引擎适配、改阈值、改指纹逻辑、改缓存或账号归一规则时补用例。改动 `_verify` / `_rank` / 取图链路后，用真实图跑一次端到端，确认「匹配、最佳匹配、带图」三步都不缺。
+目前 788 项。新增引擎适配、改阈值、改指纹逻辑、改缓存或账号归一规则时补用例。改动 `_verify` / `_rank` / 取图链路后，用真实图跑一次端到端，确认「匹配、最佳匹配、带图」三步都不缺。
 
 改完 `plugin.py` 必须重载验证：日志里应出现 `麦麦寻人已加载：… 上限=…` 与 `vX.Y.Z 加载成功`，且无 traceback。改源码会重启插件进程，内存里的任务表会重建。
 

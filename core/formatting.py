@@ -382,6 +382,9 @@ def _paywall_lines(outcome: SearchOutcome) -> list[str]:
         lines.append(f"🔗 {post['url']}")
     elif shop:
         lines.append(f"🛒 她的 {label}：{shop}（最近二十期里没对上这一期）")
+    x_url = str(info.get("x_url") or "").strip()
+    if x_url:
+        lines.append(f"🐦 她的 X：{x_url}")
     tiers = info.get("tiers") or []
     # 只有 Free 档时「档位：Free（免费）」等于没说，不如省一行。
     if any(not tier.get("free") for tier in tiers):
@@ -945,11 +948,15 @@ def _best_block_core(outcome: SearchOutcome, *, skip_grok: bool = False, detail:
             for item in outcome.candidates
             if item.status == "suspect" and is_avatar_hit(item)
         ]
-        lines = ["⚠️ 未找到可靠出处"]
         # 落点是别的网站转载时，得把「只能找到转发」这件事说明白：单写一句「未找到
-        # 可靠出处」，群里会以为连链接都没有（s-20261112-1244-7c22）。
-        if any(downgrade_kind(item) == "repost" for item in outcome.candidates):
-            lines.append("仅能找到其他网站的转发，并未能找到原始出处。")
+        # 可靠出处」，群里会以为连链接都没有（s-20261112-1244-7c22）。两句说的是同一件
+        # 事，合成一行，别在群里摆两行重复的话。
+        reposted = any(downgrade_kind(item) == "repost" for item in outcome.candidates)
+        lines = [
+            "⚠️ 未找到可靠出处：只找到别的网站的转发，没能找到原始出处。"
+            if reposted
+            else "⚠️ 未找到可靠出处"
+        ]
         if compared and nearest is not None:
             if nearest.status == "suspect":
                 # 距离够近但被降级（转发页、头像这类）：不能说「均未通过阈值」，
