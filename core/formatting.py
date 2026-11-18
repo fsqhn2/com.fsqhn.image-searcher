@@ -293,6 +293,35 @@ def _x_guess_lines(outcome: SearchOutcome) -> list[str]:
     return lines
 
 
+def _role_hint_lines(outcome: SearchOutcome) -> list[str]:
+    """图搜图没结论时按角色找到的同角色账号：只给名字，不当结论。
+
+    s-20261118-1414-e965 就是这么漏的：图搜引擎一条都没收（小号、没水印），
+    但角色认得出，按「角色名 + コスプレ」一搜，人就在里面。所以这条要摆出来，
+    同时说明白它只是线索——角色对得上不等于人是同一个。
+    """
+    info = outcome.role_hint or {}
+    roles = [str(item).strip() for item in (info.get("roles") or []) if str(item).strip()]
+    accounts = info.get("accounts") or []
+    if not roles and not accounts:
+        return []
+    lines: list[str] = []
+    if roles:
+        lines.append(f"🎭 角色：{'、'.join(roles[:2])}")
+    people: list[str] = []
+    for item in accounts[:5]:
+        if not isinstance(item, dict):
+            continue
+        handle = str(item.get("handle") or "").strip().lstrip("@")
+        if not handle:
+            continue
+        fans = int(item.get("fans") or 0)
+        people.append(f"@{handle}（粉丝 {_fans_text(fans)}）" if fans else f"@{handle}")
+    if people:
+        lines.append("👥 同角色账号（只是线索，没核过图）：" + " ".join(people))
+    return lines
+
+
 def _weibo_lines(outcome: SearchOutcome) -> list[str]:
     """微博站内反查的结果：搜到了谁，或者搜过但只有路人号。
 
@@ -589,6 +618,7 @@ def _best_block(outcome: SearchOutcome, *, skip_grok: bool = False, detail: bool
     extra.extend(_same_person_lines(outcome))
     extra.extend(_x_guess_lines(outcome))
     extra.extend(_weibo_lines(outcome))
+    extra.extend(_role_hint_lines(outcome))
     extra.extend(_paid_lines(outcome))
     if extra:
         text = "\n".join([text, *extra])
@@ -1885,37 +1915,6 @@ def stale_image_hint(stale_seconds: int) -> str:
     )
 
 
-def _notice_word(outcome: SearchOutcome) -> str:
-    """一句话说清这次是什么结论，给转发后的那句文字兜底用。"""
-    best = outcome.best
-    if best is not None and best.status == "match":
-        name = (best.name or "").strip()
-        return f"找到原帖{f'（{name}）' if name else ''}"
-    if (outcome.vision or {}).get("picked_images"):
-        return "视觉复核挑了疑似，不是同一张图"
-    if best is not None:
-        return "有线索，但不是同一张图"
-    if outcome.status == "not_found":
-        return "没搜到"
-    if outcome.status == "error":
-        return "搜索失败"
-    return "结果已出"
-
-
-def forward_notice(task: SearchTask, command: str = "麦麦寻人") -> str:
-    """合并转发发出去之后补的一句话。
-
-    转发卡片会「发成功、服务端有、客户端看不见」：s-20261114-1216-5cf2 与
-    s-20261115-2237-0365 两条都是这样，手机端和电脑端都不渲染。卡片该发还发，
-    但后面补一句纯文字，至少让人知道搜完了、结论是什么、怎么捞全部。
-    """
-    outcome = task.outcome or SearchOutcome(status="error")
-    return (
-        f"🔍 结果已发（{task.task_id}）：{_notice_word(outcome)}"
-        f"｜回「{command} 更多 {task.task_id}」看全部"
-    )
-
-
 def build_text_summary(
     task: SearchTask,
     *,
@@ -1951,3 +1950,55 @@ def build_text_summary(
     # 首次回复只给最终结果，群里看着干净。
     lines.append(f"（搜索路线、耗时与全部 {outcome.total_candidates} 条候选见「{command} 更多」）")
     return "\n".join(lines)
+
+
+# 首次回复最多带几张图：原图一张、最像的候选一张就够了，再多就是刷屏，
+# 全部候选统一留给「更多」。
+FIRST_REPLY_IMAGES = 3
+
+
+def _first_reply_images(outcome: SearchOutcome, limit: int = FIRST_REPLY_IMAGES) -> list[str]:
+    """挑首次回复要带的关键图，最多 limit 张。
+
+    顺序按说服力排：原图（确认搜的是哪张）→ 最佳匹配的配图（确认对不对）
+    → Grok 给的那张。没命中时再补候选图，方便自己肉眼核对。
+    """
+    picked: list[str] = []
+
+    def add(value: str) -> None:
+        if value and value not in picked and len(picked) < limit:
+            picked.append(value)
+
+    add(outcome.image_b64)
+    if outcome.best is not None:
+        add(candidate_image(outcome, outcome.best))
+    add(outcome.grok_image_b64)
+    if len(picked) < limit and outcome.status != "ok":
+        for _engine, items in engine_groups(outcome, outcome.best, limit):
+            for item in items:
+                add(candidate_image(outcome, item))
+                if len(picked) >= limit:
+                    break
+            if len(picked) >= limit:
+                break
+    return picked
+
+
+def build_first_reply(
+    task: SearchTask,
+    *,
+    command: str,
+    ttl_minutes: int = 15,
+    max_images: int = FIRST_REPLY_IMAGES,
+) -> tuple[str, list[str]]:
+    """首次回复的内容：一段文字结论 + 最多 max_images 张关键图。
+
+    不再走合并转发：卡片偶发拿不到新的 real_seq，客户端会整条不画（服务端仍存着），
+    而插件既预知不了也补救不了（重发拿到的还是同一个 seq）。改成普通图文消息后一定
+    看得见，代价是群里多占一行。匹配路线、AI 检测、全部候选仍然留在「更多」里。
+    """
+    outcome = task.outcome or SearchOutcome(status="error")
+    lines = [f"{_header_text(outcome, command, False)}\n{_best_block(outcome)}"]
+    lines.append("")
+    lines.extend(_footer_lines(outcome, command, ttl_minutes, False, task.task_id))
+    return "\n".join(lines), _first_reply_images(outcome, max_images)

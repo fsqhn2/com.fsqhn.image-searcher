@@ -716,6 +716,114 @@ class LensTimeoutBudgetTest(unittest.TestCase):
         self.assertLessEqual(left, TIMEOUT_COOLDOWN + 1)
 
 
+class LensUploadQuotaTest(unittest.TestCase):
+    """上传接口回 429 是「key 额度用完」，不是「图没传上去」。
+
+    s-20261116-2147-a881：3 把 SerpAPI key 死了 2 把，上传接口回的是
+    HTTP 429 + {"error": "Your account has run out of searches."}。旧代码把它
+    静默当成上传失败，死 key 一直留在轮询里，三分之二的单 lens 都是 0，日志上却只
+    写「图片上传失败」，事后根本分不清是额度用完还是图不行。
+    """
+
+    def _resp(self, status=200, payload=None, text=""):
+        resp = mock.MagicMock()
+        resp.status_code = status
+        resp.text = text
+        resp.json.return_value = payload if payload is not None else {}
+        return resp
+
+    def _session(self, uploads, search=None):
+        session = mock.MagicMock()
+        session.post.side_effect = list(uploads)
+        if search is not None:
+            session.get.return_value = search
+        return session
+
+    def test_quota_dead_key_is_marked_exhausted(self) -> None:
+        from core.keypool import KeyPool
+
+        pool = KeyPool(["dead"])
+        session = self._session([self._resp(429, text='{"error": "Your account has run out of searches."}')])
+        with mock.patch("core.engines.make_session", return_value=session):
+            with self.assertRaises(EngineError) as ctx:
+                LensEngine(pool, retries=0)._search_once(b"img")
+        self.assertIn("额度", str(ctx.exception))
+        self.assertTrue(pool.is_exhausted("dead"))
+
+    def test_search_moves_to_next_key_after_quota_dead(self) -> None:
+        from core.keypool import KeyPool
+
+        pool = KeyPool(["dead", "good"])
+        search = self._resp(
+            payload={"visual_matches": [{"link": "https://x.com/a/status/1", "title": "t"}]}
+        )
+        sessions = [
+            self._session([self._resp(429, text='{"error": "Your account has run out of searches."}')]),
+            self._session([self._resp(payload={"image_id": "id1"})], search),
+        ]
+        with mock.patch("core.engines.make_session", side_effect=sessions):
+            with mock.patch("core.engines.time.sleep"):
+                items = LensEngine(pool, retries=2, retry_delay=0).search(b"img")
+        self.assertEqual(len(items), 1)
+        self.assertTrue(pool.is_exhausted("dead"))
+        self.assertEqual(pool.available_count(), 1)
+
+    def test_auth_failure_cools_the_key_without_burning_it(self) -> None:
+        from core.keypool import KeyPool
+
+        pool = KeyPool(["bad"])
+        session = self._session([self._resp(401, text="unauthorized")])
+        with mock.patch("core.engines.make_session", return_value=session):
+            with self.assertRaises(EngineError):
+                LensEngine(pool, retries=0)._search_once(b"img")
+        self.assertFalse(pool.is_exhausted("bad"))
+        self.assertGreater(pool.cooldown_remaining("bad"), 0)
+
+    def test_plain_bad_gateway_still_treated_as_upload_failure(self) -> None:
+        """500/502 是图没传上去，key 还留着，回退按链接搜索。"""
+        from core.keypool import KeyPool
+
+        pool = KeyPool(["k"])
+        session = self._session([self._resp(502, text="bad gateway")])
+        with mock.patch("core.engines.make_session", return_value=session):
+            with self.assertRaises(EngineError) as ctx:
+                LensEngine(pool, retries=0)._search_once(b"img")
+        self.assertIn("图片上传失败", str(ctx.exception))
+        self.assertFalse(pool.is_exhausted("k"))
+
+    def test_quota_deadline_comes_from_the_account_api(self) -> None:
+        """屏蔽到哪天要问账号接口：这两把 key 的重置日是 11-22，不是月初。"""
+        from core import keystate
+        from core.keypool import KeyPool
+
+        pool = KeyPool(["dead"])
+        session = self._session(
+            [self._resp(429, text='{"error": "Your account has run out of searches."}')]
+        )
+        session.get.return_value = self._resp(payload={"plan_renewal_date": "2026-11-22"})
+        with mock.patch("core.engines.make_session", return_value=session):
+            with self.assertRaises(EngineError):
+                LensEngine(pool, retries=0)._search_once(b"img")
+        until = pool.snapshot()[keystate.key_id("dead")]
+        self.assertEqual(until, keystate.renewal_deadline("2026-11-22"))
+
+    def test_quota_deadline_falls_back_to_month_end(self) -> None:
+        """问不到重置日才按自然月兜底。"""
+        from core import keystate
+        from core.keypool import KeyPool
+
+        pool = KeyPool(["dead"])
+        session = self._session(
+            [self._resp(429, text='{"error": "Your account has run out of searches."}')]
+        )
+        session.get.side_effect = TimeoutError("account api down")
+        with mock.patch("core.engines.make_session", return_value=session):
+            with self.assertRaises(EngineError):
+                LensEngine(pool, retries=0)._search_once(b"img")
+        until = pool.snapshot()[keystate.key_id("dead")]
+        self.assertAlmostEqual(until, keystate.month_end(), delta=120)
+
+
 class SauceNaoRouteTest(unittest.TestCase):
     """代理偶发 TLS 握手失败时换直连再试，别因为一次握手丢掉整条。"""
 
@@ -799,7 +907,7 @@ class HostImageTest(unittest.TestCase):
         notes: list[str] = []
         with mock.patch("core.engines.make_session", return_value=self._session()):
             with mock.patch("core.engines.time.sleep"):
-                link = host_image_publicly(b"x" * 64, note=notes.append)
+                link = host_image_publicly(b"x" * 64, note=notes.append, hosting=("uguu",))
         self.assertEqual(link, "")
         self.assertEqual(len(notes), 2, notes)
         self.assertTrue(all("HTTP 502" in item for item in notes), notes)
@@ -821,13 +929,87 @@ class HostImageTest(unittest.TestCase):
         notes: list[str] = []
         with mock.patch("core.engines.make_session", side_effect=[bad, good]):
             with mock.patch("core.engines.time.sleep"):
-                link = host_image_publicly(b"x" * 64, note=notes.append)
+                link = host_image_publicly(b"x" * 64, note=notes.append, hosting=("uguu",))
         self.assertEqual(link, "https://d.uguu.se/abc.jpg")
         self.assertEqual(len(notes), 1, notes)
 
     def test_empty_body_is_reported(self) -> None:
         notes: list[str] = []
         with mock.patch("core.engines.make_session", return_value=self._session(status=200, text="")):
-            link = host_image_publicly(b"x" * 64, note=notes.append)
+            link = host_image_publicly(b"x" * 64, note=notes.append, hosting=("uguu",))
+        self.assertEqual(link, "")
+        self.assertTrue(any("没回直链" in item for item in notes), notes)
+
+
+class HostingChainTest(unittest.TestCase):
+    """图床链：uguu → ChatGLM → CliIm，前一家失败就换下一家。
+
+    2026-11-16 实测三家的直链 Google Lens 都抓得到（各回 60 条），所以留了三个，
+    哪家抽风都还有下一家顶着。
+    """
+
+    def _resp(self, status=200, payload=None, text=""):
+        resp = mock.MagicMock()
+        resp.status_code = status
+        resp.text = text
+        resp.json.return_value = payload if payload is not None else {}
+        return resp
+
+    def _session(self, *responses):
+        session = mock.MagicMock()
+        session.post.side_effect = list(responses)
+        return session
+
+    def test_falls_back_to_chatglm_when_uguu_fails(self) -> None:
+        notes: list[str] = []
+        uguu = self._session(self._resp(status=502, text="bad gateway"))
+        chatglm = self._session(
+            self._resp(payload={"result": {"file_url": "https://t1.chatglm.cn/file/a.jpg?sign=x"}})
+        )
+        with mock.patch("core.engines.make_session", side_effect=[uguu, uguu, chatglm]):
+            with mock.patch("core.engines.time.sleep"):
+                link = host_image_publicly(b"x" * 64, note=notes.append)
+        self.assertEqual(link, "https://t1.chatglm.cn/file/a.jpg?sign=x")
+        self.assertTrue(any("换下一家" in item for item in notes), notes)
+        self.assertTrue(any("chatglm" in item.lower() for item in notes), notes)
+
+    def test_falls_back_to_cliim_when_both_above_fail(self) -> None:
+        uguu = self._session(self._resp(status=502, text="bad gateway"))
+        chatglm = self._session(self._resp(status=500, text="boom"))
+        cliim = self._session(
+            self._resp(
+                payload={"status": "1", "data": {"path": "http://oss-cn-hangzhou.aliyuncs.com/a.jpg"}}
+            )
+        )
+        with mock.patch("core.engines.make_session", side_effect=[uguu, uguu, chatglm, cliim]):
+            with mock.patch("core.engines.time.sleep"):
+                link = host_image_publicly(b"x" * 64)
+        self.assertEqual(link, "http://oss-cn-hangzhou.aliyuncs.com/a.jpg")
+
+    def test_cliim_bare_path_gets_https_prefix(self) -> None:
+        cliim = self._session(self._resp(payload={"data": {"path": "oss.example.com/a.jpg"}}))
+        with mock.patch("core.engines.make_session", return_value=cliim):
+            link = host_image_publicly(b"x" * 64, hosting=("cliim",))
+        self.assertEqual(link, "https://oss.example.com/a.jpg")
+
+    def test_disabled_hosts_are_not_touched(self) -> None:
+        """配置里只开 cliim 时，uguu 一次都不能碰。"""
+        cliim = self._session(self._resp(payload={"data": {"path": "http://oss.cn/a.jpg"}}))
+        with mock.patch("core.engines.make_session", return_value=cliim) as made:
+            link = host_image_publicly(b"x" * 64, hosting=("cliim",))
+        self.assertEqual(link, "http://oss.cn/a.jpg")
+        self.assertEqual(made.call_count, 1)
+
+    def test_no_host_enabled_returns_empty(self) -> None:
+        notes: list[str] = []
+        self.assertEqual(host_image_publicly(b"x" * 64, note=notes.append, hosting=()), "")
+        self.assertTrue(any("一家都没开" in item for item in notes), notes)
+
+    def test_chatglm_without_url_is_not_used(self) -> None:
+        """回了 JSON 但没有 file_url，就不能拿空串当链接继续往下走。"""
+        notes: list[str] = []
+        chatglm = self._session(self._resp(payload={"message": "success", "result": {}}))
+        with mock.patch("core.engines.make_session", return_value=chatglm):
+            link = host_image_publicly(b"x" * 64, note=notes.append, hosting=("chatglm",))
         self.assertEqual(link, "")
         self.assertTrue(any("没回直链" in item for item in notes), notes)

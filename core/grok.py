@@ -478,3 +478,181 @@ def dumps(result: GrokResult) -> str:
         },
         ensure_ascii=False,
     )
+
+
+# ---------------------------------------------------------------------------
+# 角色线索：图搜图走不通时，改按「这是哪个角色」去找同角色的 coser
+# ---------------------------------------------------------------------------
+
+ROLE_PROMPT = """这张图是某位 coser 的作品，用图搜图找不到原帖，改按角色去找人。
+
+请做两件事，必须真的用 x_search 检索，不要凭记忆回答。
+
+第一步，认角色：看服装、发型、道具、场景，判断这是哪个作品里的哪个角色。认不出就写「角色：无」，别猜。
+
+第二步，按角色名在 X 站内找发过同一角色 cos 的账号。日文圈和中文圈都找，粉丝很少的小号也要——这类图往往就是小号发的。
+检索时至少把这几种组合都试一遍：角色名 + コスプレ、角色名 + cosplay、角色中文名。
+最多列 8 个账号，一个一行。每个账号必须是你真的在检索结果里见过的，不许编。
+
+输出格式（严格照这个写）：
+角色：<作品名>｜<角色名>（认不出就写 角色：无）
+账号：@handle | 粉丝数 | <帖子链接，没有就写 无>
+账号：@handle2 | 粉丝数 | <帖子链接或 无>
+检索词：<用过的关键词，逗号分隔>
+依据：<不超过 40 字>
+
+这一步只负责给线索，不需要判断谁一定发过这张图。宁可多列几个同角色的账号，也不要因为「不确定是不是本人」一个都不写。
+"""
+
+# 候选标题里本来就写着角色名（「死芒 Necrass」「遐蝶 Castorice」这种），
+# 白扔掉等于让模型裸看图猜——实测裸猜会认成别的角色，后面整串账号全歪。
+ROLE_HINT_BLOCK = """下面是搜索引擎返回的候选（账号 | 平台 | 标题）。里面出现的角色名可以参考，但必须自己看图确认，别照抄：
+{hints}
+
+"""
+
+_ROLE_FIELD_LINE = re.compile(r"角色\s*[:：]\s*(.+)")
+_ACCOUNT_LINE = re.compile(r"账号\s*[:：]\s*(.+)")
+
+
+@dataclass
+class RoleHint:
+    """一次「按角色找人」的结果：认出的角色 + 同角色账号线索。"""
+
+    roles: list[str] = field(default_factory=list)
+    accounts: list[dict] = field(default_factory=list)
+    text: str = ""
+    tools: list[str] = field(default_factory=list)
+    model: str = ""
+    reason: str = ""
+    keywords: list[str] = field(default_factory=list)
+    error: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.roles or self.accounts)
+
+
+def build_role_payload(
+    model: str,
+    image_data_url: str,
+    *,
+    hints: list[str] | None = None,
+    max_output_tokens: int = 1800,
+) -> dict:
+    """按角色找人的请求体：同样是 /responses + x_search，只是换了提示词。
+
+    ``hints`` 是候选标题（账号 | 平台 | 标题）。模型裸看图认角色会错，把候选里
+    已经出现过的角色名摆给它，判断稳得多。
+    """
+    prompt = ROLE_PROMPT
+    if hints:
+        blocks = ROLE_HINT_BLOCK.format(hints="\n".join(hints[:8]))
+        prompt = blocks + ROLE_PROMPT
+    return {
+        "model": model,
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {"type": "input_image", "image_url": image_data_url},
+                ],
+            }
+        ],
+        "tools": [{"type": "x_search"}],
+        "max_output_tokens": max_output_tokens,
+    }
+
+
+def parse_fans(text: str) -> int:
+    """把「1757」「1.7K」「3.2万」「?」这类粉丝数写法换成整数，认不出算 0。"""
+    raw = str(text or "").strip().replace(",", "").replace("，", "").replace("粉丝", "")
+    if not raw or raw in {"?", "？", "-", "无", "N/A"}:
+        return 0
+    match = re.search(r"([\d.]+)\s*([kKmM万]?)", raw)
+    if not match:
+        return 0
+    try:
+        value = float(match.group(1))
+    except ValueError:
+        return 0
+    unit = match.group(2)
+    if unit.lower() == "k":
+        value *= 1000
+    elif unit.lower() == "m":
+        value *= 1_000_000
+    elif unit == "万":
+        value *= 10_000
+    return int(value)
+
+
+def parse_role_output(body: dict, *, model: str = "") -> RoleHint:
+    """解析「角色 + 账号清单」的输出。
+
+    只认结构化字段：``角色：`` 一行给角色，``账号：`` 每行一个账号。正文里
+    裸写的 @名字一律不收，模型复述「我搜了谁、没找到」时会带一堆无关名字。
+    """
+    hint = RoleHint(model=str(body.get("model") or model or ""))
+    text, urls, tools = collect_text_and_urls(body)
+    hint.text = text
+    hint.tools = tools
+    if not text and not urls:
+        hint.error = "返回空内容"
+        return hint
+
+    hint.reason = reason_of(text)
+    posts = find_posts(text, urls)
+    post_by_handle = {handle.lower(): url for handle, url in posts if handle}
+
+    seen: set[str] = set()
+    for line in text.splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        role_match = _ROLE_FIELD_LINE.match(raw)
+        if role_match and not hint.roles:
+            value = role_match.group(1).strip()
+            if value and value[:1] not in {"无", "沒", "没"} and value.lower() not in {"none", "n/a"}:
+                hint.roles.append(value[:60])
+            continue
+        if raw.startswith("检索词"):
+            value = raw.split("：", 1)[-1].split(":", 1)[-1]
+            hint.keywords = [part.strip() for part in re.split(r"[,，、]", value) if part.strip()]
+            continue
+        account_match = _ACCOUNT_LINE.match(raw)
+        if not account_match:
+            continue
+        parts = [part.strip() for part in account_match.group(1).split("|")]
+        handle = parts[0].lstrip("@").strip()
+        if not handle or handle.lower() in RESERVED or handle.lower() in seen:
+            continue
+        seen.add(handle.lower())
+        fans = parse_fans(parts[1]) if len(parts) > 1 else 0
+        post = ""
+        for part in parts[1:]:
+            if part.startswith("http"):
+                post = part
+                break
+        if not post:
+            post = post_by_handle.get(handle.lower(), "")
+        hint.accounts.append({"handle": handle, "fans": fans, "post": post})
+        if len(hint.accounts) >= 8:
+            break
+    return hint
+
+
+def dumps_role(hint: RoleHint) -> str:
+    """日志用：这一轮按角色找人得到了什么。"""
+    return json.dumps(
+        {
+            "roles": hint.roles,
+            "accounts": [item.get("handle") for item in hint.accounts],
+            "keywords": hint.keywords,
+            "tools": hint.tools,
+            "model": hint.model,
+            "reason": hint.reason,
+            "error": hint.error,
+        },
+        ensure_ascii=False,
+    )

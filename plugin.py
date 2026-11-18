@@ -240,14 +240,57 @@ class SerperConfig(PluginConfigBase):
     upload: bool = Field(
         default=True,
         description=(
-            "Serper 的 Lens 不收图片字节、只收公网链接，走它时必须先把图传到 uguu.se "
-            "换一个几小时后失效的直链。关掉等于不让 Serper 碰 Lens，网页检索不受影响。"
+            "Serper 的 Lens 不收图片字节、只收公网链接，走它时必须先把图传到图床换一个直链。"
+            "关掉等于不让 Serper 碰 Lens，网页检索不受影响。传到哪家见下面的图床设置。"
         ),
         json_schema_extra=_ui(
             "允许上传图片到图床",
-            "默认开。图片会传到 uguu.se（公开、几小时后失效），只在上面的替补开关生效时才发生。",
+            "默认开。图片会传到公开图床（几分钟到几小时后失效），只在上面的替补开关生效时才发生。",
         ),
     )
+
+
+class HostingConfig(PluginConfigBase):
+    """上传图床：Serper 的 Lens 只认公网链接，得先把图传上去换个直链。
+
+    顺序固定为 uguu → ChatGLM → CliIm，前一家没换成自动换下一家，关掉的那家直接跳过；
+    一家都没开就等于不让 Serper 碰 Lens。三家都不需要额外配置，也都被 Google 抓得到
+    （2026-11-16 拿 Unsplash 的照片逐一实测，喂 Lens 都回 60 条）。
+    """
+
+    __ui_label__ = "图床（Serper 替补 Lens 时用）"
+    __ui_icon__ = "upload"
+    __ui_order__ = 10
+
+    uguu: bool = Field(
+        default=True,
+        description=(
+            "第一顺位 uguu.se。传完回一个 d.uguu.se 直链，三小时左右自动失效。"
+            "实测 Google 抓得到，但它自己偶尔整段回 502，所以后面还留了两家。"
+        ),
+        json_schema_extra=_ui("uguu.se（第一顺位）", "默认开。它抽风时自动换下一家。"),
+    )
+    chatglm: bool = Field(
+        default=True,
+        description=(
+            "第二顺位 ChatGLM（智谱）的文件上传，不用 key。回带签名的 t1.chatglm.cn "
+            "直链，有时效，换成之后立刻用。"
+        ),
+        json_schema_extra=_ui("ChatGLM（第二顺位）", "默认开。不用注册，链接带时效。"),
+    )
+    cliim: bool = Field(
+        default=True,
+        description=(
+            "第三顺位 CliIm（草料二维码）的免费图床，文件名取图片 MD5，"
+            "回阿里云杭州 OSS 直链。"
+        ),
+        json_schema_extra=_ui("CliIm 草料（第三顺位）", "默认开。免注册，回阿里云 OSS 直链。"),
+    )
+
+    def order(self) -> tuple[str, ...]:
+        """按固定顺序给出开了哪几家，交给上传链依次去试。"""
+        pairs = (("uguu", self.uguu), ("chatglm", self.chatglm), ("cliim", self.cliim))
+        return tuple(name for name, on in pairs if on)
 
 
 class YandexConfig(EngineConfig):
@@ -674,6 +717,28 @@ class GrokConfig(PluginConfigBase):
         ge=15,
         le=300,
     )
+    role_hint: bool = Field(
+        default=False,
+        description=(
+            "图搜图完全没有结论时，再问一次「这是哪个角色」，然后按角色名去 X 搜同角色的"
+            "coser，把她们当线索列出来（不判定谁发过这张图）。实测只能给名单、核不了图，"
+            "还会多等一两分钟，所以默认关。"
+        ),
+        json_schema_extra=_ui(
+            "按角色找同角色账号",
+            "默认关。打开后只在没找到结论时跑一次；结果只是线索，不当作答案。",
+        ),
+    )
+    role_timeout: int = Field(
+        default=100,
+        description=(
+            "按角色找人这一路最多等多少秒（整条线另有 +30 秒总预算，避免几个模型"
+            "串起来把整单拖长）。实测一次完整检索约 70 秒。"
+        ),
+        json_schema_extra=_ui("角色线索超时（秒）", "默认 100。实测约 70 秒返回。"),
+        ge=15,
+        le=300,
+    )
 
 
 class PluginSectionConfig(PluginConfigBase):
@@ -707,6 +772,19 @@ class PluginSectionConfig(PluginConfigBase):
         default="麦麦寻人",
         description="结果以合并转发发出去时，每条消息上方显示的昵称。",
         json_schema_extra=_ui("转发昵称", "随便改，只影响显示。"),
+    )
+    plain_first_reply: bool = Field(
+        default=False,
+        description=(
+            "首次结果改成普通图文消息（一段结论 + 最多 3 张图），不再用合并转发。"
+            "默认关闭：关着就走合并转发卡片，和以前一样；打开后一定看得见，"
+            "但群里会多占一行。不管开关怎么设，「更多」始终是合并转发。"
+        ),
+        json_schema_extra=_ui(
+            "首次结果用普通图文消息",
+            "默认关闭 = 用合并转发卡片。打开后首次结果是一条图文消息，"
+            "适合合并转发老是显示不出来的环境。",
+        ),
     )
     task_ttl_minutes: int = Field(
         default=1440,
@@ -1012,6 +1090,7 @@ class ImageSearcherConfig(PluginConfigBase):
     baidu: BaiduConfig = Field(default_factory=BaiduConfig)
     saucenao: SauceNaoConfig = Field(default_factory=SauceNaoConfig)
     serper: SerperConfig = Field(default_factory=SerperConfig)
+    hosting: HostingConfig = Field(default_factory=HostingConfig)
     weibo: WeiboConfig = Field(default_factory=WeiboConfig)
     vision: VisionConfig = Field(default_factory=VisionConfig)
     grok: GrokConfig = Field(default_factory=GrokConfig)
@@ -1461,6 +1540,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 config.lens.retry_delay,
                 serper_pool=lens_serper_pool,
                 note=self._vlog,
+                hosting=config.hosting.order(),
             ),
             "yandex": YandexEngine(global_proxy, section.engine_timeout),
             "baidu": BaiduEngine(global_proxy, section.engine_timeout),
@@ -2473,21 +2553,31 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 and (best.handle or "").strip()
             )
         ):
-            try:
-                weibo_clue = await self._hunt_weibo(
-                    ordered, vision_info, grok_info, target_hash
-                )
-            except Exception as error:  # noqa: BLE001 - 查不到不影响已经搜到的结果
-                self.ctx.logger.warning("微博反查失败：%s", error)
-            if weibo_clue and weibo_clue.get("post"):
-                # 微博那边指纹对上了：本人发的帖比「某网站的报道页」硬得多。
+            async def run_hunt(label: str, coro: Any, budget: float) -> Any:
+                """外挂反查的护栏：超时或报错都只丢这一路，绝不拖住主流程。"""
+                try:
+                    return await asyncio.wait_for(coro, timeout=budget)
+                except asyncio.TimeoutError:
+                    self.ctx.logger.warning("%s反查超时（%.0fs），跳过", label, budget)
+                    return None
+                except Exception as error:  # noqa: BLE001 - 反查失败不影响已有结果
+                    self.ctx.logger.warning("%s反查失败：%s", label, error)
+                    return None
+
+            weibo_clue = await run_hunt(
+                "微博",
+                self._hunt_weibo(ordered, vision_info, grok_info, target_hash),
+                45,
+            )
+            weibo_post = weibo_clue.get("post") if weibo_clue else ""
+            if weibo_post:
                 best = self._promote_weibo_post(
                     best,
                     {
                         "distance": int(weibo_clue.get("distance") or 0),
                         "name": str(weibo_clue.get("name") or ""),
                         "uid": str(weibo_clue.get("uid") or ""),
-                        "url": str(weibo_clue.get("post") or ""),
+                        "url": str(weibo_post),
                         "image": str(weibo_clue.get("image") or ""),
                     },
                 )
@@ -2533,6 +2623,16 @@ class ImageSearcherPlugin(MaiBotPlugin):
                     best, {**weibo_post, "note": "转载页正文反查到原帖"}
                 )
 
+        # 图搜图彻底没结论时，退一步问「这是哪个角色」，再按角色名把同角色的
+        # coser 列出来当线索。s-20261118-1414-e965 的教训：小号 + 无水的图，
+        # Lens/Yandex 一条都不收，但角色认得出来，按角色搜人反而能碰到她。
+        role_hint: dict[str, Any] | None = None
+        if upload and target_hash is not None and (best is None or best.status != "match"):
+            try:
+                role_hint = await self._hunt_role_hint(upload, ordered)
+            except Exception as error:  # noqa: BLE001 - 这一路失败不影响已有结果
+                self.ctx.logger.warning("角色线索检索失败：%s", error)
+
         # Grok 给了具体帖子或账号，也算有结论：前者是找到，后者是线索。
         grok_hit = bool(grok_info and grok_info.get("tier") in {"post", "account"})
         outcome = SearchOutcome(
@@ -2554,6 +2654,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
             x_identity=x_identity,
             repost_author=repost_author,
             weibo=weibo_clue,
+            role_hint=role_hint,
             paywall=paywall_info,
         )
 
@@ -5376,8 +5477,35 @@ class ImageSearcherPlugin(MaiBotPlugin):
                     "source": source,
                     "min_fans": floor,
                 }
+                # 粉丝少不等于不是本人：素人号、小号几十粉很常见。这里让图说话——
+                # 翻她最近的带图帖比指纹，对上了就是实锤，落到那条微博上；对不上
+                # 才按同名路人号处理（s-20261117-0741-4631 就是 98 粉被门槛挡回去，
+                # 结果只留了一句「低于门槛」，人其实还在那儿）。
+                proven = await self._with_weibo_post(
+                    {
+                        "status": "hit",
+                        "kind": "name",
+                        "query": name,
+                        "uid": str(top.get("uid") or ""),
+                        "name": str(top.get("name") or ""),
+                        "followers": followers,
+                        "url": str(top.get("url") or ""),
+                        "source": source,
+                        "min_fans": floor,
+                    },
+                    target_hash,
+                )
+                if proven.get("post"):
+                    self._vlog(
+                        "微博反查：%s 只有 %s 粉，但她自己的帖子里有这张图（距离 %s）",
+                        name,
+                        followers,
+                        proven.get("distance"),
+                    )
+                    return proven
                 self._vlog(
-                    "微博反查：%s 只搜到同名的路人号（最多 %s 粉），低于门槛 %s",
+                    "微博反查：%s 只搜到同名的路人号（最多 %s 粉，低于门槛 %s），"
+                    "翻了她的带图帖也没这张",
                     name,
                     followers,
                     floor,
@@ -5554,6 +5682,96 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 "image": pictures[0] if pictures else "",
             }
         return None
+
+    async def _hunt_role_hint(
+        self, upload: bytes, candidates: list[Candidate] | None = None
+    ) -> dict[str, Any] | None:
+        """图搜图没结论时，按「这是哪个角色」去 X 上找同角色的 coser。
+
+        只给线索，不判定谁发过这张图：角色对得上不等于人是同一个，认人仍然靠指纹。
+        一次调用、一条硬预算，超时或失败都只是少一行线索。
+        """
+        section = self.config.grok
+        if not bool(getattr(section, "role_hint", True)):
+            return None
+        if not bool(getattr(section, "enabled", False)):
+            return None
+        key = str(getattr(section, "api_key", "") or "").strip()
+        base = str(getattr(section, "base_url", "") or "").strip().rstrip("/")
+        if not key or not base:
+            return None
+        try:
+            compact, _ = prepare_upload(upload, limit=900_000, as_jpeg=True)
+        except Exception as error:  # noqa: BLE001 - 图处理失败就少这一路
+            self._vlog("角色线索：原图处理失败 %s", str(error)[:60])
+            return None
+        data_url = "data:image/jpeg;base64," + base64.b64encode(compact).decode("ascii")
+        # 候选标题里常写着角色名（「死芒 Necrass」「遐蝶 Castorice」），一起喂给它，
+        # 免得它裸看图认成别的角色——认错一次，后面 8 个账号全是别人。
+        hints = grok.build_hints(grok.social_first(candidates or []))
+        models = grok.model_chain(section.model, getattr(section, "models", None))
+        seconds = max(15, int(getattr(section, "role_timeout", 60)))
+        # 整条线的硬预算：中转站经常第一个模型就挂，逐个等满会把整单拖到十几分钟。
+        deadline = time.monotonic() + seconds + 30
+        proxy = self.config.plugin.proxy
+        started = time.monotonic()
+
+        def call(body: dict, timeout: int) -> dict:
+            session = make_session(proxy, headers={"Authorization": f"Bearer {key}"})
+            try:
+                response = session.post(f"{base}/responses", json=body, timeout=timeout)
+                if response.status_code != 200:
+                    raise HttpError(f"HTTP {response.status_code}：{response.text[:120]}")
+                return response.json()
+            finally:
+                session.close()
+
+        payload: dict | None = None
+        model = models[0]
+        for name in models:
+            left = deadline - time.monotonic()
+            if left < 10:
+                self._vlog("角色线索：预算用完，剩下的模型不再试")
+                break
+            wait = min(seconds, int(left))
+            try:
+                payload = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        call,
+                        grok.build_role_payload(name, data_url, hints=hints),
+                        wait,
+                    ),
+                    timeout=wait + 5,
+                )
+                model = name
+                break
+            except asyncio.TimeoutError:
+                self._vlog("角色线索：%s 等满 %s 秒没回，换下一个", name, wait)
+            except Exception as error:  # noqa: BLE001 - 一个模型失败不代表这条线没救
+                self._vlog("角色线索：%s 没成（%s）", name, str(error)[:60])
+        if payload is None:
+            self._vlog("角色线索：这次没问到（试过 %s）", "、".join(models))
+            return None
+        hint = grok.parse_role_output(payload, model=model)
+        if hint.error:
+            self._vlog("角色线索：解析失败 %s", hint.error)
+            return None
+        self._vlog(
+            "角色线索：角色=%s 账号=%s 耗时=%.1fs %s",
+            "、".join(hint.roles) or "未知",
+            [item.get("handle") for item in hint.accounts][:6],
+            time.monotonic() - started,
+            grok.dumps_role(hint),
+        )
+        if not hint.ok:
+            return None
+        return {
+            "roles": hint.roles,
+            "accounts": hint.accounts,
+            "keywords": hint.keywords,
+            "model": hint.model,
+            "reason": hint.reason,
+        }
 
     async def _hunt_weibo_repost(
         self,
@@ -6003,6 +6221,17 @@ class ImageSearcherPlugin(MaiBotPlugin):
             for name in names:
                 if not handles.name_matches_handle(name, handle):
                     continue
+                # 水印带中文名时，中文名才是本人的标识：@Natsuko_夏夏子 的 handle
+                # 只剩 natsuko_，而 X 上的 @natsuko_ 是另一个号（显示名对不上中文
+                # 名），不能因为拉丁那段重名就认成作者（s-20261117-0741-4631）。
+                if handles.watermark_name_conflict(str(anchor.get("raw") or ""), str(anchor.get("name") or "")):
+                    self._vlog(
+                        "水印「%s」带中文名，X 上 @%s 的显示名是「%s」，对不上，不认定作者",
+                        str(anchor.get("raw") or "")[:40],
+                        handle,
+                        str(anchor.get("name") or "") or "-",
+                    )
+                    continue
                 self._vlog(
                     "交叉验证成立：水印 @%s + 标题署名 %s，认定作者（原帖翻不到）",
                     handle,
@@ -6036,6 +6265,18 @@ class ImageSearcherPlugin(MaiBotPlugin):
         if not handle:
             return best
         if best is not None and (best.handle or "").strip() and best.status == "match":
+            return best
+        # 水印是「那张图上的」，只有当这张图确实出现在那个页面上（指纹命中）时才算
+        # 作者证据。只是「疑似同一个人」的候选不行：s-20261117-0741-4631 拿一条距离
+        # 24 的 reddit 帖——那是别人另一套图，白毛带角拿镰刀——上面的微博水印去定
+        # 作者，结果既认错了人，还把微博号当成 X 号去查。
+        if best is None or best.status != "match":
+            self._vlog(
+                "水印 @%s 和署名 %s 对上了，但手上那条候选不是这张图（%s），不据此认定作者",
+                handle,
+                str(info.get("name") or ""),
+                getattr(best, "status", "") or "无候选",
+            )
             return best
         self._vlog(
             "认定作者：@%s（图上水印 + 标题署名 %s）", handle, str(info.get("name") or "")
@@ -6954,6 +7195,8 @@ class ImageSearcherPlugin(MaiBotPlugin):
     # QQ 单条合并转发的图片总量有上限，超过后 send_group_forward_msg 会被对端拒绝。
     # 实测 6 张图能过、13 张失败，所以「更多」按这个预算拆成几条发。
     _MAX_FORWARD_IMAGES = 6
+    # 首次结果的普通图文消息最多带几张图：结论配原图加一张最像的候选就够了。
+    _MAX_FIRST_IMAGES = 3
 
     @staticmethod
     def _planned_images(outcome: SearchOutcome, groups: list[tuple[str, list[Candidate]]]) -> int:
@@ -7056,12 +7299,18 @@ class ImageSearcherPlugin(MaiBotPlugin):
         await self._ensure_engine_images(task, limit=limit, whole=replay)
         section = self.config.plugin
         outcome = task.outcome
-        if replay and outcome is not None:
-            groups = formatting.engine_groups(outcome, outcome.best, limit)
-            if len(groups) > 1 and self._planned_images(outcome, groups) > self._MAX_FORWARD_IMAGES:
-                await self._send_engine_forwards(task, groups, section, target=where)
-                return
+        if not replay and section.plain_first_reply:
+            # 开关打开：首次结果换成一条普通图文消息。合并转发卡片偶发拿不到新的
+            # real_seq，客户端会整条不画；普通消息不受这个影响。
+            await self._send_first_reply(task, where)
+            return
+
         if replay:
+            if outcome is not None:
+                groups = formatting.engine_groups(outcome, outcome.best, limit)
+                if len(groups) > 1 and self._planned_images(outcome, groups) > self._MAX_FORWARD_IMAGES:
+                    await self._send_engine_forwards(task, groups, section, target=where)
+                    return
             # 「更多」是重发全部候选，保持单条结构（图多时会走上面的按引擎拆条）。
             blocks = [
                 formatting.build_forward_nodes(
@@ -7076,8 +7325,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 )
             ]
         else:
-            # 视觉、Grok、页脚各占一个节点，最后塞进同一条合并转发：
-            # 两种来源的结论和配图挤在一个节点里，用户分不清哪张属于哪个判断。
+            # 开关关着（默认）：首次结果还是合并转发。视觉、Grok、页脚各占一个节点，
+            # 最后塞进同一条转发——两种来源的结论和配图挤在一个节点里，用户分不清哪张
+            # 属于哪个判断。
             blocks = formatting.build_result_forwards(
                 task,
                 command=COMMAND,
@@ -7133,15 +7383,10 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 # 连着发多条容易被适配器判成刷屏，隔一秒。
                 await asyncio.sleep(1)
 
-        # 转发卡片会「发成功、服务端有、客户端看不见」（见 formatting.forward_notice
-        # 的注释），补一句纯文字兜底。只在首次结果时补：「更多」是用户主动要的，
-        # 再补一句就成刷屏了。
-        if delivered and not replay:
-            try:
-                await self.ctx.send.text(formatting.forward_notice(task, COMMAND), where)
-            except Exception as error:  # noqa: BLE001 - 兜底失败不影响已经发出的结果
-                self.ctx.logger.warning("结果提示文字发送失败：%s", error)
+        # 卡片发出去就结束，不再补「结果已发」那句文字：用户明确不要这条。
+        # 卡片本身偶发不渲染仍然没解，要靠 plain_first_reply 开关换发法来解决。
 
+        # 转发失败要留一句人话，否则群里只看到「正在搜图」就没了下文。
         if delivered == 0:
             self.ctx.logger.warning("合并转发全部失败，退回文字消息：%s", last_error or "被拒绝")
             text = formatting.build_text_summary(
@@ -7154,6 +7399,44 @@ class ImageSearcherPlugin(MaiBotPlugin):
             fallback = await self.ctx.send.text(text, where)
             if not _send_ok(fallback):
                 self.ctx.logger.warning("转发退路也失败：task=%s 文本长度=%s", task.task_id, len(text))
+
+    async def _send_first_reply(self, task: SearchTask, where: str) -> None:
+        """首次结果：一条普通图文消息，文字结论在前，最多跟三张关键图。
+
+        只在 `plain_first_reply` 打开时走这里。合并转发卡片偶发拿不到新的 real_seq
+        （QQ 把它挂到上一条消息上），客户端按 seq 去重就整条不画，而插件这边只能拿到
+        一个 bool，既预知不了也补救不了。普通消息不受这个影响，代价是群里多占一行；
+        全部候选仍在「更多」里。
+        """
+        section = self.config.plugin
+        text, images = formatting.build_first_reply(
+            task,
+            command=COMMAND,
+            ttl_minutes=section.task_ttl_minutes,
+            max_images=self._MAX_FIRST_IMAGES,
+        )
+        sent: Any = None
+        if images:
+            segments: list[dict] = [{"type": "text", "data": text}]
+            segments.extend({"type": "image", "content": image} for image in images)
+            try:
+                sent = await self.ctx.send.hybrid(segments, where)
+            except Exception as error:  # noqa: BLE001 - 图文失败就退回纯文字
+                self.ctx.logger.warning("首次结果图文发送失败，改用纯文字：%s", error)
+                sent = None
+        if not _send_ok(sent):
+            sent = await self.ctx.send.text(text, where)
+        self._vlog(
+            "首次结果已发送：task=%s 发往=%s 图=%s 文字=%s字 返回类型=%s 成功=%s",
+            task.task_id,
+            where,
+            len(images),
+            len(text),
+            type(sent).__name__,
+            _send_ok(sent),
+        )
+        if not _send_ok(sent):
+            self.ctx.logger.warning("首次结果发送失败：task=%s", task.task_id)
 
     # -- 等图 -------------------------------------------------------------
 

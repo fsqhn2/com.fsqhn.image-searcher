@@ -222,6 +222,28 @@ class NameMatchesHandleTest(unittest.TestCase):
         self.assertLessEqual(len(handles.typo_variants("menruinyanko", limit=5)), 5)
 
 
+class WatermarkCjkTest(unittest.TestCase):
+    """水印带中文名时，中文名得对得上，否则认成同名的另一个号。
+
+    s-20261117-0741-4631：水印读作 @Natsuko_夏夏子，handle 只剩 natsuko_，
+    X 上的 @natsuko_ 其实是日本画师「おおらい なつこ」，八竿子打不着。
+    """
+
+    def test_cjk_part_picks_the_longest_run(self) -> None:
+        self.assertEqual(handles.cjk_part("@Natsuko_夏夏子"), "夏夏子")
+        self.assertEqual(handles.cjk_part("cosplay by 昭君睡不醒"), "昭君睡不醒")
+        self.assertEqual(handles.cjk_part("@kuru_xox"), "")
+
+    def test_conflict_when_display_name_has_no_such_chinese(self) -> None:
+        self.assertTrue(handles.watermark_name_conflict("@Natsuko_夏夏子", "おおらい なつこ"))
+        self.assertTrue(handles.watermark_name_conflict("@Natsuko_夏夏子", ""))
+
+    def test_no_conflict_when_display_name_carries_it(self) -> None:
+        self.assertFalse(handles.watermark_name_conflict("@Natsuko_夏夏子", "夏夏子 Natsuko"))
+        # 全是拉丁字母的水印不适用这条：还是按原来的 handle 比对走。
+        self.assertFalse(handles.watermark_name_conflict("@kuru_xox", "KURU"))
+
+
 
 class SignatureNameTest(unittest.TestCase):
     """标题里的明确署名：搬运帖常把原作者名连动词一起抄过来。

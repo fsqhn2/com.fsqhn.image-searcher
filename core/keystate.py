@@ -1,7 +1,10 @@
 """key 额度用尽的记忆。
 
 有的 key 月额度用完以后，再拿它请求也只是白发一次：服务端要回一次 429/错误，
-插件这边还要多等一个来回。这类状态按自然月记住，写进 data 目录，重启也不丢。
+插件这边还要多等一个来回。这类状态记住到期日，写进 data 目录，重启也不丢。
+
+SerpAPI 的免费额度不是按自然月重置，而是各把 key 自己的开号日（账号接口的
+plan_renewal_date，比如 11-22、11-28），所以到期日优先问接口，问不到才按自然月兜底。
 
 key 本身不落盘，只存 sha256 的前 16 位——文件泄露也拿不到可用 key。
 """
@@ -14,8 +17,23 @@ import os
 import time
 
 FILE_NAME = "key_quota.json"
-# 跨月缓冲：SerpAPI 按 UTC 自然月重置，多等一天，免得月初边界上白试。
+# 兜底缓冲：问不到重置日时按自然月算，多等一天，免得月初边界上白试。
 _RESET_BUFFER_SECONDS = 86400
+# 问到重置日时只多等一小时：按那天 0 点（UTC）算，早试了最多再吃一次 429。
+_RENEWAL_BUFFER_SECONDS = 3600
+
+
+def renewal_deadline(text: str) -> float | None:
+    """把账号接口的 ``plan_renewal_date``（2026-11-22）换成到期时间戳。
+
+    认不出来就返回 None，让调用方按自然月兜底。
+    """
+    raw = str(text or "").strip()[:10]
+    try:
+        day = datetime.datetime.strptime(raw, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc)
+    except (TypeError, ValueError):
+        return None
+    return day.timestamp() + _RENEWAL_BUFFER_SECONDS
 
 
 def key_id(key: str) -> str:
@@ -24,7 +42,11 @@ def key_id(key: str) -> str:
 
 
 def month_end(now: float | None = None) -> float:
-    """下一个自然月的起点（UTC）+ 一天缓冲。"""
+    """兜底用：下一个自然月的起点（UTC）+ 一天缓冲。
+
+    SerpAPI 免费档实际是按各把 key 的开号日重置（见 ``renewal_deadline``），
+    只有问不到重置日时才退到这里。
+    """
     stamp = time.time() if now is None else float(now)
     current = datetime.datetime.fromtimestamp(stamp, datetime.timezone.utc)
     if current.month == 12:

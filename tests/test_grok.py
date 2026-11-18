@@ -448,5 +448,103 @@ class FormattingTest(unittest.TestCase):
         self.assertNotIn("Grok", text)
 
 
+class RoleHintParseTest(unittest.TestCase):
+    """按角色找人：解析「角色 + 账号清单」。"""
+
+    def test_parses_role_and_accounts(self) -> None:
+        text = (
+            "角色：明日方舟｜死芒 Necrass\n"
+            "账号：@tsurumi57 | 1.7K | https://x.com/tsurumi57/status/2085139555746025660\n"
+            "账号：@Aaaasui | 2.3万 | 无\n"
+            "检索词：ネクラス コスプレ, 死芒 cosplay\n"
+            "依据：白发猫耳黑面纱，与死芒立绘一致\n"
+        )
+        hint = grok.parse_role_output(_body(text, tools=["x_search"]))
+        self.assertTrue(hint.ok)
+        self.assertEqual(hint.roles, ["明日方舟｜死芒 Necrass"])
+        self.assertEqual(len(hint.accounts), 2)
+        self.assertEqual(hint.accounts[0]["handle"], "tsurumi57")
+        self.assertEqual(hint.accounts[0]["fans"], 1700)
+        self.assertIn("status/2085139555746025660", hint.accounts[0]["post"])
+        self.assertEqual(hint.accounts[1]["fans"], 23000)
+        self.assertEqual(hint.accounts[1]["post"], "")
+        self.assertIn("ネクラス コスプレ", hint.keywords)
+        self.assertIn("死芒", hint.reason)
+
+    def test_unknown_role_is_dropped(self) -> None:
+        """认不出角色时写「角色：无」，不能当成一个真角色。"""
+        hint = grok.parse_role_output(_body("角色：无\n账号：@someone | 100 | 无"))
+        self.assertEqual(hint.roles, [])
+        self.assertEqual(len(hint.accounts), 1)
+
+    def test_does_not_scan_bare_mentions(self) -> None:
+        """正文里复述「我搜了 @who 没找到」不算账号，只认「账号：」这行。"""
+        text = "角色：明日方舟｜死芒\n我搜过 @noise_account 但没结果\n账号：@real_one | 1757 | 无"
+        hint = grok.parse_role_output(_body(text))
+        self.assertEqual([item["handle"] for item in hint.accounts], ["real_one"])
+
+    def test_dedupes_and_caps(self) -> None:
+        lines = ["角色：某作品｜某角色"]
+        for index in range(12):
+            lines.append("账号：@user%d | 10 | 无" % index)
+        lines.append("账号：@user0 | 999 | 无")
+        hint = grok.parse_role_output(_body("\n".join(lines)))
+        handles = [item["handle"] for item in hint.accounts]
+        self.assertEqual(len(handles), 8)
+        self.assertEqual(handles.count("user0"), 1)
+
+    def test_placeholder_links_are_dropped(self) -> None:
+        """模型把「无」写成占位链接时，别把它当帖子地址。"""
+        hint = grok.parse_role_output(_body("角色：A｜B\n账号：@x | 10 | 无"))
+        self.assertEqual(hint.accounts[0]["post"], "")
+
+    def test_fans_variants(self) -> None:
+        self.assertEqual(grok.parse_fans("1757"), 1757)
+        self.assertEqual(grok.parse_fans("1.7K"), 1700)
+        self.assertEqual(grok.parse_fans("1.7k粉"), 1700)
+        self.assertEqual(grok.parse_fans("3.2万"), 32000)
+        self.assertEqual(grok.parse_fans("?"), 0)
+        self.assertEqual(grok.parse_fans(""), 0)
+
+    def test_empty_body_reports_error(self) -> None:
+        hint = grok.parse_role_output({"model": "grok-4.7", "output": []})
+        self.assertFalse(hint.ok)
+        self.assertTrue(hint.error)
+
+    def test_payload_carries_image_and_tool(self) -> None:
+        payload = grok.build_role_payload("grok-4.7", "data:image/jpeg;base64,AAA")
+        self.assertEqual(payload["model"], "grok-4.7")
+        self.assertEqual(payload["tools"], [{"type": "x_search"}])
+        content = payload["input"][0]["content"]
+        self.assertTrue(any(item.get("type") == "input_image" for item in content))
+        self.assertIn("角色", content[0]["text"])
+
+
+class RoleHintFormatTest(unittest.TestCase):
+    """线索的展示文案：要写明只是线索，别让人以为是结论。"""
+
+    def test_shows_role_and_accounts(self) -> None:
+        outcome = SearchOutcome(
+            status="not_found",
+            role_hint={
+                "roles": ["明日方舟｜死芒 Necrass"],
+                "accounts": [
+                    {"handle": "tsurumi57", "fans": 1757, "post": ""},
+                    {"handle": "another_cos", "fans": 0, "post": ""},
+                ],
+            },
+        )
+        lines = formatting._role_hint_lines(outcome)
+        joined = "\n".join(lines)
+        self.assertIn("死芒 Necrass", joined)
+        self.assertIn("@tsurumi57", joined)
+        self.assertIn("1757", joined)
+        self.assertIn("@another_cos", joined)
+        self.assertIn("线索", joined)
+
+    def test_empty_hint_gives_nothing(self) -> None:
+        self.assertEqual(formatting._role_hint_lines(SearchOutcome(status="not_found")), [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -9,12 +9,12 @@ from core import formatting
 from core.engines import Candidate, downgrade_kind
 from core.formatting import (
     build_engine_forward_nodes,
+    build_first_reply,
     build_forward_nodes,
     build_result_forwards,
     build_text_summary,
     count_forward_images,
     engine_groups,
-    forward_notice,
     stale_image_hint,
     ttl_text,
 )
@@ -2216,39 +2216,63 @@ class WeiboClueLineTest(unittest.TestCase):
         self.assertIn("不填 cookie 也能用", text)
 
 
-class ForwardNoticeTest(unittest.TestCase):
-    """转发卡片发出去之后补的那句话。
+class FirstReplyTest(unittest.TestCase):
+    """首次结果改成普通图文消息：文字带结论与「更多」入口，图最多三张。"""
 
-    卡片会「发成功、服务端有、客户端看不见」（s-20261114-1216-5cf2、
-    s-20261115-2237-0365 两条都是），这句纯文字是最后的兜底：必须带上任务编号，
-    用户才知道回哪一条去捞全部。
-    """
-
-    def test_not_found_says_so_and_carries_task_id(self) -> None:
-        task = _task(SearchOutcome(status="not_found", candidates=[], total_candidates=3))
-        line = forward_notice(task, "盆地找鸡")
-        self.assertIn("s-test", line)
-        self.assertIn("没搜到", line)
-        self.assertIn("盆地找鸡 更多 s-test", line)
-
-    def test_match_mentions_the_name(self) -> None:
-        outcome = SearchOutcome(
-            status="match",
-            best=Candidate(
-                url="https://x.com/someone/status/1",
-                platform="X",
-                name="某人",
-                handle="someone",
-                status="match",
-                distance=3,
-                engine="lens",
-            ),
+    def _candidate(self, index: int) -> Candidate:
+        item = Candidate(
+            engine="lens",
+            url=f"https://www.pixiv.net/artworks/{index}",
+            platform="pixiv",
+            distance=20 + index,
+            status="suspect",
+            image_url=f"https://img.example/{index}.jpg",
         )
-        line = forward_notice(_task(outcome), "麦麦寻人")
-        self.assertIn("找到原帖", line)
-        self.assertIn("某人", line)
+        item.finalize()
+        return item
 
-    def test_error_status_is_not_called_not_found(self) -> None:
-        line = forward_notice(_task(SearchOutcome(status="error")), "麦麦寻人")
-        self.assertIn("搜索失败", line)
-        self.assertNotIn("没搜到", line)
+    def test_text_carries_conclusion_and_more_entry(self) -> None:
+        best = Candidate(engine="lens", url="https://x.com/a/status/1", status="match", distance=4)
+        best.finalize()
+        outcome = SearchOutcome(status="ok", best=best, candidates=[best], image_b64="BEST")
+        text, images = build_first_reply(_task(outcome), command="盆地找鸡")
+        self.assertIn("盆地找鸡", text)
+        self.assertIn("s-test", text)
+        self.assertIn("盆地找鸡 更多 s-test", text)
+        self.assertEqual(images, ["BEST"])
+
+    def test_images_capped_at_three(self) -> None:
+        items = [self._candidate(i) for i in range(1, 6)]
+        outcome = SearchOutcome(
+            status="not_found",
+            best=None,
+            candidates=items,
+            image_b64="REF",
+            images={item.image_url: f"IMG{i}" for i, item in enumerate(items, start=1)},
+        )
+        _text, images = build_first_reply(_task(outcome), command="盆地找鸡")
+        self.assertLessEqual(len(images), 3)
+        self.assertEqual(images[0], "REF")
+
+    def test_same_image_is_not_repeated(self) -> None:
+        best = Candidate(engine="lens", url="https://x.com/a/status/1", status="match", distance=4)
+        best.finalize()
+        outcome = SearchOutcome(
+            status="ok",
+            best=best,
+            candidates=[best],
+            image_b64="SAME",
+            images={best.image_url: "SAME"},
+        )
+        _text, images = build_first_reply(_task(outcome), command="盆地找鸡")
+        self.assertEqual(images, ["SAME"])
+
+    def test_max_images_argument_is_respected(self) -> None:
+        items = [self._candidate(i) for i in range(1, 6)]
+        outcome = SearchOutcome(
+            status="not_found",
+            candidates=items,
+            images={item.image_url: f"IMG{i}" for i, item in enumerate(items, start=1)},
+        )
+        _text, images = build_first_reply(_task(outcome), command="盆地找鸡", max_images=1)
+        self.assertEqual(len(images), 1)

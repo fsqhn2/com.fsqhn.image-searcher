@@ -64,6 +64,10 @@ class SearchOutcome:
     # "followers", "url", "source", "max_fans", "floor"}。hit 只是线索（这个号确实是
     # 她本人），不改 best；none 说明搜过但没搜到粉丝量像正主的同名号。
     weibo: dict | None = None
+    # 按角色找人的线索：{"roles": ["明日方舟｜死芒 Necrass"],
+    # "accounts": [{"handle", "fans", "post"}], "keywords": [...], "model", "reason"}。
+    # 只在图搜图没结论时才有，纯线索——角色对得上不等于人是同一个，认人仍然靠指纹。
+    role_hint: dict | None = None
     # 确认作者后在她自己的付费页找到的售卖信息：{"platform": patreon/fanbox, "handle",
     # "shop", "post": {title, url, published, min_cents, currency},
     # "tiers": [{title, cents, currency, free}], "preview": {title, url}}。
@@ -97,6 +101,7 @@ class SearchOutcome:
             "x_identity": self.x_identity,
             "repost_author": self.repost_author,
             "weibo": self.weibo,
+            "role_hint": self.role_hint,
             "paywall": self.paywall,
         }
 
@@ -125,6 +130,7 @@ class SearchOutcome:
             x_identity=summary.get("x_identity"),
             repost_author=summary.get("repost_author"),
             weibo=summary.get("weibo"),
+            role_hint=summary.get("role_hint"),
             paywall=summary.get("paywall"),
         )
 

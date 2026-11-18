@@ -35,6 +35,17 @@ class KeystateTest(unittest.TestCase):
     def test_month_end_rolls_to_next_month(self) -> None:
         self.assertEqual(_utc_of(keystate.month_end(_utc(2026, 11, 14))), (2026, 12, 2))
 
+    def test_renewal_deadline_follows_the_key_own_date(self) -> None:
+        """SerpAPI 免费档按各把 key 的开号日重置，不是每月 1 号。"""
+        stamp = keystate.renewal_deadline("2026-11-22")
+        self.assertIsNotNone(stamp)
+        self.assertEqual(_utc_of(stamp), (2026, 11, 22))
+        self.assertGreater(stamp, _utc(2026, 11, 22))
+
+    def test_renewal_deadline_rejects_garbage(self) -> None:
+        for text in ("", "   ", "unknown", "22/11/2026", None):
+            self.assertIsNone(keystate.renewal_deadline(text), text)
+
     def test_load_drops_expired_and_tolerates_garbage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, keystate.FILE_NAME)

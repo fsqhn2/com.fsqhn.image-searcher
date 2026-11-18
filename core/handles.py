@@ -348,6 +348,26 @@ def signature_fix(handle: str, names: list[str], limit: int = 4) -> list[str]:
     return out[: max(1, limit)]
 
 
+def cjk_part(text: str) -> str:
+    """取一段文字里最长的那段中日文（至少两个字）。"""
+    runs = re.findall(r"[\u4e00-\u9fff\u3040-\u30ff]{2,}", str(text or ""))
+    return max(runs, key=len) if runs else ""
+
+
+def watermark_name_conflict(raw: str, x_name: str) -> bool:
+    """水印里带中文名、而 X 上那个号的显示名里没有这段中文 → 不是同一个人。
+
+    s-20261117-0741-4631：水印读作 ``@Natsuko_夏夏子``，handle 只留下拉丁那段
+    ``natsuko_``；X 上确实有个 @natsuko_，但那是日本画师「おおらい なつこ」，跟这个
+    中文名毫无关系。只比拉丁那段，等于把完全不同的人认成作者。中文名才是这个人的
+    真标识，所以带着中文时必须以中文名对得上为准。
+    """
+    cjk = cjk_part(raw)
+    if not cjk:
+        return False
+    return cjk not in str(x_name or "")
+
+
 def name_matches_handle(name: str, handle: str) -> bool:
     """标题里的署名，跟图上读出来那个号是不是同一个名字。
 

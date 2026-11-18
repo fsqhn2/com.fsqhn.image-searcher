@@ -254,6 +254,8 @@ def platform_of(url: str = "", source: str = "", title: str = "") -> str:
         return "抖音"
     if "weibo.com" in host or "weibo.cn" in host:
         return "微博"
+    if "xiaohongshu.com" in host or "xhslink.com" in host:
+        return "小红书"
     if "instagram.com" in host:
         return "Instagram"
     if "tiktok.com" in host:

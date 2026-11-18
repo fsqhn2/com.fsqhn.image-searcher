@@ -7,11 +7,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import html as html_lib
 import json
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -41,9 +42,11 @@ from .httpclient import (
 )
 from .identity import SERPER_LENS, is_serper_key
 from .keypool import KeyPool
+from .keystate import renewal_deadline
 
 SERP_ENDPOINT = "https://serpapi.com/search.json"
 SERP_IMAGE_ENDPOINT = "https://serpapi.com/image"
+SERP_ACCOUNT_ENDPOINT = "https://serpapi.com/account"
 SERP_UPLOAD_LIMIT = 500 * 1024
 # 请求超时（网络抖动，不是 key 坏了）只冷却这么久就再试。原来是 60 秒，两单
 # 同时进来时会把对方的 key 一起锁死，谁都用不了。
@@ -51,6 +54,21 @@ TIMEOUT_COOLDOWN = 15
 # 转码重传用的长边：Lens 只认「这张图像什么」，不靠细节比对，1600 够用，
 # 再大只是多传几秒。
 _LENS_RETRY_SIDE = 1600
+# SerpAPI 表示「这把 key 的搜索额度用完了」的说法。搜索接口和上传接口都会回，
+# 上传接口回的是 HTTP 429 + {"error": "Your account has run out of searches."}。
+_QUOTA_TOKENS = ("run out", "runout", "quota", "exceeded", "no searches", "searches left")
+
+
+def _until_text(until: float | None) -> str:
+    """额度到期日写进日志时用的短日期。"""
+    if not until:
+        return "下个自然月"
+    return time.strftime("%m-%d", time.localtime(until))
+
+
+def _looks_like_quota(text: str) -> bool:
+    low = str(text or "").lower()
+    return any(token in low for token in _QUOTA_TOKENS)
 
 
 def _reencode_for_lens(raw: bytes) -> bytes:
@@ -86,11 +104,21 @@ def _reencode_for_lens(raw: bytes) -> bytes:
         return b""
     return b""
 # Serper 的 Lens 只收公网图片链接（base64 会回 400 Missing "url"），所以要先把图
-# 传到 uguu 换一个直链。大图不传，省得白等一次上传。
-# 注意：tmpfiles.org 的 dl 直链喂给 Serper Lens 会回 organic=0（Google 抓不到那台机器），
-# 别换回去。telegra.ph 直接 400、file.io 回的是网页，也都试过不行。
-SERPER_HOST_UPLOAD = "https://uguu.se/upload?output=text"
+# 传到一个能被 Google 抓到的图床换直链。三家按顺序试，前一家没换成自动换下一家；
+# 每家的开关在配置 [hosting] 里。实测（2026-11-16，拿一张 Unsplash 的优胜美地照片）：
+# uguu 的 d.uguu.se、ChatGLM 的 t1.chatglm.cn、CliIm 的阿里云 OSS 直链，喂 Lens
+# 都回 60 条，抓得到。tmpfiles.org 的 dl 直链回 organic=0（Google 抓不到那台机器），
+# telegra.ph 直接 400、file.io 回的是网页，都别换回去。
+UGUU_UPLOAD = "https://uguu.se/upload?output=text"
+CHATGLM_UPLOAD = "https://chatglm.cn/chatglm/backend-api/assistant/file_upload"
+CLIIM_UPLOAD = "https://upload.api.cli.im/upload.php?kid=cliim"
+HOSTING_ORDER = ("uguu", "chatglm", "cliim")
 SERPER_HOST_LIMIT = 4 * 1024 * 1024
+# ChatGLM 的接口按浏览器 UA 才收；requests 的默认 UA 会被挡。
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
+)
 SAUCENAO_ENDPOINT = "https://saucenao.com/search.php"
 SIGHTENGINE_ENDPOINT = "https://api.sightengine.com/1.0/check.json"
 
@@ -229,25 +257,8 @@ def serper_lens_candidates(payload: Any, engine: str = "lens") -> list[Candidate
     return items
 
 
-def host_image_publicly(
-    raw: bytes,
-    proxy: str = "",
-    timeout: float = 40.0,
-    note: Callable[[str], None] | None = None,
-) -> str:
-    """把图传到 uguu 换一个三小时左右自动失效的直链。
-
-    Serper 的 Lens 不收 base64（回 400 ``Missing "url"``），只认公网链接。换不到
-    就返回空串，让上层报「图床没换成」，不要拿一张不存在的图去搜。只在轮到 Serper
-    的 key 时才走这里（SerpAPI 额度用完的替补），平时不会上传任何图。
-
-    用 uguu 是因为实测 Google 抓得到它：``d.uguu.se`` 的直链喂 Lens 能回 60 条。
-    tmpfiles 的 dl 直链则回 0 条，别换回去。
-
-    以前这里把失败原因整个吞掉，日志只剩一句「图床没换成」，事后查不出是超时、
-    拒绝还是回了空——s-20261115-2237-0365 那单就是这样，只能重跑一遍才知道。
-    现在每一步失败都经 ``note`` 写一行。
-    """
+def _say_to(note: Callable[[str], None] | None) -> Callable[..., None]:
+    """把日志回调包一层：回调没接、或自己写日志时抛异常，都不能影响检索。"""
 
     def _say(message: str, *args: Any) -> None:
         if note is None:
@@ -257,48 +268,167 @@ def host_image_publicly(
         except Exception:  # noqa: BLE001 - 日志写不出去不能影响检索
             pass
 
-    if not raw:
-        _say("图床：图为空，跳过")
-        return ""
-    if len(raw) > SERPER_HOST_LIMIT:
-        _say("图床：%sKB 超过 %sKB 上限，跳过", len(raw) // 1024, SERPER_HOST_LIMIT // 1024)
-        return ""
-    # uguu 会整段返回 502（实测直连和代理都一样，是它自己的故障），过一次再试一次
-    # 往往就通了；不值得为它等太久。
+    return _say
+
+
+def _upload_uguu(raw: bytes, proxy: str, timeout: float, say: Callable[..., None]) -> str:
+    """uguu.se：``output=text`` 直接回一行直链，不用解 JSON。
+
+    它偶尔整段回 502（实测直连和代理都一样，是它自己的故障），过一次再试一次
+    往往就通了；不值得为它等太久。
+    """
     for attempt in (1, 2):
         session = make_session(proxy)
         try:
             resp = session.post(
-                SERPER_HOST_UPLOAD,
+                UGUU_UPLOAD,
                 files={"files[]": ("upload.jpg", raw, "image/jpeg")},
                 timeout=_timeout(timeout),
             )
             if resp.status_code != 200:
-                _say(
+                say(
                     "图床 uguu 第%s次回 HTTP %s：%s",
                     attempt,
                     resp.status_code,
                     (resp.text or "（空）")[:120].replace("\n", " "),
                 )
-                if attempt == 1:
-                    time.sleep(2)
-                    continue
+            else:
+                text = (resp.text or "").strip()
+                link = text.splitlines()[0].strip() if text else ""
+                if link.startswith("http"):
+                    return link
+                say("图床 uguu 没回直链：%s", (text[:120] or "（空响应）").replace("\n", " "))
                 return ""
-            # output=text 让 uguu 直接回一行纯文本直链，不用解 JSON。
-            text = resp.text.strip()
-            link = text.splitlines()[0].strip() if text else ""
-            if not link.startswith("http"):
-                _say("图床 uguu 没回直链：%s", (text[:120] or "（空响应）").replace("\n", " "))
-                return ""
-            return link
         except Exception as exc:  # noqa: BLE001 - 图床抽风就当这条路不通
-            _say("图床 uguu 第%s次出错：%s: %s", attempt, type(exc).__name__, str(exc)[:120])
-            if attempt == 1:
-                time.sleep(2)
-                continue
-            return ""
+            say("图床 uguu 第%s次出错：%s: %s", attempt, type(exc).__name__, str(exc)[:120])
         finally:
             session.close()
+        if attempt == 1:
+            time.sleep(2)
+    return ""
+
+
+def _upload_chatglm(raw: bytes, proxy: str, timeout: float, say: Callable[..., None]) -> str:
+    """ChatGLM（智谱）的文件上传：不用 key，回一个 ``t1.chatglm.cn`` 的签名直链。
+
+    链接带 ``expired_at`` 与 ``sign``，有时效；换成之后立刻拿去搜，别存着。
+    """
+    session = make_session(proxy)
+    try:
+        resp = session.post(
+            CHATGLM_UPLOAD,
+            files={"file": ("image.jpg", raw, "image/jpeg")},
+            headers={"User-Agent": _BROWSER_UA},
+            timeout=_timeout(timeout),
+        )
+        if resp.status_code != 200:
+            say(
+                "图床 ChatGLM 回 HTTP %s：%s",
+                resp.status_code,
+                (resp.text or "（空）")[:120].replace("\n", " "),
+            )
+            return ""
+        data = resp.json()
+        link = str(((data or {}).get("result") or {}).get("file_url") or "").strip()
+        if link.startswith("http"):
+            return link
+        say("图床 ChatGLM 没回直链：%s", str(data)[:120])
+        return ""
+    except Exception as exc:  # noqa: BLE001 - 图床抽风就当这条路不通
+        say("图床 ChatGLM 出错：%s: %s", type(exc).__name__, str(exc)[:120])
+        return ""
+    finally:
+        session.close()
+
+
+def _upload_cliim(raw: bytes, proxy: str, timeout: float, say: Callable[..., None]) -> str:
+    """CliIm（草料二维码）的免费图床：文件名用图片 MD5，回阿里云杭州 OSS 直链。
+
+    返回的是 ``http://oss-cn-hangzhou.aliyuncs.com/...``，Google 抓得到。
+    """
+    session = make_session(proxy)
+    try:
+        name = hashlib.md5(raw).hexdigest() + ".jpg"
+        resp = session.post(
+            CLIIM_UPLOAD,
+            files={"Filedata": (name, raw, "image/jpeg")},
+            headers={
+                "User-Agent": _BROWSER_UA,
+                "Origin": "https://cli.im",
+                "Referer": "https://cli.im/deqr/",
+            },
+            timeout=_timeout(timeout),
+        )
+        if resp.status_code != 200:
+            say(
+                "图床 cli.im 回 HTTP %s：%s",
+                resp.status_code,
+                (resp.text or "（空）")[:120].replace("\n", " "),
+            )
+            return ""
+        data = resp.json()
+        link = str(((data or {}).get("data") or {}).get("path") or "").strip()
+        if link and not link.startswith("http"):
+            link = "https://" + link.lstrip("/")
+        if link.startswith("http"):
+            return link
+        say("图床 cli.im 没回直链：%s", str(data)[:120])
+        return ""
+    except Exception as exc:  # noqa: BLE001 - 图床抽风就当这条路不通
+        say("图床 cli.im 出错：%s: %s", type(exc).__name__, str(exc)[:120])
+        return ""
+    finally:
+        session.close()
+
+
+_UPLOADERS: dict[str, Callable[..., str]] = {
+    "uguu": _upload_uguu,
+    "chatglm": _upload_chatglm,
+    "cliim": _upload_cliim,
+}
+
+
+def host_image_publicly(
+    raw: bytes,
+    proxy: str = "",
+    timeout: float = 40.0,
+    note: Callable[[str], None] | None = None,
+    hosting: Sequence[str] | None = None,
+) -> str:
+    """按顺序把图传到第一个能用的图床，返回一个 Google 抓得到的直链。
+
+    Serper 的 Lens 不收 base64（回 400 ``Missing "url"``），只认公网链接。换不到
+    就返回空串，让上层报「图床没换成」，不要拿一张不存在的图去搜。只在轮到 Serper
+    的 key 时才走这里（SerpAPI 额度用完的替补），平时不会上传任何图。
+
+    顺序默认 uguu → ChatGLM → CliIm，配置 ``[hosting]`` 里可以逐个关掉；关掉的那家
+    直接跳过，一家都没开就返回空串。三家都被 Google 抓得到（2026-11-16 各拿一张
+    Unsplash 照片喂 Lens，都回 60 条）；tmpfiles 的 dl 直链回 0 条，别换回去。
+
+    每一步失败都经 ``note`` 写一行：以前 except 一把吞掉，日志只剩「图床没换成」，
+    事后分不清是超时、被拒还是回了空（s-20261115-2237-0365 就是这样）。
+    """
+    say = _say_to(note)
+    if not raw:
+        say("图床：图为空，跳过")
+        return ""
+    if len(raw) > SERPER_HOST_LIMIT:
+        say("图床：%sKB 超过 %sKB 上限，跳过", len(raw) // 1024, SERPER_HOST_LIMIT // 1024)
+        return ""
+
+    order = tuple(hosting) if hosting is not None else HOSTING_ORDER
+    chain = [name for name in order if name in _UPLOADERS]
+    if not chain:
+        say("图床：配置里一家都没开，跳过")
+        return ""
+    for index, name in enumerate(chain):
+        link = _UPLOADERS[name](raw, proxy, timeout, say)
+        if link:
+            if index:
+                say("图床：换到 %s 成功（先跌过 %s）", name, "、".join(chain[:index]))
+            return link
+        if index + 1 < len(chain):
+            say("图床 %s 没换成，换下一家", name)
     return ""
 
 
@@ -330,12 +460,15 @@ class LensEngine:
         retry_delay: float = 1.5,
         serper_pool: KeyPool | None = None,
         note: Callable[[str], None] | None = None,
+        hosting: Sequence[str] | None = None,
     ) -> None:
         self.pool = pool
         # Serper 是一把独立的池：只有 SerpAPI 那边全不可用时才轮到它，不参与轮询。
         self.serper_pool = serper_pool
         # 替补那一枪过去是静默的，事后完全查不出「没补成」还是「补了 0 条」。
         self._note = note
+        # 图床链的顺序（uguu / chatglm / cliim 里开了哪几家），由配置决定。
+        self.hosting = tuple(hosting) if hosting is not None else HOSTING_ORDER
         self.proxy = proxy
         self.timeout = timeout
         self.retries = max(0, int(retries))
@@ -351,6 +484,24 @@ class LensEngine:
             self._note(message % args if args else message)
         except Exception:  # noqa: BLE001 - 日志写不出去不能影响检索
             pass
+
+    def _quota_deadline(self, session, key: str) -> float | None:
+        """问 SerpAPI 这把 key 什么时候重置额度。
+
+        免费档不是按自然月重置，而是各把 key 自己的开号日（实测两把是 11-22，
+        另一把是 11-28）。问不到就回 None，让上层按自然月兜底。
+        """
+        try:
+            resp = session.get(
+                SERP_ACCOUNT_ENDPOINT,
+                params={"api_key": key},
+                timeout=_timeout(self.timeout),
+            )
+            if resp.status_code != 200:
+                return None
+            return renewal_deadline(str(resp.json().get("plan_renewal_date") or ""))
+        except Exception:  # noqa: BLE001 - 查不到就按自然月算
+            return None
 
     def _pick_key(self) -> tuple[str, KeyPool]:
         """先拿 SerpAPI 的 key，它那边一个都拿不到才用 Serper 顶。"""
@@ -439,7 +590,7 @@ class LensEngine:
 
         session = make_session(self.proxy)
         try:
-            image_id = self._upload(session, key, raw)
+            image_id = self._upload(session, key, raw, pool)
             params = {"engine": "google_lens", "api_key": key, "type": "all"}
             if image_id:
                 params["image_id"] = image_id
@@ -455,15 +606,16 @@ class LensEngine:
             data = json_or_raise(resp, "SerpAPI")
             if data.get("error"):
                 message = str(data["error"])[:160]
-                low = message.lower()
-                if any(
-                    token in low
-                    for token in ("run out", "runout", "quota", "exceeded", "no searches", "searches left")
-                ):
-                    # 月额度跑完了：冷却几分钟救不回来，按自然月记住，别再每单撞一次。
-                    # s-20261114 那把 641968394@qq.com 的免费额度就是这样用完的。
-                    pool.mark_exhausted(key)
-                elif any(token in low for token in ("key", "plan", "limit")):
+                # 这一句是「Google 自己说没结果」，跟额度、key、代理都没关系，得留痕：
+                # 不然事后只看到 lens=0，分不清是没搜到还是被拦了。
+                self._say("Lens 这枪没结果：%s", message)
+                if _looks_like_quota(message):
+                    # 月额度跑完了：冷却几分钟救不回来，记到这把 key 自己的重置日，
+                    # 期间别再每单撞一次。重置日问账号接口，问不到才按自然月兜底。
+                    until = self._quota_deadline(session, key)
+                    pool.mark_exhausted(key, until=until)
+                    self._say("SerpAPI key …%s 额度已用完，%s 再启用", key[-4:], _until_text(until))
+                elif any(token in message.lower() for token in ("key", "plan", "limit")):
                     pool.mark_failure(key)
                 raise EngineError(message)
         except EngineError:
@@ -496,7 +648,7 @@ class LensEngine:
                 )
         return items
 
-    def _upload(self, session, key: str, raw: bytes) -> str:
+    def _upload(self, session, key: str, raw: bytes, pool: KeyPool | None = None) -> str:
         if len(raw) > SERP_UPLOAD_LIMIT:
             return ""
         try:
@@ -506,12 +658,35 @@ class LensEngine:
                 files={"image": ("upload.jpg", raw, "image/jpeg")},
                 timeout=_timeout(self.timeout),
             )
-            if resp.status_code >= 400:
-                return ""
-            payload = resp.json()
-            return str(payload.get("image_id") or "")
         except Exception:  # noqa: BLE001 - 上传失败就回退到按链接搜索
             return ""
+        if resp.status_code >= 400:
+            # 上传接口也会回 429「额度用完」和 401/403「key 无效」。以前一律当成
+            # 「图没传上去」，于是死 key 一直留在轮询里：3 把 key 死 2 把时，三分之二
+            # 的单 lens 都是 0，日志上还只写「图片上传失败」，事后根本查不出是额度
+            # 用完了（s-20261116-2147-a881）。这类失败必须认到 key 头上，并拒掉它，
+            # 让本轮直接换下一把。
+            body = (resp.text or "")[:200]
+            target = pool if pool is not None else self.pool
+            if _looks_like_quota(body):
+                until = self._quota_deadline(session, key)
+                target.mark_exhausted(key, until=until)
+                self._say(
+                    "SerpAPI key …%s 额度已用完（上传接口 HTTP %s），%s 再启用",
+                    key[-4:],
+                    resp.status_code,
+                    _until_text(until),
+                )
+                raise EngineError(f"SerpAPI key …{key[-4:]} 额度用完（HTTP {resp.status_code}）")
+            if is_auth_failure(resp.status_code):
+                target.mark_failure(key)
+                raise EngineError(f"SerpAPI 上传接口不认这把 key（HTTP {resp.status_code}）")
+            return ""
+        try:
+            payload = resp.json()
+        except Exception:  # noqa: BLE001
+            return ""
+        return str(payload.get("image_id") or "")
 
     def _search_serper(
         self,
@@ -529,7 +704,13 @@ class LensEngine:
         target = pool if pool is not None else self.pool
         link = str(image_url or "").strip()
         if not link.startswith("http"):
-            link = host_image_publicly(raw, self.proxy, self.timeout, note=self._say)
+            link = host_image_publicly(
+                raw,
+                self.proxy,
+                self.timeout,
+                note=self._say,
+                hosting=self.hosting,
+            )
             if not link:
                 raise EngineError("Serper Lens 需要公网图片链接，图床没换成")
         session = make_session(self.proxy)
