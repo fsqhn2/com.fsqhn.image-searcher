@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 from .engines import Candidate, downgrade_kind, is_avatar_hit
 from .extract import dead_site, is_avatar_image, is_forum_page, split_repost_title
 from .tasks import SearchOutcome, SearchTask
-from . import gallery, paywall
+from . import gallery, handles, paywall
 
 AI_FLAG_THRESHOLD = 0.75
 
@@ -26,20 +26,86 @@ def _is_x_platform(platform: str) -> bool:
     return text in {"x", "twitter", "x (twitter)"} or text.startswith("x (")
 
 
-def _ai_line(ai: dict | None) -> str:
-    if not ai:
-        return "🤖 AI 检测：未执行"
-    if not ai.get("ok"):
-        return f"🤖 AI 检测失败：{ai.get('error') or '未知原因'}"
-    score = ai.get("score")
+def _ai_probability_line(ai: dict | None) -> str:
+    """只给「AI 生成概率」那一行。
+
+    没搜到的卡片用它：结论后面紧跟着说清这张图大概是不是 AI 生成的，别让人再回
+    「更多」翻。没跑或跑失败时返回空串——那种情况下「未执行」写在结论里只是占地。
+    """
+    if not ai or not ai.get("ok"):
+        return ""
     try:
-        value = float(score)
+        value = float(ai.get("score"))
     except (TypeError, ValueError):
-        return "🤖 AI 检测：未返回有效分值"
+        return ""
     percent = value * 100
     if value >= AI_FLAG_THRESHOLD:
         return f"🤖 AI 生成概率：{percent:.0f}%（疑似 AI 生成）"
     return f"🤖 AI 生成概率：{percent:.1f}%（大概率真人拍摄）"
+
+
+# 付费图包与打包图站：fantia / Patreon / FANBOX 把图锁在订阅后面，4play、秀人
+# 这类整站就是把写真打包卖。落在这些站上的图，公开索引里不会有原帖——用户
+# 2026-11-19 要求没搜到时把这件事点明，免得以为换个引擎还能搜出来。
+PAID_PACK_HOSTS = (
+    "fantia.jp",
+    "patreon.com",
+    "fanbox.cc",
+    "dlsite.com",
+    "booth.pm",
+    "xiurenol.com",
+    "coser.love",
+    "cosppi.net",
+)
+
+
+def _paid_pack_host(url: str, platform: str = "") -> str:
+    """落在付费图包 / 打包图站时返回站名，否则空串。"""
+    host = _host_of(url) or str(platform or "")
+    host = host.strip().lower().removeprefix("www.")
+    if not host:
+        return ""
+    for token in PAID_PACK_HOSTS:
+        if host == token or host.endswith("." + token):
+            return token
+    return host if gallery.is_gallery_site(url, platform) else ""
+
+
+def _paid_pack_line(outcome: SearchOutcome) -> str:
+    """没搜到时补一句：候选落在付费图包页，公开索引里不会有原帖。
+
+    已经拿到她售卖页时不写——`_paywall_lines()` 已经把平台和链接摆出来了，
+    再说一遍是废话。
+    """
+    if outcome.paywall:
+        return ""
+    names: list[str] = []
+    for item in outcome.candidates:
+        host = _paid_pack_host(item.url or "", item.platform or "")
+        if host and host not in names:
+            names.append(host)
+    if not names:
+        return ""
+    shown = "、".join(names[:2])
+    rest = " 等" if len(names) > 2 else ""
+    return (
+        f"💸 有候选落在 {shown}{rest} 这种付费图包页，"
+        "这类图通常只在订阅里，公开索引没有原帖，换引擎也一样。"
+    )
+
+
+def _ai_line(ai: dict | None) -> str:
+    if not ai:
+        return "🤖 AI 检测：未执行"
+
+    if not ai.get("ok"):
+        return f"🤖 AI 检测失败：{ai.get('error') or '未知原因'}"
+    score = ai.get("score")
+    try:
+        float(score)
+    except (TypeError, ValueError):
+        return "🤖 AI 检测：未返回有效分值"
+    return _ai_probability_line(ai)
 
 
 def _route_line(outcome: SearchOutcome) -> str:
@@ -225,6 +291,74 @@ def _repost_author_lines(outcome: SearchOutcome, *, detail: bool = False) -> lis
         f"🔎 也翻过候选里 {names} 自己的带图帖和搜索，没找到这张{tail}；"
         "这几个号只看得到最近发的那批"
     ]
+
+
+def _author_split_text(info: dict) -> str:
+    """把「名字 + 账号」拆开讲：中文名和英文 id 常写在一起，混着看像一个人名。
+
+    拆的是**标题里那串原样名字**，不是最后对上的 X 号：标题「染三ran3」拆成名字
+    「染三」+ 账号「ran3」，而真正命中的号可能是 ``ran3ran3ran3``，拿它来当「拆出来
+    的账号」既跟标题对不上，下面 @ 那一句还要再重复一遍。
+    """
+    author = str(info.get("author") or "").strip()
+    if author:
+        name, handle = handles.split_author_name(author)
+        if name and handle and name != handle:
+            return f"标题写的是「{author}」，拆开是名字「{name}」+ 账号「{handle}」"
+        if name:
+            return f"标题里的名字是「{name}」"
+        if handle:
+            return f"标题里的账号是「{handle}」"
+        return f"标题里的名字是「{author}」"
+    name = str(info.get("name") or "").strip()
+    handle = str(info.get("handle") or "").strip().lstrip("@")
+    if name and handle and name != handle:
+        return f"拆开是名字「{name}」+ 账号「{handle}」"
+    if name:
+        return f"标题里的名字是「{name}」"
+    if handle:
+        return f"标题里的账号是「{handle}」"
+    return "标题里没有可用的名字"
+
+
+def _title_author_lines(outcome: SearchOutcome, *, detail: bool = False) -> list[str]:
+    """按转载站标题里的作者名找到的 X 号。
+
+    证据强度介于两头之间：不是「她帖子里有这张图」（那会换掉结论），而是「名字
+    对得上这个人」。所以单独写一行说明来历，并提醒用户自己核对。
+
+    名字和账号分两截说：很多人把中文名和英文 id 写在一起（「染三ran3」），
+    混成一句会被当成一个人名。走模型那条路时再补一句说明名字是哪来的，
+    免得以为还是规则切的。
+    """
+    info = outcome.title_author or {}
+    status = str(info.get("status") or "")
+    if status == "hit":
+        # 结论已经换成那条帖子了，账号在结论行里，这里不再重复。
+        return []
+    via_llm = str(info.get("via") or "") == "llm"
+    handle = str(info.get("handle") or "").strip().lstrip("@")
+    if status == "named" and handle:
+        display = str(info.get("x_name") or "").strip()
+        who = f"（显示名「{display}」）" if display else ""
+        lines = [
+            f"🔗 {_author_split_text(info)}；在 X 上对得上 @{handle}{who}：https://x.com/{handle}",
+            "她最近的带图帖里没翻到这张，可能发得更早或被删——点开自己核一下。",
+        ]
+        if via_llm:
+            lines.append("（名字是模型从页面标题／正文里读出来的，不是按分隔符硬切出来的）")
+        return lines
+    if status == "none" and detail:
+        variants = [str(item) for item in (info.get("variants") or []) if item]
+        if variants:
+            lines = [
+                f"🔎 {_author_split_text(info)}，试过 {'、'.join(variants[:4])}，"
+                "都对不上 X 上的显示名"
+            ]
+            if via_llm:
+                lines.append("（名字是模型从页面标题／正文里读出来的）")
+            return lines
+    return []
 
 
 def _x_identity_lines(outcome: SearchOutcome) -> list[str]:
@@ -612,6 +746,7 @@ def _best_block(outcome: SearchOutcome, *, skip_grok: bool = False, detail: bool
         extra.append(watermark)
     extra.extend(_x_identity_lines(outcome))
     extra.extend(_repost_author_lines(outcome, detail=detail))
+    extra.extend(_title_author_lines(outcome, detail=detail))
     extra.extend(_paywall_lines(outcome))
     extra.extend(_gallery_source_lines(outcome))
     if not skip_grok and GROK_QUIET_NOTE not in text:
@@ -823,18 +958,25 @@ def _conclusion_handle(outcome: SearchOutcome) -> str:
 
 
 def _gallery_source_lines(outcome: SearchOutcome) -> list[str]:
-    """图集站页面上自己标的来源账号。
+    """图集 / 泄露站页面上标的来源账号。
 
     站点把别人的 IG / X 内容搬下来打包，页面不是作者主页，但站方通常写着来源
     账号。这是「视觉判定同一人、落点却被降级」时唯一还能指向本人的线索：实测
     4play.to 的 meta 直接给了 ``instagram.com/menruinyanko``。站方也会标错，
     所以只当线索，必须让用户自己点开核对。
+
+    来源有两种：帖子页自己写的（``vision["sources"]``），以及从帖子页翻到发布者
+    主页再抽到的（``outcome.gallery_sources``，带 ``author_page``）。后者硬一些
+    ——那是站方给「这个主页属于谁」的链接，不是从标题里抄的。
     """
+    raw: list = []
     vision = outcome.vision or {}
-    raw = vision.get("sources")
-    if not isinstance(raw, list):
-        return []
+    if isinstance(vision.get("sources"), list):
+        raw.extend(vision["sources"])
+    if isinstance(outcome.gallery_sources, list):
+        raw.extend(outcome.gallery_sources)
     lines: list[str] = []
+    seen: set[tuple[str, str]] = set()
     for item in raw:
         if not isinstance(item, dict):
             continue
@@ -843,7 +985,18 @@ def _gallery_source_lines(outcome: SearchOutcome) -> list[str]:
         if not handle or not url:
             continue
         platform = str(item.get("platform") or "账号")
+        if (platform, handle) in seen:
+            continue
+        seen.add((platform, handle))
         site = str(item.get("site") or "").strip()
+        author_page = str(item.get("author_page") or "").strip()
+        if author_page:
+            where = site or "这个页面"
+            lines.append(
+                f"🔗 {where} 的发布者主页写着 {platform} @{handle}：{url}"
+                "（页面自己标的，点开核对一下）"
+            )
+            continue
         where = f"来自 {site} 页面" if site else "图集站页面"
         lines.append(f"🔎 {where}标的来源：{platform} @{handle}（站方标注，未必是作者本人）：{url}")
     if lines:
@@ -1018,6 +1171,10 @@ def _best_block_core(outcome: SearchOutcome, *, skip_grok: bool = False, detail:
                 lines.append(f"另有 {len(suspects)} 条是同角色或同款服装的图，不是这张照片本身，见参考区。")
         if outcome.total_candidates:
             lines.append(f"共收到 {outcome.total_candidates} 条结果，见参考区。")
+        # 候选落在付费图包页时点一句：这类图公开索引里本来就没有原帖。
+        paid_pack = _paid_pack_line(outcome)
+        if paid_pack:
+            lines.append(paid_pack)
         return "\n".join(lines)
     lines = _identity_lines(best, detail=detail)
     leak_line = _leak_line(best)
@@ -1307,6 +1464,28 @@ def _footer_lines(outcome: SearchOutcome, command: str, ttl_minutes: int, replay
     return lines
 
 
+def _footer_needs_upload(outcome: SearchOutcome, replay: bool) -> bool:
+    """页脚要不要补那张原图。"""
+    return bool(not replay and outcome.upload_b64 and outcome.image_source != "upload")
+
+
+def _footer_content(outcome: SearchOutcome, lines: list[str], replay: bool) -> list[dict]:
+    """页脚节点的内容：文字之后补一张本次搜索的原图。
+
+    群里一次连着好几单时，只看结论分不清这堆结果对应哪张图，所以把原图贴在
+    合并转发的最末尾。三种情况不补：
+    - 回「更多」（replay）：原图在首次回复里已经出现过，再发一遍只会更乱；
+    - 旧任务或按图缓存：原图不落盘，字段是空的；
+    - 没有可用候选图时（image_source == upload）：参考区那张本来就是原图。
+    """
+    content: list[dict] = [{"type": "text", "content": "\n".join(lines)}]
+    if not _footer_needs_upload(outcome, replay):
+        return content
+    content.append({"type": "text", "content": "🖼 本次搜索的原图（用来对照上面的结果）"})
+    content.append({"type": "image", "content": outcome.upload_b64})
+    return content
+
+
 def build_forward_nodes(
     task: SearchTask,
     *,
@@ -1390,12 +1569,11 @@ def build_forward_nodes(
 
     nodes.append(
         node(
-            [
-                {
-                    "type": "text",
-                    "content": "\n".join(_footer_lines(outcome, command, ttl_minutes, replay, task.task_id)),
-                }
-            ]
+            _footer_content(
+                outcome,
+                _footer_lines(outcome, command, ttl_minutes, replay, task.task_id),
+                replay,
+            )
         )
     )
 
@@ -1534,12 +1712,11 @@ def _tail_nodes(
 
     nodes.append(
         _node(
-            [
-                {
-                    "type": "text",
-                    "content": "\n".join(_footer_lines(outcome, command, ttl_minutes, replay, task.task_id)),
-                }
-            ],
+            _footer_content(
+                outcome,
+                _footer_lines(outcome, command, ttl_minutes, replay, task.task_id),
+                replay,
+            ),
             nickname,
             user_id,
         )
@@ -1704,7 +1881,18 @@ def build_miss_nodes(
     # 服务端，客户端却整条不渲染（s-20261115-2237-0365 的 22:20 与 22:43 两次，
     # 电脑端和手机端都看不见）。前面挂上任务编号，保证每张卡片的开头都不一样。
     headline = f"[{task.task_id}] {_miss_headline(outcome)}"
-    nodes: list[dict] = [_node([{"type": "text", "content": headline}], nickname, user_id)]
+    # 用户要求：没搜到的单子也把「AI 生成概率」直接摆在结论里，别让人回「更多」才看得到。
+    # 只多这一行——匹配路线、耗时这些仍然只留在「更多」。检测没跑或失败时不写。
+    first: list[dict] = [{"type": "text", "content": headline}]
+    ai_probability = _ai_probability_line(outcome.ai)
+    if ai_probability:
+        first.append({"type": "text", "content": ai_probability})
+    # 候选全落在付费图包 / 打包图站时，得说清这类图本来就没有公开原帖——
+    # 否则看着像「再搜一次就能搜到」。
+    paid_pack = _paid_pack_line(outcome)
+    if paid_pack:
+        first.append({"type": "text", "content": paid_pack})
+    nodes: list[dict] = [_node(first, nickname, user_id)]
     shown: set[str] = set()
     shown_urls: dict[str, str] = {}
 
@@ -1765,21 +1953,18 @@ def build_miss_nodes(
 
     nodes.append(
         _node(
-            [
-                {
-                    "type": "text",
-                    "content": "\n".join(
-                        _footer_lines(
-                            outcome,
-                            command,
-                            ttl_minutes,
-                            replay,
-                            task.task_id,
-                            reference_note=False,
-                        )
-                    ),
-                }
-            ],
+            _footer_content(
+                outcome,
+                _footer_lines(
+                    outcome,
+                    command,
+                    ttl_minutes,
+                    replay,
+                    task.task_id,
+                    reference_note=False,
+                ),
+                replay,
+            ),
             nickname,
             user_id,
         )
@@ -1808,16 +1993,21 @@ def build_result_forwards(
 
     if is_miss_layout(outcome):
         # 什么都没搜到：结论打头，然后每个引擎一条、视觉一条、Grok 一条。
-        return [
-            build_miss_nodes(
-                task,
-                command=command,
-                nickname=nickname,
-                ttl_minutes=ttl_minutes,
-                replay=replay,
-                user_id=user_id,
-            )
-        ]
+        nodes = build_miss_nodes(
+            task,
+            command=command,
+            nickname=nickname,
+            ttl_minutes=ttl_minutes,
+            replay=replay,
+            user_id=user_id,
+        )
+        # 页脚带原图时单独成块：这套排版本来就凑得满 6 张图（4 引擎 + 视觉 +
+        # Grok），再加一张原图就是 7 张，NapCat 会整条拒收、群里什么都看不到。
+        # 拆成两块后，发送层在图少时会自动合回一条，图多时页脚（连着原图）
+        # 单独一条跟上，原图始终跟页脚在一起。
+        if nodes and _footer_needs_upload(outcome, replay):
+            return [nodes[:-1], [nodes[-1]]]
+        return [nodes]
 
     blocks: list[list[dict]] = []
     vision = _vision_block(outcome)

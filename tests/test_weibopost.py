@@ -45,6 +45,30 @@ CARD_HTML = """<div class="card-wrap" action-type="feed_list_item" mid="53643946
 """
 
 
+class PageExcerptTest(unittest.TestCase):
+    """整页正文裁成一小段喂模型：开头留原样，后面只挑带署名和外链的行。"""
+
+    def test_keeps_head_and_signature_lines(self):
+        body = "\n".join(
+            [f"导航第{i}行" for i in range(30)]
+            + ["Photo by kuru", "回到顶部", "作者：染三ran3", "https://x.com/ran3ran3ran3", "推荐阅读"]
+        )
+        excerpt = weibopost.page_excerpt(body, limit=2000)
+        self.assertIn("导航第0行", excerpt)
+        self.assertIn("Photo by kuru", excerpt)
+        self.assertIn("作者：染三ran3", excerpt)
+        self.assertIn("x.com/ran3ran3ran3", excerpt)
+        # 纯导航行不该混进来
+        self.assertNotIn("推荐阅读", excerpt)
+
+    def test_respects_limit(self):
+        body = "\n".join(["x.com/foo"] * 50)
+        self.assertLessEqual(len(weibopost.page_excerpt(body, limit=300)), 300)
+
+    def test_empty_body(self):
+        self.assertEqual(weibopost.page_excerpt(""), "")
+
+
 class RepostPageTest(unittest.TestCase):
     def test_recognises_sina_repost_page(self):
         self.assertTrue(

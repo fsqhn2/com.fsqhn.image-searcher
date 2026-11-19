@@ -8,10 +8,20 @@
 
 from __future__ import annotations
 
+import json
 import re
 from urllib.parse import unquote
 
 _TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9_]{3,14}")
+
+# 转载站标题常写成「作者 - 作品名」，作者名就在第一个分隔符前面。
+# 方括号也算分隔：漏了开括号的标题（抓下来只剩「Cosplay] ran3」）要能从这里切开。
+_TITLE_SPLIT = re.compile(r"\s*[-–—|｜/／\]】]\s*")
+# 标题开头的分类标签：「[Cosplay] 染三ran3 - …」里的方括号是分类，不是作者。
+# 资源站常把开括号吃掉，只剩「Cosplay] 」，这种残留单独处理（见 _strip_title_tag）。
+_TITLE_TAG = re.compile(r"^\s*[\[\(【〔（][^\[\]\(\)【】〔〕（）]{0,24}[\]\)】〕）]\s*")
+_TITLE_TAG_TAIL = re.compile(r"^\s*([^\[\]\(\)【】〔〕（）\s]{1,24})[\]\)】〕）]\s*")
+_CJK = re.compile(r"[一-鿿]")
 
 # 平台名、通用词、角色/作品名、资源站常用词都不能当账号。漏掉的靠后面的
 # 「账号真的存在 + 粉丝量够 + 名字在标题里出现过」三道门槛兜。
@@ -41,6 +51,12 @@ _STOP = {
     "nothing", "something", "anything", "everything", "someone", "anyone",
     "design", "designs", "hide", "hidden", "apron", "princess", "femboy",
     "join", "joined", "joinme", "come", "shower", "swim", "suit", "bikini",
+    # 标题里的颜色和修饰词。实测 s-20261119-1722-fe9b 的标题「Cosplay] ran3 -
+    # Cure Nyammy black stockings purple staff」把 purple 当成了 X 号（@Purple，
+    # 4 万粉），跟这张图毫无关系。
+    "purple", "black", "white", "red", "blue", "green", "pink", "yellow",
+    "brown", "grey", "gray", "silver", "gold", "blonde", "dark", "light",
+    "long", "short", "small", "large", "cute", "beautiful", "pretty",
 }
 
 
@@ -250,6 +266,236 @@ def weibo_targets(texts: list[str], limit: int = 3) -> list[tuple[str, str]]:
         if len(found) >= max(1, limit):
             break
     return found[: max(1, limit)]
+
+
+def _strip_title_tag(value: str) -> str:
+    """剥掉标题开头的分类标签：``[Cosplay] ran3 - …`` → ``ran3 - …``。
+
+    完整成对的方括号一律当标签；只剩右括号的残留（``Cosplay] ran3``，开括号被
+    站点吃掉了）只在里面确实是分类词或纯数字时才剥，免得把真名字剥掉。
+    """
+    for _ in range(3):
+        stripped = _TITLE_TAG.sub("", value, count=1)
+        if stripped == value:
+            match = _TITLE_TAG_TAIL.match(value)
+            if match and (match.group(1).lower() in _STOP or match.group(1).isdigit()):
+                stripped = value[match.end() :]
+        if stripped == value:
+            break
+        value = stripped
+    return value.strip()
+
+
+def title_author(text: str) -> str:
+    """转载站标题里的作者名：剥掉分类标签后取第一个分隔符之前那段。
+
+    ``「染三ran3 - 露露卡[108P7V-1.23GB]」`` → ``「染三ran3」``；
+    ``「Cosplay] ran3 - Cure Nyammy black stockings…」`` → ``「ran3」``。这类资源站
+    习惯把作者写在最前面，后面跟作品名和体积；没有分隔符时只在标题够短的时候才当
+    名字，否则整句话里什么都可能是名字。剥出来的是分类词（``[Photo] ran3`` 剥成
+    ``Photo``）时不算，那只是标签没剥干净。
+    """
+    value = _strip_title_tag(str(text or "").strip())
+    if not value:
+        return ""
+    if not _TITLE_SPLIT.search(value):
+        # 没有分隔符就不猜：整句话里什么都可能是名字，交给署名抽取那条线去认。
+        return ""
+    head = _TITLE_SPLIT.split(value, 1)[0].strip()
+    if head.lower() in _STOP:
+        return ""
+    return head[:40]
+
+
+def split_author_name(value: str) -> tuple[str, str]:
+    """把「中文名 + 英文 id」拆成两截：``染三ran3`` → ``(染三, ran3)``。
+
+    很多人把显示名和账号写在一起（「染三ran3」「渔蛋Sakana」），抽出来一个整串的话，
+    展示时看着像个人名，其实里面一半是账号。纯中文返回 ``(名字, "")``；纯英文返回
+    ``("", 名字)``——单看一个 ASCII 名字分不清是显示名还是账号，交给后面「显示名
+    对得上」那一步判断。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return "", ""
+    ascii_part = re.sub(r"[^A-Za-z0-9_]+", "", text)
+    other = re.sub(r"[A-Za-z0-9_]+", "", text).strip()
+    if other and ascii_part and 2 <= len(ascii_part) <= 15:
+        return other, ascii_part
+    if other and not ascii_part:
+        return text, ""
+    return "", text if 2 <= len(text) <= 15 else ""
+
+
+def llm_author_reply(text: str) -> tuple[str, str, str]:
+    """解析模型回的那一句：作者名、其中的账号、其中的名字。
+
+    要求模型回 JSON：
+    ``{"author": "染三ran3", "name": "染三", "handle": "ran3"}``——
+    ``author`` 是页面里原样的名字，``name`` / ``handle`` 是把「中文名 + 英文 id」
+    拆开的结果（很多人把两截写在一起：「染三ran3」→ 染三 / ran3）。模型只给
+    ``author`` 时这里也会按 ASCII 段自己拆，别指望它每次都听话。
+
+    返回值 ``(author, handle, name)``；看不出来时三个都是空串。
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return "", "", ""
+    body = re.sub(r"^```[a-zA-Z]*|```$", "", raw).strip()
+    author = ""
+    handle = ""
+    name = ""
+    match = re.search(r"\{.*\}", body, re.S)
+    if match:
+        try:
+            data = json.loads(match.group(0))
+        except (ValueError, TypeError):
+            data = None
+        if isinstance(data, dict):
+            author = str(data.get("author") or data.get("full") or data.get("name") or "")
+            handle = str(data.get("handle") or data.get("account") or "")
+            name = str(data.get("name") or data.get("display") or data.get("cn") or "")
+            link = str(data.get("x") or data.get("x_handle") or data.get("link") or "")
+            # JSON 已经答了（哪怕都空）就以它为准，别再拿整段文字当名字。
+            return _finish_author(author, handle, name, link)
+    # 没给 JSON：按「字段：值」逐行认；没有字段名时只接受短得像名字的那一行。
+    for line in body.splitlines():
+        item = line.strip().lstrip("-*• ").strip()
+        if not item:
+            continue
+        field = re.match(
+            r"^(作者名?|author|名字|昵称|中文名|账号|handle|account|x|name)\s*[:：]\s*(.+)$", item, re.I
+        )
+        if field:
+            key = field.group(1).lower()
+            value = field.group(2)
+            if key in {"账号", "handle", "account", "x"}:
+                handle = handle or value
+            elif key in {"名字", "昵称", "中文名", "name"}:
+                name = name or value
+            else:
+                author = author or value
+            continue
+        if not author and _looks_like_name(item):
+            author = item
+    return _finish_author(author, handle, name)
+
+
+def _finish_author(author: str, handle: str, name: str, link: str = "") -> tuple[str, str, str]:
+    """清理三个字段，并在模型没拆时用原串自己拆一遍。
+
+    ``link`` 是页面里直接写到的 X 账号，比从名字里拆出来的可靠，有就用它。
+    """
+    author = _clean_author(author)
+    handle = _clean_handle(handle)
+    name = _clean_author(name)
+    split_name, split_handle = split_author_name(author or name)
+    if not name:
+        name = split_name
+    if not handle:
+        handle = split_handle
+    linked = _clean_handle(_link_handle(link))
+    if linked:
+        handle = linked
+    return author, handle, name
+
+
+def _link_handle(value: str) -> str:
+    """从「x.com/xxx」「@xxx」「https://twitter.com/xxx」里取出裸账号。"""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    found = re.search(r"(?:x|twitter)\.com/([A-Za-z0-9_]{2,15})", text, re.I)
+    if found:
+        return found.group(1)
+    return text
+
+
+# 模型爱解释。整段文字里出现这些词，就不是名字，是它在说「看不出来」。
+_SENTENCE_HINTS = re.compile(
+    r"(没有|无法|抱歉|不确定|不知道|看不出|标题里|无法判断|请|我猜|应该是|可能是|looks|sorry|cannot|unable)",
+    re.I,
+)
+
+
+def _looks_like_name(value: str) -> bool:
+    """没有 JSON、也没有「作者：」前缀时，判断这一行像不像名字。
+
+    ``染三ran3`` 像；``这个标题里没有写作者`` 不像——那是模型在解释。
+    """
+    text = str(value or "").strip()
+    if not (2 <= len(text) <= 24):
+        return False
+    if _SENTENCE_HINTS.search(text):
+        return False
+    if re.search(r"[\s。，、；：！？!?;:，,]", text):
+        return False
+    return True
+
+
+_EMPTY_REPLY = {"", "none", "null", "n/a", "na", "unknown", "-", "无", "未知", "空", "没有", "看不出来", "不确定"}
+
+
+def _clean_author(value: str) -> str:
+    text = str(value or "").strip().strip("\"'“”「」『』` ")
+    text = text.lstrip("@").strip()
+    text = re.sub(r"^(?:作者|author)\s*[:：]\s*", "", text, flags=re.I)
+    text = text.strip("\"'“”「」『』` 。，,；;")
+    if text.lower() in _EMPTY_REPLY:
+        return ""
+    # 模型爱补一句解释（「染三ran3（X 上叫 ran3ran3ran3）」），只留括号前那截。
+    text = re.split(r"[（(]|，|,|（?即|也就是", text)[0].strip()
+    if len(text) < 2 or len(text) > 40:
+        return ""
+    return text
+
+
+def _clean_handle(value: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9_]+", "", str(value or ""))
+    if not (3 <= len(text) <= 15):
+        return ""
+    if text.lower() in _STOP:
+        return ""
+    return text
+
+
+def x_variants(name: str, limit: int = 6) -> list[str]:
+    """把名字展开成可能的 X 账号：重复拼接是最常见的取名法。
+
+    实测 s-20261119-1703-0c5b 的标题是「染三ran3」，正主账号就是
+    ``ran3ran3ran3``（显示名「染三 ran3」）；直接拿 ``ran3`` 去查只查到一个
+    1 粉的空号。所以同一个名字要试单写、二连、三连，再加上下划线拼法。
+
+    只留 ASCII 那截：中文部分在 X 的显示名里，不可能是 handle。
+    """
+    ascii_part = re.sub(r"[^A-Za-z0-9_]+", "", str(name or ""))
+    found: list[str] = []
+    if len(ascii_part) >= 3 and ascii_part.lower() not in _STOP:
+        for times in (1, 2, 3):
+            candidate = ascii_part * times
+            if 3 <= len(candidate) <= 15 and candidate.lower() not in {item.lower() for item in found}:
+                found.append(candidate)
+        for joined in (f"{ascii_part}_{ascii_part}", f"{ascii_part}{ascii_part}_"):
+            if len(joined) <= 15 and joined.lower() not in {item.lower() for item in found}:
+                found.append(joined)
+    return found[:limit]
+
+
+def name_matches(author: str, display: str) -> bool:
+    """标题里的名字和 X 显示名对不对得上。
+
+    ``「染三ran3」`` 对 ``「染三 ran3」`` 算对上；对 ``「あんらん」`` 不算。
+    去空格后互相包含即可——中文名和英文名分开写时，两边都要出现。
+    """
+    left = re.sub(r"\s+", "", str(author or "")).lower()
+    right = re.sub(r"\s+", "", str(display or "")).lower()
+    if len(left) < 3 or not right:
+        return False
+    if left in right or right in left:
+        return True
+    cjk = _CJK.sub("", left)
+    latin = re.sub(r"[^a-z0-9_]", "", left)
+    return bool(cjk and latin and cjk in right and latin in right)
 
 
 def stem(handle: str) -> str:

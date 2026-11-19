@@ -942,5 +942,215 @@ class HostingChainConfigTest(unittest.TestCase):
         self.assertEqual(config.order(), ())
 
 
+class TitleAuthorLlmSwitchTest(unittest.TestCase):
+    """「从转载页标题里抽作者名」这一步：开关开着问模型，关着走固定规则。"""
+
+    def _plugin(self, enabled: bool):
+        module = import_plugin()
+        plugin = object.__new__(module.ImageSearcherPlugin)
+        config = mock.Mock()
+        config.title_author.enabled = enabled
+        config.title_author.task = "utils"
+        config.title_author.model = ""
+        config.title_author.timeout = 60
+        return module, plugin, config
+
+    def _best(self, module):
+        best = module.Candidate(
+            engine="yandex",
+            url="https://xx.knit.bid/en/article/32501/",
+            title="Cosplay] ran3 - Cure Nyammy black stockings purple staff ...",
+            source="xx.knit.bid",
+            platform="xx.knit.bid",
+            status="match",
+            distance=0,
+        )
+        best.name = "Cosplay] ran3 - Cure Nyammy black stockings purple staff ..."
+        best.finalize()
+        return best
+
+    def _run(self, plugin, module, config, best, answer):
+        async def ask(self, item):
+            return answer
+
+        with (
+            mock.patch.object(module.ImageSearcherPlugin, "_vlog", lambda *a, **k: None),
+            mock.patch.object(module.ImageSearcherPlugin, "_ask_title_author", ask),
+            mock.patch.object(module.ImageSearcherPlugin, "config", config, create=True),
+        ):
+            return asyncio.run(plugin._title_author_candidates(best))
+
+    def test_llm_answer_wins_and_handle_comes_first(self) -> None:
+        module, plugin, config = self._plugin(True)
+        best = self._best(module)
+        author, variants, via, name = self._run(
+            plugin, module, config, best, ("染三ran3", "ran3ran3ran3", "染三")
+        )
+        self.assertEqual(via, "llm")
+        self.assertEqual(author, "染三ran3")
+        self.assertEqual(name, "染三")
+        # 模型直接给的号排在规则展开的前面，避免先白查一遍 ran3、ran3ran3
+        self.assertEqual(variants[0], "ran3ran3ran3")
+        self.assertIn("ran3", variants)
+
+    def test_llm_says_no_author_stops_here(self) -> None:
+        """模型明确说标题里没作者时，不再拿规则硬抽。"""
+        module, plugin, config = self._plugin(True)
+        best = self._best(module)
+        author, variants, via, name = self._run(plugin, module, config, best, ("", "", ""))
+        self.assertEqual(via, "llm")
+        self.assertEqual(variants, [])
+
+    def test_timeout_falls_back_to_rules(self) -> None:
+        """模型没回（None）就退回规则，规则剥掉分类标签后是 ran3。"""
+        module, plugin, config = self._plugin(True)
+        best = self._best(module)
+        author, variants, via, name = self._run(plugin, module, config, best, None)
+        self.assertEqual(via, "rule")
+        self.assertEqual(author, "ran3")
+        self.assertEqual(name, "")
+        self.assertIn("ran3ran3ran3", variants)
+
+    def test_switch_off_never_calls_the_model(self) -> None:
+        module, plugin, config = self._plugin(False)
+        best = self._best(module)
+        called: list[object] = []
+
+        async def ask(self, item):
+            called.append(item)
+            return ("不该被调用", "", "")
+
+        with (
+            mock.patch.object(module.ImageSearcherPlugin, "_vlog", lambda *a, **k: None),
+            mock.patch.object(module.ImageSearcherPlugin, "_ask_title_author", ask),
+            mock.patch.object(module.ImageSearcherPlugin, "config", config, create=True),
+        ):
+            author, variants, via, name = asyncio.run(plugin._title_author_candidates(best))
+        self.assertEqual(called, [])
+        self.assertEqual(via, "rule")
+        self.assertIn("ran3ran3ran3", variants)
+
+    def test_default_section_is_on_with_utils(self) -> None:
+        """默认开着，任务组是 MaiBot 自带的 utils。"""
+        module = import_plugin()
+        section = module.TitleAuthorConfig()
+        self.assertTrue(section.enabled)
+        self.assertEqual(section.task, "utils")
+        self.assertEqual(section.model, "")
+
+    def test_page_body_goes_into_the_prompt(self) -> None:
+        """模型不联网，光给 URL 没用：页面正文里的署名要一起递过去。"""
+        module, plugin, config = self._plugin(True)
+        captured: dict = {}
+
+        async def call(name, **kwargs):
+            captured.update(kwargs)
+            return {"success": True, "response": '{"author": "ran3", "handle": "ran3ran3ran3"}'}
+
+        plugin_ctx = mock.Mock()
+        plugin_ctx.call_capability = call
+
+        async def fetch(self, url):
+            return "<html><body><p>导航</p><p>Photo by ran3</p><p>x.com/ran3ran3ran3</p></body></html>"
+
+        with (
+            mock.patch.object(module.ImageSearcherPlugin, "_vlog", lambda *a, **k: None),
+            mock.patch.object(module.ImageSearcherPlugin, "_fetch_page_html", fetch),
+            mock.patch.object(module.ImageSearcherPlugin, "config", config, create=True),
+            mock.patch.object(module.ImageSearcherPlugin, "ctx", plugin_ctx, create=True),
+        ):
+            answer = asyncio.run(plugin._ask_title_author(self._best(module)))
+
+        self.assertEqual(answer, ("ran3", "ran3ran3ran3", ""))
+        self.assertIn("Photo by ran3", captured["prompt"])
+        self.assertIn("x.com/ran3ran3ran3", captured["prompt"])
+        self.assertEqual(captured["task_name"], "utils")
+        # 纯文本任务用字符串 prompt，不是多模态的消息数组
+        self.assertIsInstance(captured["prompt"], str)
+
+    def test_page_fetch_failure_still_asks(self) -> None:
+        """页面抓不到（403/超时）时只凭标题问，不能整步跳过。"""
+        module, plugin, config = self._plugin(True)
+        captured: dict = {}
+
+        async def call(name, **kwargs):
+            captured.update(kwargs)
+            return {"success": True, "response": '{"author": "ran3", "handle": ""}'}
+
+        plugin_ctx = mock.Mock()
+        plugin_ctx.call_capability = call
+
+        async def fetch(self, url):
+            return ""
+
+        with (
+            mock.patch.object(module.ImageSearcherPlugin, "_vlog", lambda *a, **k: None),
+            mock.patch.object(module.ImageSearcherPlugin, "_fetch_page_html", fetch),
+            mock.patch.object(module.ImageSearcherPlugin, "config", config, create=True),
+            mock.patch.object(module.ImageSearcherPlugin, "ctx", plugin_ctx, create=True),
+        ):
+            answer = asyncio.run(plugin._ask_title_author(self._best(module)))
+
+        self.assertEqual(answer, ("ran3", "ran3", ""))
+        self.assertIn("Cosplay] ran3", captured["prompt"])
+        # 抓不到页面就不带正文那一段（规则里「优先看页面正文…」这句是固定文案，不算）
+        self.assertNotIn("页面正文（去掉标签后的纯文字", captured["prompt"])
+
+
+class ProfileLookupRetryTest(unittest.TestCase):
+    """查 X 账号资料失败时：404 直接收手，429／5xx 重试一次，失败要留日志。"""
+
+    class _Response:
+        def __init__(self, code: int, payload: dict | None = None) -> None:
+            self.status_code = code
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+    def _run(self, responses):
+        module = import_plugin()
+        plugin = object.__new__(module.ImageSearcherPlugin)
+        seen: list[str] = []
+        queue = list(responses)
+
+        class Session:
+            def get(self, url, timeout=0):
+                seen.append(url)
+                return queue.pop(0) if queue else ProfileLookupRetryTest._Response(500)
+
+            def close(self):
+                pass
+
+        config = mock.Mock()
+        config.plugin.proxy = ""
+        with (
+            mock.patch.object(module.ImageSearcherPlugin, "config", config, create=True),
+            mock.patch.object(module.ImageSearcherPlugin, "_vlog", lambda *a, **k: None),
+            mock.patch.object(module.ImageSearcherPlugin, "_PROFILE_RETRY_DELAY", 0),
+            mock.patch.object(module, "make_session", lambda proxy: Session()),
+        ):
+            user = asyncio.run(plugin._profile("ran3ran3ran3"))
+        return user, seen
+
+    def test_retries_once_after_server_error(self):
+        """9aa1 那单四个变体全静默返回空，才需要靠重试兜住一次抖动。"""
+        user, seen = self._run(
+            [self._Response(429), self._Response(200, {"user": {"name": "染三 ran3"}})]
+        )
+        self.assertEqual(user, {"name": "染三 ran3"})
+        self.assertEqual(len(seen), 2)
+
+    def test_404_is_not_retried(self):
+        user, seen = self._run([self._Response(404)])
+        self.assertIsNone(user)
+        self.assertEqual(len(seen), 1)
+
+    def test_gives_up_after_second_failure(self):
+        user, seen = self._run([self._Response(502), self._Response(503)])
+        self.assertIsNone(user)
+        self.assertEqual(len(seen), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

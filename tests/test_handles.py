@@ -388,3 +388,127 @@ class WeiboClueTest(unittest.TestCase):
         self.assertEqual(handles.at_names(["轻颜 / @青生w"]), ["青生w"])
         self.assertTrue(handles.has_cjk("青生w"))
         self.assertFalse(handles.has_cjk("kuru_xox"))
+
+
+class TitleAuthorTest(unittest.TestCase):
+    """转载站标题里的作者名，以及它能展开成哪些 X 账号。"""
+
+    def test_author_is_the_part_before_the_title_separator(self):
+        self.assertEqual(
+            handles.title_author("染三ran3 - 露露卡[108P7V-1.23GB]"), "染三ran3"
+        )
+        self.assertEqual(handles.title_author("Vivian | cosplay"), "Vivian")
+
+    def test_sentence_without_separator_is_not_a_name(self):
+        """没有「作者 - 作品」这种分隔就不猜：整句里什么都可能是名字。"""
+        self.assertEqual(
+            handles.title_author("求这张图出处有没有大佬知道这个coser是谁谢谢"), ""
+        )
+        self.assertEqual(handles.title_author("染三ran3"), "")
+
+    def test_variants_expand_by_repetition(self):
+        self.assertEqual(
+            handles.x_variants("染三ran3"), ["ran3", "ran3ran3", "ran3ran3ran3", "ran3_ran3", "ran3ran3_"]
+        )
+
+    def test_variants_skip_short_or_long_ascii(self):
+        self.assertEqual(handles.x_variants("染三"), [])
+        self.assertEqual(handles.x_variants("a" * 16), [])
+
+    def test_display_name_must_match(self):
+        """`ran3` 那个号也存在，但显示名是「あんらん」，不能认。"""
+        self.assertTrue(handles.name_matches("染三ran3", "染三 ran3"))
+        self.assertFalse(handles.name_matches("染三ran3", "あんらん"))
+        self.assertTrue(handles.name_matches("Vivian", "vivian cos"))
+        self.assertFalse(handles.name_matches("Vivian", ""))
+
+    def test_leading_category_tag_is_not_the_author(self):
+        """s-20261119-1722-fe9b：标题「Cosplay] ran3 - …」，开括号被站点吃掉了。
+
+        改之前抽到「Cosplay] ran3」，展开成 ``Cosplayran3``，当然查不到人；
+        剥掉分类标签后是 ``ran3``，三连就是 ``ran3ran3ran3``。
+        """
+        title = "Cosplay] ran3 - Cure Nyammy black stockings purple staff ..."
+        self.assertEqual(handles.title_author(title), "ran3")
+        self.assertIn("ran3ran3ran3", handles.x_variants(handles.title_author(title)))
+        self.assertEqual(
+            handles.title_author("[Cosplay] ran3 - Cure Nyammy"), "ran3"
+        )
+        self.assertEqual(
+            handles.title_author("【Cosplay】染三ran3 - 露露卡[108P7V-1.23GB]"), "染三ran3"
+        )
+
+    def test_trailing_bracket_splits_title(self):
+        """方括号也当分隔符：``[18+] KURU / Seia cosplay`` 要取到 KURU。"""
+        self.assertEqual(handles.title_author("[18+] KURU / Seia cosplay"), "KURU")
+        self.assertEqual(handles.title_author("[Photo] maonu164196 - Cure Nyammy"), "maonu164196")
+
+    def test_category_word_is_not_a_name(self):
+        """标签没剥干净、只剩分类词时不算名字，省得白跑几个请求。"""
+        self.assertEqual(handles.title_author("[Cosplay] Cosplay - something"), "")
+        self.assertEqual(handles.x_variants("Cosplay"), [])
+
+
+class LlmAuthorReplyTest(unittest.TestCase):
+    """把「抽作者名」这一步交给模型时，模型那句话怎么解析。
+
+    返回的是 (author, handle, name)：author 是原样整串（比对显示名用它），
+    handle 是账号那半截，name 是名字那半截——「染三ran3」这种人名和账号黏在
+    一起的写法，必须拆开。
+    """
+
+    def test_json_reply(self):
+        self.assertEqual(
+            handles.llm_author_reply('{"author": "染三ran3", "handle": "ran3ran3ran3"}'),
+            ("染三ran3", "ran3ran3ran3", "染三"),
+        )
+
+    def test_name_and_handle_are_split(self):
+        """中文名 + 英文 id 写在一起时，模型拆没拆都能得到两截。"""
+        self.assertEqual(
+            handles.llm_author_reply(
+                '{"author": "染三ran3", "name": "染三", "handle": "ran3"}'
+            ),
+            ("染三ran3", "ran3", "染三"),
+        )
+        self.assertEqual(handles.split_author_name("渔蛋Sakana"), ("渔蛋", "Sakana"))
+        self.assertEqual(handles.split_author_name("染三"), ("染三", ""))
+        self.assertEqual(handles.split_author_name("Vivian"), ("", "Vivian"))
+
+    def test_page_x_link_wins_over_guessed_handle(self):
+        """页面里直接写了 x.com/xxx 时以它为准，别用名字里拆出来的那截。"""
+        self.assertEqual(
+            handles.llm_author_reply(
+                '{"author": "染三ran3", "handle": "ran3", "x": "https://x.com/ran3ran3ran3"}'
+            ),
+            ("染三ran3", "ran3ran3ran3", "染三"),
+        )
+
+    def test_fenced_json_reply(self):
+        """小模型爱包一层代码围栏。"""
+        self.assertEqual(
+            handles.llm_author_reply('```json\n{"author": "ran3", "handle": ""}\n```'),
+            ("ran3", "ran3", ""),
+        )
+
+    def test_labelled_lines(self):
+        self.assertEqual(
+            handles.llm_author_reply("作者：染三ran3\n账号：ran3ran3ran3"),
+            ("染三ran3", "ran3ran3ran3", "染三"),
+        )
+
+    def test_bare_name_line(self):
+        self.assertEqual(handles.llm_author_reply("染三ran3"), ("染三ran3", "ran3", "染三"))
+
+    def test_bare_sentence_is_not_a_name(self):
+        """模型解释一句「标题里没有写作者」，不能把这句当名字去展开变体。"""
+        self.assertEqual(handles.llm_author_reply("这个标题里没有写作者"), ("", "", ""))
+        self.assertEqual(handles.llm_author_reply("抱歉，看不出来"), ("", "", ""))
+
+    def test_explicit_empty_json_means_no_author(self):
+        """模型明确回空对象要当「页面里没作者」，不能退回把整段当名字。"""
+        self.assertEqual(handles.llm_author_reply('{"author": "", "handle": ""}'), ("", "", ""))
+        self.assertEqual(handles.llm_author_reply('{"author": null, "handle": null}'), ("", "", ""))
+
+    def test_parenthetical_explanation_is_dropped(self):
+        self.assertEqual(handles.llm_author_reply("作者名：ran3（X 上叫 ran3ran3ran3）")[0], "ran3")

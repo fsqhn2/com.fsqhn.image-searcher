@@ -122,3 +122,53 @@ class SourceAccountTest(unittest.TestCase):
     def test_garbage_and_empty(self):
         self.assertEqual(gallery.parse_source_accounts("", "https://4play.to/x"), [])
         self.assertEqual(gallery.parse_source_accounts("<html>nothing</html>", "https://4play.to/x"), [])
+
+
+class AuthorPageTest(unittest.TestCase):
+    """落点是泄露站时，翻一层「帖子页 → 发布者主页」找作者账号。"""
+
+    POST_URL = "https://picazor.com/en/maonu164196-1/48"
+
+    def test_author_page_is_the_parent_path(self):
+        html = '<a href="/en/maonu164196-1">Maonu164196</a><a href="/en/hot">hot</a>'
+        self.assertEqual(
+            gallery.author_page_url(html, self.POST_URL),
+            "https://picazor.com/en/maonu164196-1",
+        )
+
+    def test_missing_parent_link_returns_empty(self):
+        html = '<a href="/en/hot">hot</a><a href="/en/top">top</a>'
+        self.assertEqual(gallery.author_page_url(html, self.POST_URL), "")
+
+    def test_other_hosts_are_not_taken_as_author_page(self):
+        html = '<a href="https://other.example/en/maonu164196-1">x</a>'
+        self.assertEqual(gallery.author_page_url(html, self.POST_URL), "")
+
+    def test_picazor_counts_as_author_page_site(self):
+        self.assertTrue(gallery.is_author_page_site(self.POST_URL))
+        self.assertTrue(gallery.is_author_page_site("", "picazor.com"))
+        self.assertFalse(gallery.is_author_page_site("https://4play.to/a/1"))
+        self.assertFalse(gallery.is_author_page_site("https://notpicazor.com/a/1"))
+
+    def test_social_link_on_author_page_counts_once(self):
+        """主页上的 X 链接只出现一次也要认：那是作者信息区块，不是噪声。"""
+        html = """
+        <html><head><title>Maonu164196 | Picazor</title></head>
+        <body>
+        <a href="https://picazor.com/en/maonu164196-1">home</a>
+        <a href="https://x.com/maonu164196">X</a>
+        </body></html>
+        """
+        found = gallery.author_from_author_page(html, "https://picazor.com/en/maonu164196-1")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["platform"], "X")
+        self.assertEqual(found[0]["handle"], "maonu164196")
+        self.assertEqual(found[0]["url"], "https://x.com/maonu164196")
+        self.assertTrue(found[0]["from_author_page"])
+
+    def test_author_page_without_social_link(self):
+        html = '<a href="https://picazor.com/en/maonu164196-1">home</a>'
+        self.assertEqual(
+            gallery.author_from_author_page(html, "https://picazor.com/en/maonu164196-1"), []
+        )
+

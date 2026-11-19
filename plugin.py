@@ -65,7 +65,14 @@ from .core.extract import (
     x_page_kind,
     x_title_name,
 )
-from .core.gallery import is_gallery_site, is_repost_site, parse_source_accounts
+from .core.gallery import (
+    author_from_author_page,
+    author_page_url,
+    is_author_page_site,
+    is_gallery_site,
+    is_repost_site,
+    parse_source_accounts,
+)
 from .core import weibopost
 from .core.hashing import dhash, hamming, prepare_upload
 from .core.httpclient import (
@@ -747,6 +754,52 @@ class GrokConfig(PluginConfigBase):
     )
 
 
+class TitleAuthorConfig(PluginConfigBase):
+    """转载站标题里的作者名：交给 LLM 抽，还是用固定规则抽。"""
+
+    __ui_label__ = "转载页作者名（LLM 抽取）"
+    __ui_icon__ = "user-search"
+    __ui_order__ = 11
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            "指纹命中落在搬运站、图集站时，第一步要从页面标题里认出作者名（「染三ran3 - 作品名」"
+            "→ 「染三ran3」），再展开成几个候选 X 账号去核。老办法是固定规则：剥掉开头的分类标签、"
+            "按分隔符切第一段。资源站标题写法太杂（分类标签、语言标签、体积、多语言混排），"
+            "规则总有漏的。打开后这一步改问一次 MaiBot 的文本模型，让它读出作者名和可能的账号。"
+            "模型没回、超时或答复解析不了时，自动退回老规则，不会因为这一步失败就没结果。"
+        ),
+        json_schema_extra=_ui(
+            "用 LLM 抽作者名",
+            "默认开。只换「从标题里抽出作者名」这一步，后面照样要显示名对得上、翻到本人带图帖才算命中。",
+        ),
+    )
+    task: str = Field(
+        default="utils",
+        description=(
+            "用哪个模型任务组。默认 utils——MaiBot 自带的文本小任务组，速度快、成本低，"
+            "抽个名字不需要推理模型。"
+        ),
+        json_schema_extra=_ui("模型任务组", "默认 utils。填任务组名，不是模型名。", placeholder="utils"),
+    )
+    model: str = Field(
+        default="",
+        description="指定具体模型，留空表示按任务组顺序挑（推荐留空）。",
+        json_schema_extra=_ui("指定模型", "默认留空，按任务组顺序。只有组里靠前的模型抽不好时才点名。"),
+    )
+    timeout: int = Field(
+        default=60,
+        description=(
+            "最多等多少秒。这个时长包含排队：宿主管道忙的时候，一次文本请求也要等十几秒才轮到。"
+            "超时就退回老规则，整单照常出结果。"
+        ),
+        json_schema_extra=_ui("超时（秒）", "默认 60，含排队。超时自动退回规则抽取。"),
+        ge=10,
+        le=180,
+    )
+
+
 class PluginSectionConfig(PluginConfigBase):
     """插件基础配置。"""
 
@@ -1101,6 +1154,7 @@ class ImageSearcherConfig(PluginConfigBase):
     vision: VisionConfig = Field(default_factory=VisionConfig)
     grok: GrokConfig = Field(default_factory=GrokConfig)
     ai_detect: AiDetectConfig = Field(default_factory=AiDetectConfig)
+    title_author: TitleAuthorConfig = Field(default_factory=TitleAuthorConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -2428,6 +2482,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
         # 同一张图落在普通网页上（搬运站/图集页，页面上没有账号）时别停在那儿：
         # 候选里出现过的 X 号挨个翻一遍，谁自己的帖子里有这张图谁就是结论。
         repost_author: dict[str, Any] | None = None
+        title_author: dict[str, Any] | None = None
         if (
             upload
             and best is not None
@@ -2437,12 +2492,22 @@ class ImageSearcherPlugin(MaiBotPlugin):
             and bool(getattr(config.vision, "repost_author", True))
         ):
             try:
-                repost_author = await self._hunt_repost_author(ordered, best, upload)
-            except Exception as error:  # noqa: BLE001 - 翻不到不影响已经命中的那条
-                self.ctx.logger.warning("搬运站转贴反查失败：%s", error)
-                repost_author = None
-            if repost_author and repost_author.get("status") == "hit":
-                best = self._promote_repost_author(best, repost_author)
+                title_author = await self._hunt_title_author(best, upload)
+            except Exception as error:  # noqa: BLE001 - 按名字找不到不影响已命中的那条
+                self.ctx.logger.warning("标题作者反查失败：%s", error)
+                title_author = None
+            if title_author and title_author.get("status") == "hit":
+                best = self._promote_repost_author(best, title_author)
+            elif title_author is None or title_author.get("status") != "named":
+                # 标题里没名字、或名字压根没对上号时，再退回翻候选里那几个 X 号。
+                # 名字已经对上一个号（named）就不用翻了——那才是本人的号。
+                try:
+                    repost_author = await self._hunt_repost_author(ordered, best, upload)
+                except Exception as error:  # noqa: BLE001 - 翻不到不影响已经命中的那条
+                    self.ctx.logger.warning("搬运站转贴反查失败：%s", error)
+                    repost_author = None
+                if repost_author and repost_author.get("status") == "hit":
+                    best = self._promote_repost_author(best, repost_author)
         # 结论里的账号核一下死活：被封的号 handle 会被释放，只剩数字 ID 能对上人。
         best = await self._check_best_account(best, vision_info)
 
@@ -2471,6 +2536,12 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 author = best.handle.strip().lstrip("@")
                 if self._is_x(best) and "/status/" in (best.url or ""):
                     post_url = best.url
+            elif (title_author or {}).get("handle"):
+                # 标题里认出的号「名字对得上、但她最近的带图帖里没有这张图」（named）：
+                # 图包里的图本来就不会公开发，拿这个号继续查她主页挂的 Patreon／FANBOX，
+                # 才可能落到「这是哪一期」上。9aa1 那单就卡在这里——人已经认出来了，
+                # 却因为结论还停在搬运站，整段付费页反查没跑。
+                author = str((title_author or {}).get("handle") or "").strip().lstrip("@")
             elif (grok_info or {}).get("tier") == "post":
                 author = str((grok_info or {}).get("handle") or "").strip().lstrip("@")
                 post_url = str((grok_info or {}).get("post_url") or "")
@@ -2605,6 +2676,16 @@ class ImageSearcherPlugin(MaiBotPlugin):
                     },
                 )
 
+        # 结论落在 picazor 这类站时，帖子页本身没有账号，但挂着发布者主页，
+        # 主页上直接写着作者的 X：翻这一层把它捞回来。s-20261119-1605-e790 就是
+        # 停在「平台：picazor.com」没有下文，而 @maonu164196 一直在那页上。
+        gallery_sources: list[dict[str, Any]] = []
+        if best is not None and best.url and is_author_page_site(best.url, best.platform):
+            try:
+                gallery_sources = await self._gallery_sources([best], author_pages=True)
+            except Exception as error:  # noqa: BLE001 - 翻不到只少一条线索
+                self.ctx.logger.warning("发布者主页反查失败：%s", error)
+
         # 付费内容线索：搬运站和泄露站按名字建页，有页就说明这个人确实在做
         # OnlyFans。它同样不改 best，只多给一个可以核对的号。
         paid_info: dict[str, Any] | None = None
@@ -2676,10 +2757,23 @@ class ImageSearcherPlugin(MaiBotPlugin):
             same_person=same_person_info,
             x_identity=x_identity,
             repost_author=repost_author,
+            title_author=title_author,
             weibo=weibo_clue,
             role_hint=role_hint,
             paywall=paywall_info,
+            gallery_sources=gallery_sources,
         )
+
+        # 合并转发的页尾要再贴一次原图：群里连着收到好几单时，只看结论分不清
+        # 这堆结果对应哪张图。只留内存不落盘——原图体积大，回「更多」和重放时
+        # 也不会重复发。压解不开就干脆没有，页尾少一行而已。
+        if upload:
+            try:
+                compact, _ = prepare_upload(upload, limit=1_200_000, as_jpeg=True)
+            except Exception:  # noqa: BLE001 - 压不动就不给页尾原图
+                compact = b""
+            if compact:
+                outcome.upload_b64 = base64.b64encode(compact).decode("ascii")
 
         if grok_hit and best is None and upload:
             # Grok 给的帖子不在候选池里。核对时距离最近的那张最有用——用户可以直接
@@ -3209,20 +3303,27 @@ class ImageSearcherPlugin(MaiBotPlugin):
 
     _GALLERY_MAX_PAGES = 2
 
-    async def _gallery_sources(self, items: list[Candidate]) -> list[dict[str, Any]]:
+    async def _gallery_sources(self, items: list[Candidate], *, author_pages: bool = False) -> list[dict[str, Any]]:
         """读图集站页面上自己标的来源账号。
 
         视觉挑中的图常常落在 4play、v2ph 这类搬运站上：页面本身不是作者主页，
         所以结论会把它降级。但站方通常写着来源账号——实测 4play 的 meta 直接给
         了 ``instagram.com/menruinyanko``，那是整单唯一指向本人的线索。这里只
         抓降级候选里的图集站页面，最多两页，读不到就当没有。
+
+        ``author_pages=True`` 时多认一类站（`AUTHOR_PAGE_HOSTS`，如 picazor）：
+        这类站的图确实是原图，只是页面不是作者主页，所以不降级，单独翻一层
+        「帖子页 → 发布者主页」拿作者账号。
         """
         pool: list[Candidate] = []
         seen: set[str] = set()
         for item in items:
             url = (item.url or "").strip()
-            if not url or url in seen or not is_gallery_site(url, item.platform):
+            if not url or url in seen:
                 continue
+            if not is_gallery_site(url, item.platform):
+                if not (author_pages and is_author_page_site(url, item.platform)):
+                    continue
             seen.add(url)
             pool.append(item)
             if len(pool) >= self._GALLERY_MAX_PAGES:
@@ -3248,13 +3349,18 @@ class ImageSearcherPlugin(MaiBotPlugin):
         return sources
 
     async def _page_source(self, url: str) -> list[dict[str, Any]]:
-        """抓一页 HTML，抽里面的来源账号。抓不到就返回空，不影响别的结论。"""
+        """抓一页 HTML，抽里面的来源账号；页面上没有就再翻一层发布者主页。
 
-        def fetch() -> str:
+        picazor 那类站把账号挂在发布者主页上，帖子页只有一条 ``/en/<名字>`` 的
+        内部链接。所以第一页抽不到账号时，用 `author_page_url()` 找出这个上级
+        链接再抓一次——只多一次请求，读不到就当没有。
+        """
+
+        def fetch(target: str) -> str:
             session = make_session(self._proxy())
             try:
                 response = session.get(
-                    url,
+                    target,
                     timeout=10,
                     headers={
                         "User-Agent": (
@@ -3272,11 +3378,29 @@ class ImageSearcherPlugin(MaiBotPlugin):
             finally:
                 session.close()
 
-        try:
-            html = await asyncio.wait_for(asyncio.to_thread(fetch), timeout=14)
-        except Exception:  # noqa: BLE001 - 页面读不到只少一条线索
+        async def read(target: str) -> str:
+            try:
+                return await asyncio.wait_for(asyncio.to_thread(fetch, target), timeout=14)
+            except Exception:  # noqa: BLE001 - 页面读不到只少一条线索
+                return ""
+
+        html = await read(url)
+        if not html:
             return []
-        return parse_source_accounts(html, url)
+        accounts = parse_source_accounts(html, url)
+        if accounts:
+            return accounts
+        parent = author_page_url(html, url)
+        if not parent or parent == url:
+            return []
+        page = await read(parent)
+        if not page:
+            return []
+        self._vlog("图集站翻发布者主页：%s → %s", url, parent)
+        accounts = author_from_author_page(page, parent)
+        for account in accounts:
+            account["author_page"] = parent
+        return accounts
 
     async def _grok_lookup(
         self, upload: bytes | None, candidates: list[Candidate] | None = None, reply_hint: str = ""
@@ -5180,6 +5304,261 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 break
         return found
 
+    _TITLE_AUTHOR_LIMIT = 5
+    # 查这五个变体的总预算：正常一个号一两秒，失败一次要等满 20 秒，五六个加起来
+    # 能把整单拖长两三分钟。超预算就停止试后面的变体，已经认出的号照样往下翻。
+    _TITLE_AUTHOR_BUDGET = 70
+    # 查资料失败后的重试间隔。测试里会改成 0。
+    _PROFILE_RETRY_DELAY = 1.2
+    # 抓候选页面取正文喂模型：超时别太久，正文也别太长（只为抽个名字，不值得几千 token）。
+    _PAGE_EXCERPT_TIMEOUT = 10
+    _PAGE_EXCERPT_CHARS = 1500
+
+    async def _hunt_title_author(
+        self, best: Candidate | None, upload: bytes | None
+    ) -> dict[str, Any] | None:
+        """转载站标题里写着的作者名，拿去 X 上把号找回来。
+
+        s-20261119-1703-0c5b 的 best 标题是「染三ran3 - 露露卡[108P7V-1.23GB]」，
+        插件翻了候选里两个不相干的号（aisaki_cos、oioioi525）就收工；可正主
+        ``ran3ran3ran3`` 的显示名就是「染三 ran3」——名字对得上，她的带图帖里
+        也确实有这张图。
+
+        判据只有一条：**显示名必须和标题里的名字对得上**。光「这个号存在」不算，
+        `ran3` 这种 1 粉的空号存在也不代表是她。名字对上但没翻到这张图时只当
+        线索（status=named），不改结论。
+        """
+        if best is None or not upload:
+            return None
+        author, variants, via, name = await self._title_author_candidates(best)
+        if not variants:
+            return None
+        scanned: list[str] = []
+        started = time.monotonic()
+        for handle in variants[: self._TITLE_AUTHOR_LIMIT]:
+            if scanned and time.monotonic() - started > self._TITLE_AUTHOR_BUDGET:
+                self._vlog(
+                    "标题作者：认号花了 %.0f 秒，剩下的变体不再试",
+                    time.monotonic() - started,
+                )
+                break
+            if not scanned and time.monotonic() - started > self._TITLE_AUTHOR_BUDGET * 2:
+                # 一个都没认出来、时间又烧光了：再试下去只会把整单拖得更久。
+                self._vlog(
+                    "标题作者：查号超过 %.0f 秒仍没对上任何一个，放弃",
+                    time.monotonic() - started,
+                )
+                break
+            profile = await self._profile(handle)
+            if not profile:
+                continue
+            display = str(profile.get("name") or "")
+            if not handles.name_matches(author, display):
+                self._vlog(
+                    "标题作者：@%s 显示名「%s」对不上「%s」，跳过", handle, display, author
+                )
+                continue
+            scanned.append(handle)
+            hit = await self._media_lookup(handle, upload)
+            if not (hit and hit.get("url")):
+                hit = await self._search_media_lookup(handle, upload)
+            base = {
+                "author": author,
+                "name": name,
+                "variants": variants[: self._TITLE_AUTHOR_LIMIT],
+                "via": via,
+                "scanned": scanned,
+                "handle": handle,
+                "x_name": display,
+                "post": "",
+                "distance": None,
+            }
+            if hit and hit.get("url"):
+                distance = int(hit.get("distance") or 0)
+                self._vlog(
+                    "标题作者：@%s 命中 %s（距离 %s，作者「%s」）",
+                    handle,
+                    hit.get("url"),
+                    distance,
+                    author,
+                )
+                return {**base, "status": "hit", "post": str(hit.get("url") or ""), "distance": distance}
+            self._vlog("标题作者：@%s 名字对上了，但没翻到这张图", handle)
+            return {**base, "status": "named"}
+        return {
+            "status": "none",
+            "author": author,
+            "name": name,
+            "variants": variants[: self._TITLE_AUTHOR_LIMIT],
+            "via": via,
+            "scanned": [],
+        }
+
+    async def _title_author_candidates(self, best: Candidate) -> tuple[str, list[str], str, str]:
+        """从标题里认出作者名，再展开成候选 X 账号。
+
+        默认交给 MaiBot 的文本模型（``[title_author]`` 段，任务组默认 utils）：资源站
+        标题写法太杂，固定规则总在漏（`s-20261119-1722-fe9b` 的「Cosplay] ran3 - …」
+        被抽成 `Cosplay] ran3`，展开成 `Cosplayran3`，一个都不存在）。关掉开关、或者
+        模型没回／答复解析不了时退回规则抽取。
+
+        返回值 ``(author, variants, via, name)``：``author`` 是原样的整串（比对显示名
+        用它），``name`` 是拆出来的名字那半截（「染三ran3」→ 染三），``via`` 写清这次
+        走的是 llm 还是 rule，展示时据此说明名字是哪来的。
+        """
+        section = getattr(self.config, "title_author", None)
+        if section is not None and section.enabled:
+            answer = await self._ask_title_author(best)
+            if answer is not None:
+                author, handle, name = answer
+                if not author:
+                    author = name or handle
+                variants: list[str] = []
+                if handle:
+                    variants.append(handle)
+                for item in handles.x_variants(author):
+                    if item.lower() not in {value.lower() for value in variants}:
+                        variants.append(item)
+                if variants:
+                    self._vlog(
+                        "标题作者：模型给出「%s」（名字 %s / 账号 %s），展开 %s",
+                        author,
+                        name or "-",
+                        handle or "无",
+                        variants[: self._TITLE_AUTHOR_LIMIT],
+                    )
+                return author, variants[: self._TITLE_AUTHOR_LIMIT], "llm", name
+            self._vlog("标题作者：模型没给出可用结果，退回规则抽取")
+        author = handles.title_author(best.name)
+        name, _ = handles.split_author_name(author)
+        return author, handles.x_variants(author), "rule", name
+
+    async def _page_excerpt_for_author(self, url: str) -> tuple[str, str]:
+        """抓候选页面，取一小段正文给模型看。
+
+        模型不联网，只给一个 URL 等于没给；而资源站的署名、原帖外链往往只在正文里
+        （标题那行经常只有分类和作品名）。抓不到（403、超时、不是 HTML）就只凭标题问，
+        不额外拖时间。
+        """
+        if not url:
+            return "", ""
+        try:
+            html = await asyncio.wait_for(
+                self._fetch_page_html(url), timeout=self._PAGE_EXCERPT_TIMEOUT
+            )
+        except Exception:  # noqa: BLE001 - 正文只是加分项，拿不到照样能问
+            return "", ""
+        if not html:
+            return "", ""
+        title, body = weibopost.page_text(html)
+        return str(title or "").strip(), weibopost.page_excerpt(body, limit=self._PAGE_EXCERPT_CHARS)
+
+    async def _ask_title_author(self, best: Candidate) -> tuple[str, str, str] | None:
+        """问一次文本模型：这个标题里的作者是谁、名字和账号各是哪截。
+
+        返回 ``(author, handle, name)``；都空表示模型明确说页面里没有作者名，调用方
+        据此收工（不再拿规则硬抽）。超时、报错、答复解析不了时返回 ``None``，调用方
+        退回规则。
+
+        ``author`` 是页面里原样的整串（比对 X 显示名要用它），``name`` / ``handle``
+        是把「中文名 + 英文 id」拆开的结果——很多人两截写在一起（「染三ran3」），
+        不拆开展示起来像一个人名，实际上半截是账号。
+        """
+        section = self.config.title_author
+        title = str(best.name or best.title or "").strip()
+        if not title:
+            return None
+        page_title, excerpt = await self._page_excerpt_for_author(best.url)
+        lines = [
+            "下面是一条图搜结果落到的网页，标题是资源站/搬运站自己写的。",
+            f"站点：{best.source or best.platform or '未知'}",
+            f"标题：{title}",
+        ]
+        if page_title and page_title != title:
+            lines.append(f"页面里的标题：{page_title}")
+        if best.url:
+            lines.append(f"页面：{best.url}")
+        if excerpt:
+            lines.extend(
+                [
+                    "",
+                    "页面正文（去掉标签后的纯文字，开头往往混着导航，可能不完整）：",
+                    excerpt,
+                ]
+            )
+        lines.extend(
+            [
+                "",
+                "请判断这张图真正的作者叫什么，只输出一个 JSON，不要解释：",
+                '{"author": "页面里原样的完整名字", "name": "其中的人名（中文/日文那半截）",'
+                ' "handle": "其中的英文或数字 id（账号那半截）", "x": "页面里写明的 X 账号，没有就留空"}',
+                "",
+                "规则：",
+                "- **很多人把中文名和英文 id 写在一起**，必须拆成两截分别填："
+                "「染三ran3」→ name=染三、handle=ran3；「渔蛋Sakana」→ name=渔蛋、handle=Sakana；"
+                "「Vivian」只有一截时，name 留空、handle=Vivian；「染三」只有中文时反过来；",
+                "- author 填页面里原样的那一整串（上面两个例子分别是「染三ran3」「渔蛋Sakana」），"
+                "不要自己拼，也不要翻译；",
+                "- 优先看页面正文里写明的署名（作者、Photo by、credit、© 后面那个名字），"
+                "正文写明的比标题里推测的可靠；",
+                "- 标题里的名字去掉开头的分类标签（[Cosplay]、【写真】这类）、作品名、"
+                "图片数量、体积、语言标签，也不要翻译或补全；分隔符（- 、| 、/ 、方括号）"
+                "后面的一般是作品名，不是名字；页面标题末尾那个「- 站名」也要去掉；",
+                "- 如果页面里直接写了她的 X 链接或 @账号（x.com/xxx、twitter.com/xxx、@xxx），"
+                "填在 x 里——这比从名字里拆出来的可靠；没写到就留空，别拿名字去猜；",
+                "- 页面和标题里都没有作者名（比如只是一句描述、或者写的是搬运站自己的名字），"
+                '就回 {"author": "", "name": "", "handle": "", "x": ""}。',
+            ]
+        )
+        prompt = "\n".join(lines)
+        timeout = max(10, int(section.timeout))
+        options: dict[str, Any] = {
+            "prompt": prompt,
+            "task_name": section.task or "utils",
+            "temperature": 0,
+            "max_tokens": 200,
+        }
+        if section.model:
+            options["model_name"] = section.model
+        started = time.monotonic()
+        try:
+            result = await asyncio.wait_for(
+                self.ctx.call_capability("llm.generate", timeout_ms=timeout * 1000, **options),
+                timeout=timeout + 5,
+            )
+        except asyncio.TimeoutError:
+            self.ctx.logger.warning(
+                "标题作者抽取超时：等待=%.1fs 超时=%ss 标题=%s",
+                time.monotonic() - started,
+                timeout,
+                title[:60],
+            )
+            return None
+        except Exception as error:  # noqa: BLE001 - 抽不动就退回规则，别拖住整单
+            self.ctx.logger.warning(
+                "标题作者抽取失败：耗时=%.1fs err=%s", time.monotonic() - started, str(error)[:80]
+            )
+            return None
+        payload = result if isinstance(result, dict) else {"success": True, "response": str(result or "")}
+        # 新版 Runner 会把结果再包一层 {"success": true, "result": {...}}，两种形态都要接。
+        inner = payload.get("result")
+        if isinstance(inner, dict) and ("response" in inner or "text" in inner):
+            payload = {**payload, **inner}
+        if not payload.get("success", True):
+            self.ctx.logger.warning("标题作者抽取返回失败：%s", str(payload.get("error"))[:80])
+            return None
+        text = payload.get("response") or payload.get("text") or ""
+        author, handle, name = handles.llm_author_reply(str(text))
+        self._vlog(
+            "标题作者：模型 %.1f 秒后答复「%s」→ 「%s」（名字 %s / 账号 %s）",
+            time.monotonic() - started,
+            str(text).strip().replace("\n", " ")[:80],
+            author,
+            name or "-",
+            handle or "无",
+        )
+        return author, handle, name
+
     async def _hunt_repost_author(
         self, ordered: list[Candidate], best: Candidate | None, upload: bytes | None
     ) -> dict[str, Any] | None:
@@ -6559,26 +6938,50 @@ class ImageSearcherPlugin(MaiBotPlugin):
     _X_GUESS_MIN_FOLLOWERS = 5000
 
     async def _profile(self, handle: str) -> dict[str, Any] | None:
-        """查一个 X 账号的公开资料（fxtwitter，免登录）。"""
+        """查一个 X 账号的公开资料（fxtwitter，免登录）。
+
+        失败要能看见原因：`s-20261119-2011-9aa1` 那单查 `ran3ran3ran3` 时四个变体
+        全部静默返回空，结果里只留「没找到作者」，日志里一个字都没有，根本不知道
+        是查无此号还是接口挂了。现在 404（查无此号）只记一行；其余失败（429、5xx、
+        超时、连不上）**重试一次**再放弃。
+        """
         url = f"https://api.fxtwitter.com/2/profile/{handle}"
         proxy = self._proxy()
 
-        def fetch() -> dict[str, Any] | None:
+        def fetch() -> tuple[int, dict[str, Any] | None, str]:
             session = make_session(proxy)
             try:
                 response = session.get(url, timeout=15)
                 if response.status_code != 200:
-                    return None
+                    return response.status_code, None, ""
                 payload = response.json()
                 user = payload.get("user") if isinstance(payload, dict) else None
-                return user if isinstance(user, dict) else None
+                return 200, (user if isinstance(user, dict) else None), ""
+            except Exception as error:  # noqa: BLE001 - 网络问题也算一次「没查到」
+                return 0, None, str(error)[:80]
             finally:
                 session.close()
 
-        try:
-            return await asyncio.wait_for(asyncio.to_thread(fetch), timeout=20)
-        except Exception:  # noqa: BLE001 - 查不到就当没这个号
-            return None
+        for attempt in (1, 2):
+            try:
+                code, user, error = await asyncio.wait_for(asyncio.to_thread(fetch), timeout=20)
+            except Exception as exc:  # noqa: BLE001
+                code, user, error = 0, None, str(exc)[:80]
+            if user:
+                return user
+            if code == 404:
+                self._vlog("查 @%s：查无此号", handle)
+                return None
+            self._vlog(
+                "查 @%s 失败：HTTP %s %s，%s",
+                handle,
+                code or "-",
+                error or "",
+                "重试一次" if attempt == 1 else "放弃",
+            )
+            if attempt == 1:
+                await asyncio.sleep(self._PROFILE_RETRY_DELAY)
+        return None
 
     async def _fetch_json(
         self, url: str, headers: dict[str, str] | None = None, timeout: int = 15

@@ -91,6 +91,55 @@ class ForwardNodesTest(unittest.TestCase):
         self.assertIn("这张是你发的原图", blob)
         self.assertNotIn("引擎候选里跟原图最接近的一张", blob)
 
+    def test_footer_carries_the_uploaded_image(self) -> None:
+        """群里连着好几单时，页尾再贴一次原图，才知道这堆结果对应哪张。"""
+        best = Candidate(engine="lens", url="https://x.com/a/status/1", distance=4, status="match")
+        best.finalize()
+        outcome = SearchOutcome(
+            status="ok",
+            best=best,
+            candidates=[best],
+            image_b64="BESTIMG",
+            upload_b64="UPIMG",
+        )
+        nodes = build_forward_nodes(_task(outcome), command="麦麦寻人")
+        self.assertEqual(nodes[-1]["content"][-1], {"type": "image", "content": "UPIMG"})
+        self.assertIn("本次搜索的原图", json.dumps(nodes[-1], ensure_ascii=False))
+
+    def test_footer_skips_upload_when_reference_is_the_upload(self) -> None:
+        """参考区那张本来就是原图时，页尾不再贴一遍。"""
+        outcome = SearchOutcome(
+            status="not_found",
+            best=None,
+            candidates=[],
+            image_b64="UPIMG",
+            image_source="upload",
+            upload_b64="UPIMG",
+        )
+        nodes = build_forward_nodes(_task(outcome), command="麦麦寻人", show_reference=False)
+        self.assertEqual([image for _index, image in _images(nodes)].count("UPIMG"), 1)
+
+    def test_more_reply_does_not_repeat_the_upload(self) -> None:
+        """回「更多」是重发一遍详情，原图已经在首次回复里出现过。"""
+        best = Candidate(engine="lens", url="https://x.com/a/status/1", distance=4, status="match")
+        best.finalize()
+        outcome = SearchOutcome(
+            status="ok",
+            best=best,
+            candidates=[best],
+            image_b64="BESTIMG",
+            upload_b64="UPIMG",
+        )
+        nodes = build_forward_nodes(_task(outcome), command="麦麦寻人", replay=True)
+        blob = json.dumps(nodes, ensure_ascii=False)
+        self.assertNotIn("UPIMG", blob)
+
+    def test_footer_without_upload_stays_text_only(self) -> None:
+        """旧任务、按图缓存命中的结果没有原图，页尾只剩文字，不能报错。"""
+        outcome = SearchOutcome(status="not_found", best=None, candidates=[])
+        nodes = build_forward_nodes(_task(outcome), command="麦麦寻人", show_reference=False)
+        self.assertEqual(nodes[-1]["content"][-1]["type"], "text")
+
     def _grouped_outcome(self, *, hit: bool = True) -> SearchOutcome:
         best = Candidate(
             engine="saucenao",
@@ -976,6 +1025,28 @@ class MissLayoutTest(unittest.TestCase):
         self.assertTrue(any(text.startswith("🔎 Grok") for text in order))
         self.assertIn("任务编号", self._text(nodes[-1]))
 
+    def test_ai_probability_in_headline(self) -> None:
+        """没搜到时把 AI 生成概率摆进结论：只多这一行，匹配路线仍只留在「更多」。"""
+        outcome = self._make_outcome()
+        outcome.ai = {"ok": True, "score": 0.001, "error": ""}
+        head = self._text(build_result_forwards(_task(outcome), command="盆地找鸡")[0][0])
+        self.assertIn("🤖 AI 生成概率：0.1%（大概率真人拍摄）", head)
+        self.assertNotIn("匹配路线", head)
+
+    def test_ai_probability_flagged_when_likely_generated(self) -> None:
+        outcome = self._make_outcome()
+        outcome.ai = {"ok": True, "score": 0.93, "error": ""}
+        head = self._text(build_result_forwards(_task(outcome), command="盆地找鸡")[0][0])
+        self.assertIn("疑似 AI 生成", head)
+
+    def test_ai_line_absent_when_detection_not_run(self) -> None:
+        """检测没跑或失败时不写：结论里多一句「未执行」只是占地。"""
+        outcome = self._make_outcome()
+        outcome.ai = None
+        head = self._text(build_result_forwards(_task(outcome), command="盆地找鸡")[0][0])
+        self.assertNotIn("AI 生成概率", head)
+        self.assertNotIn("AI 检测", head)
+
     def test_each_engine_one_entry_with_image(self) -> None:
         nodes = build_result_forwards(_task(self._make_outcome()), command="盆地找鸡")[0]
         lens = next(node for node in nodes if self._text(node).startswith("▍Google Lens"))
@@ -1029,6 +1100,82 @@ class MissLayoutTest(unittest.TestCase):
         nodes = build_result_forwards(_task(outcome), command="盆地找鸡")[0]
         grok = next(node for node in nodes if self._text(node).startswith("🔎 Grok"))
         self.assertEqual(self._images(grok), [])
+
+    def test_miss_footer_carries_the_uploaded_image(self) -> None:
+        """没搜到的单子，页尾也要贴原图：一屏四五条结果，靠它才知道搜的是哪张。"""
+        outcome = self._make_outcome()
+        outcome.upload_b64 = "UPIMG"
+        blocks = build_result_forwards(_task(outcome), command="盆地找鸡")
+        footer = blocks[-1][-1]
+        self.assertEqual(footer["content"][-1], {"type": "image", "content": "UPIMG"})
+        self.assertIn("本次搜索的原图", self._text(footer))
+
+    def test_miss_footer_with_upload_gets_its_own_block(self) -> None:
+        """页脚带原图时单独一块：这套排版本来就卡在 6 张图上，再加一张会被 NapCat 拒收。"""
+        outcome = self._make_outcome()
+        outcome.upload_b64 = "UPIMG"
+        blocks = build_result_forwards(_task(outcome), command="盆地找鸡")
+        self.assertEqual(len(blocks), 2)
+        self.assertNotIn("UPIMG", json.dumps(blocks[0], ensure_ascii=False))
+        self.assertIn("UPIMG", json.dumps(blocks[1], ensure_ascii=False))
+        self.assertIn("本次搜索的原图", json.dumps(blocks[1], ensure_ascii=False))
+
+    def test_paid_pack_candidates_adds_a_note(self) -> None:
+        """候选全落在付费图包页时，结论要说清这类图公开索引没有原帖。"""
+        fantia = Candidate(
+            engine="saucenao",
+            url="https://fantia.jp/posts/123",
+            distance=None,
+            status="suspect",
+            platform="fantia.jp",
+        )
+        fantia.finalize()
+        outcome = SearchOutcome(status="not_found", best=None, candidates=[fantia], total_candidates=1)
+        nodes = build_result_forwards(_task(outcome), command="盆地找鸡")[0]
+        text = "\n".join(
+            part.get("content", "")
+            for node in nodes
+            for part in node.get("content") or []
+            if part.get("type") == "text"
+        )
+        self.assertIn("付费图包页", text)
+        self.assertIn("fantia.jp", text)
+
+    def test_paid_pack_note_absent_without_such_candidates(self) -> None:
+        pixiv = Candidate(
+            engine="saucenao",
+            url="https://www.pixiv.net/artworks/1",
+            distance=20,
+            status="suspect",
+            platform="pixiv.net",
+        )
+        pixiv.finalize()
+        outcome = SearchOutcome(status="not_found", best=None, candidates=[pixiv], total_candidates=1)
+        nodes = build_result_forwards(_task(outcome), command="盆地找鸡")[0]
+        text = "\n".join(
+            part.get("content", "")
+            for node in nodes
+            for part in node.get("content") or []
+            if part.get("type") == "text"
+        )
+        self.assertNotIn("付费图包", text)
+
+    def test_paid_pack_note_silent_when_paywall_known(self) -> None:
+        """已经拿到她的售卖页时不再提这句，`_paywall_lines()` 已经说过了。"""
+        fantia = Candidate(
+            engine="saucenao",
+            url="https://fantia.jp/posts/123",
+            status="suspect",
+            platform="fantia.jp",
+        )
+        fantia.finalize()
+        outcome = SearchOutcome(
+            status="not_found",
+            best=None,
+            candidates=[fantia],
+            paywall={"platform": "fanbox", "shop": "https://x.fanbox.cc"},
+        )
+        self.assertEqual(formatting._paid_pack_line(outcome), "")
 
     def test_without_vision_or_grok_only_engines(self) -> None:
         outcome = SearchOutcome(
@@ -2283,3 +2430,158 @@ class FirstReplyTest(unittest.TestCase):
         )
         _text, images = build_first_reply(_task(outcome), command="盆地找鸡", max_images=1)
         self.assertEqual(len(images), 1)
+
+
+class GallerySourceLineTest(unittest.TestCase):
+    """落点是泄露站时，发布者主页上的 X 要摆进结论——那单就是这样丢的。"""
+
+    POST = "https://picazor.com/en/maonu164196-1/48"
+
+    def _make_outcome(self, **kwargs) -> SearchOutcome:
+        best = Candidate(
+            engine="lens",
+            url=self.POST,
+            distance=7,
+            status="match",
+            platform="picazor.com",
+            name="Maonu164196 | 猫奴",
+        )
+        best.finalize()
+        return SearchOutcome(status="ok", best=best, candidates=[best], **kwargs)
+
+    def test_author_page_link_is_shown(self) -> None:
+        outcome = self._make_outcome(
+            gallery_sources=[
+                {
+                    "platform": "X",
+                    "handle": "maonu164196",
+                    "url": "https://x.com/maonu164196",
+                    "count": 1,
+                    "site": "picazor.com",
+                    "page": self.POST,
+                    "author_page": "https://picazor.com/en/maonu164196-1",
+                }
+            ]
+        )
+        text = formatting._best_block(outcome)
+        self.assertIn("发布者主页写着 X @maonu164196", text)
+        self.assertIn("https://x.com/maonu164196", text)
+        self.assertIn("点开核对", text)
+
+    def test_post_page_source_keeps_old_wording(self) -> None:
+        outcome = self._make_outcome(
+            gallery_sources=[
+                {
+                    "platform": "Instagram",
+                    "handle": "menruinyanko",
+                    "url": "https://instagram.com/menruinyanko",
+                    "count": 9,
+                    "site": "4play.to",
+                    "page": "https://4play.to/koleksi/235/1847",
+                }
+            ]
+        )
+        text = formatting._best_block(outcome)
+        self.assertIn("来自 4play.to 页面标的来源", text)
+        self.assertIn("站方标注，未必是作者本人", text)
+
+    def test_same_handle_from_two_paths_is_listed_once(self) -> None:
+        outcome = self._make_outcome(
+            vision={"sources": [{"platform": "X", "handle": "maonu164196", "url": "https://x.com/maonu164196", "site": "picazor.com"}]},
+            gallery_sources=[
+                {"platform": "X", "handle": "maonu164196", "url": "https://x.com/maonu164196", "site": "picazor.com", "author_page": "https://picazor.com/en/maonu164196-1"}
+            ],
+        )
+        text = formatting._best_block(outcome)
+        self.assertEqual(text.count("@maonu164196"), 1)
+
+
+class TitleAuthorLineTest(unittest.TestCase):
+    """标题里的名字对上一个 X 号时，要写清来历，别让人以为是指纹对上的。"""
+
+    def _make_outcome(self, **kwargs) -> SearchOutcome:
+        best = Candidate(
+            engine="lens",
+            url="https://blog.52ku.uk/2248/",
+            distance=2,
+            status="match",
+            platform="blog.52ku.uk",
+            name="染三ran3 - 露露卡[108P7V-1.23GB]",
+        )
+        best.finalize()
+        return SearchOutcome(status="ok", best=best, candidates=[best], **kwargs)
+
+    def test_named_account_is_shown_as_a_clue(self) -> None:
+        outcome = self._make_outcome(
+            title_author={
+                "status": "named",
+                "author": "染三ran3",
+                "name": "染三",
+                "handle": "ran3ran3ran3",
+                "x_name": "染三 ran3",
+                "variants": ["ran3", "ran3ran3", "ran3ran3ran3"],
+                "scanned": ["ran3ran3ran3"],
+                "via": "rule",
+            }
+        )
+        text = formatting._best_block(outcome)
+        self.assertIn("https://x.com/ran3ran3ran3", text)
+        self.assertIn("点开自己核一下", text)
+
+    def test_name_and_account_are_split_in_the_line(self) -> None:
+        """「染三ran3」要拆成名字「染三」+ 账号「ran3」，别当成一个人名。"""
+        outcome = self._make_outcome(
+            title_author={
+                "status": "named",
+                "author": "染三ran3",
+                "name": "染三",
+                "handle": "ran3ran3ran3",
+                "x_name": "染三 ran3",
+                "via": "rule",
+            }
+        )
+        lines = formatting._title_author_lines(outcome)
+        # 拆的是标题里那串原样名字（染三ran3），不是最后命中的反拼号（ran3ran3ran3）
+        self.assertIn("拆开是名字「染三」+ 账号「ran3」", lines[0])
+        self.assertIn("@ran3ran3ran3", lines[0])
+
+    def test_llm_extraction_is_mentioned(self) -> None:
+        """走模型抽的名字要说明，别让人以为还是规则切的。"""
+        outcome = self._make_outcome(
+            title_author={
+                "status": "named",
+                "author": "染三ran3",
+                "name": "染三",
+                "handle": "ran3ran3ran3",
+                "x_name": "染三 ran3",
+                "via": "llm",
+            }
+        )
+        lines = formatting._title_author_lines(outcome)
+        self.assertTrue(any("模型" in line for line in lines))
+        self.assertFalse(
+            any("模型" in line for line in formatting._title_author_lines(self._make_outcome(
+                title_author={
+                    "status": "named",
+                    "author": "染三ran3",
+                    "name": "染三",
+                    "handle": "ran3ran3ran3",
+                    "x_name": "染三 ran3",
+                    "via": "rule",
+                }
+            )))
+        )
+
+    def test_hit_is_not_repeated_in_extra_lines(self) -> None:
+        """命中时结论已经换成那条帖，别再加一行重复的账号。"""
+        outcome = self._make_outcome(
+            title_author={"status": "hit", "author": "染三ran3", "handle": "ran3ran3ran3", "post": "https://x.com/ran3ran3ran3/status/1"}
+        )
+        self.assertEqual(formatting._title_author_lines(outcome), [])
+
+    def test_none_only_speaks_in_detail(self) -> None:
+        outcome = self._make_outcome(
+            title_author={"status": "none", "author": "染三ran3", "variants": ["ran3", "ran3ran3"], "scanned": []}
+        )
+        self.assertEqual(formatting._title_author_lines(outcome), [])
+        self.assertTrue(formatting._title_author_lines(outcome, detail=True))

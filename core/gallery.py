@@ -13,6 +13,7 @@ Instagram、X 内容搬下来重新打包，页面本身不是作者主页。但
 from __future__ import annotations
 
 import re
+from urllib.parse import urljoin, urlparse
 
 # 实测见过的图集 / 搬运站。只收确认过的：误标一个正经站点比漏标更糟。
 GALLERY_HOSTS = (
@@ -165,3 +166,100 @@ def parse_source_accounts(html: str = "", page_url: str = "") -> list[dict[str, 
             "count": count,
         }
     return sorted(found.values(), key=lambda item: int(item["count"]), reverse=True)
+
+
+# 只在「抓页面找发布者」时认的站，跟 GALLERY_HOSTS 分开：进 GALLERY_HOSTS 会把
+# 结论降级成「只找到转发」，可这类页面上的图就是原图本身（指纹对得上），用户
+# 要的是「这张图是谁发的」。实测 s-20261119-1605-e790：`picazor.com` 的帖子页
+# 没有任何外链账号，但页面里有发布者主页 `/en/<名字>`，主页上直接挂着作者的 X。
+AUTHOR_PAGE_HOSTS = (
+    "picazor.com",
+    "ibradome.com",
+)
+
+
+def is_author_page_site(url: str = "", platform: str = "") -> bool:
+    """这个落点值不值得再往「页面 → 发布者主页」翻一层。"""
+    for value in (_host_part(url), str(platform or "")):
+        item = value.strip().lower().removeprefix("www.")
+        if item and any(item == token or item.endswith("." + token) for token in AUTHOR_PAGE_HOSTS):
+            return True
+    return False
+
+
+def _host_part(url: str) -> str:
+    """从 URL 取域名，没 scheme 的字符串当域名处理。"""
+    value = str(url or "").strip()
+    if "://" in value:
+        host = value.split("://", 1)[-1].split("/", 1)[0]
+    else:
+        host = value.split("/", 1)[0]
+    return host.rsplit("@", 1)[-1].split(":")[0]
+
+
+def author_page_url(html: str = "", page_url: str = "") -> str:
+    """从帖子页里找出发布者主页：同站、且正好是当前路径去掉最后一段。
+
+    不猜站点结构，只认页面里真实存在的链接——``picazor.com/en/maonu164196-1/48``
+    的页面里写着 ``/en/maonu164196-1``，那就是发布者主页。找不到就返回空串。
+    """
+    text = str(html or "")
+    page = str(page_url or "").strip()
+    if not text or "://" not in page:
+        return ""
+    parsed = urlparse(page)
+    path = parsed.path.rstrip("/")
+    if "/" not in path.lstrip("/"):
+        return ""
+    parent = path.rsplit("/", 1)[0]
+    if not parent:
+        return ""
+    for href in re.findall(r'href="([^"]+)"', text):
+        target = urljoin(page, href)
+        got = urlparse(target)
+        if got.netloc.lower() != parsed.netloc.lower():
+            continue
+        if got.path.rstrip("/") == parent:
+            return f"{got.scheme}://{got.netloc}{got.path.rstrip('/')}"
+    return ""
+
+
+def author_from_author_page(html: str = "", page_url: str = "") -> list[dict[str, object]]:
+    """发布者主页上挂的社交账号：出现一次就认。
+
+    跟帖子页的判据不同——帖子页满屏是可点的缩略图和推荐位，同一个账号出现
+    好几次才说明「这页讲的就是她」；发布者主页只有一个作者信息区块，X 链接
+    自然只出现一次（实测 picazor 的 ``/en/maonu164196-1`` 页里就一条
+    ``x.com/maonu164196``）。多个账号时取出现次数最多的那个。
+
+    返回仍只当线索：``from_author_page=True`` 表示这是站方给的「主页属于谁」，
+    但站方也会标错，文案里必须让用户点开核对。
+    """
+    text = str(html or "")
+    if not text:
+        return []
+    found: list[dict[str, object]] = []
+    for platform, pattern, reserved, base in (
+        ("X", _X, _X_RESERVED, "https://x.com/"),
+        ("Instagram", _IG, _IG_RESERVED, "https://instagram.com/"),
+    ):
+        counts: dict[str, int] = {}
+        for raw in pattern.findall(text):
+            handle = _clean(raw, reserved)
+            if not handle:
+                continue
+            counts[handle] = counts.get(handle, 0) + 1
+        if not counts:
+            continue
+        handle, count = max(counts.items(), key=lambda item: item[1])
+        found.append(
+            {
+                "platform": platform,
+                "handle": handle,
+                "url": base + handle,
+                "count": count,
+                "from_author_page": True,
+            }
+        )
+    return found
+

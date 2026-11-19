@@ -239,6 +239,28 @@ class WatermarkTest(unittest.TestCase):
         """中文昵称取不出 X 号——它只能是微博那类平台，交给上层去核。"""
         self.assertEqual(vision.handles_from_watermark("@兔子兔子兔w"), [])
 
+    def test_template_word_alone_is_not_a_handle(self):
+        """单独一个 PHOTOGRAPHER 是占位模板，不是谁的账号。
+
+        s-20261119-1605-e790 的水印只有这一个词，旧代码顺着它去核了
+        x.com/photographer，还比出一个同名微博，两条都是噪声。
+        """
+        self.assertEqual(vision.handles_from_watermark("PHOTOGRAPHER"), [])
+        self.assertEqual(vision.handles_from_watermark("PHOTO"), [])
+        self.assertEqual(vision.handles_from_watermark("CREDIT"), [])
+        self.assertEqual(vision.handles_from_watermark("COSER"), [])
+        self.assertEqual(vision.handles_from_watermark("MODEL"), [])
+
+    def test_template_word_takes_the_name_after_it(self):
+        """模板词后面跟着的那个才是名字，拿它去搜。"""
+        self.assertEqual(vision.handles_from_watermark("PHOTOGRAPHER: maonu164196"), ["maonu164196"])
+        self.assertEqual(vision.handles_from_watermark("Photographer @abc_123"), ["abc_123"])
+        self.assertEqual(vision.handles_from_watermark("Photo by kuru"), ["kuru"])
+        self.assertEqual(vision.handles_from_watermark("credit to KURU"), ["KURU"])
+        self.assertEqual(vision.handles_from_watermark("COSER: Moliww"), ["Moliww"])
+        # 模板词后面跟的仍然是站名时，不能当账号
+        self.assertEqual(vision.handles_from_watermark("Photo by instagram"), [])
+
     def test_id_name_from_watermark(self):
         self.assertEqual(vision.id_name_from_watermark("Reng♡ @id.NothingLose"), "NothingLose")
         self.assertEqual(vision.id_name_from_watermark("@idcNothinglose"), "Nothinglose")

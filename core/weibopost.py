@@ -82,6 +82,40 @@ def _clean(text: str) -> str:
     return value
 
 
+def page_excerpt(body: str = "", limit: int = 1500) -> str:
+    """把整页正文裁成一小段，喂给模型看。
+
+    资源站页面上下全是导航和推荐位，整页几千行塞不进 prompt，也不该只为抽个名字
+    花几千 token。这里取两段：开头二十几行（标题、日期、作者、发布者通常就在这），
+    以及后面那些带署名／外链关键词的行（`Photo by`、`作者：`、`x.com/…`、`©` 这类），
+    合起来不超过 ``limit`` 字符。
+    """
+    lines = [line.strip() for line in (body or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    parts: list[str] = []
+    head = "\n".join(lines[:16])[:600]
+    if head:
+        parts.append(head)
+    picked: list[str] = []
+    for line in lines[24:]:
+        if len(picked) >= 10:
+            break
+        if _SIGN_LINE.search(line) and line not in picked:
+            picked.append(line)
+    if picked:
+        parts.append("\n".join(picked))
+    return "\n".join(parts)[:limit]
+
+
+# 页面正文里真正有用的行：署名、来源、外链、版权。
+_SIGN_LINE = re.compile(
+    r"(x\.com|twitter|作者|署名|credit|photo\s*by|pic\s*by|source|来源|©|weibo|微博|"
+    r"instagram|patreon|fanbox|dl\.dlsite|fantia)",
+    re.I,
+)
+
+
 def page_text(html: str = "") -> tuple[str, str]:
     """从转载页 HTML 里取（标题，正文）。正文保留换行，检索词要按行挑。"""
     raw = _SCRIPT.sub("", html or "")

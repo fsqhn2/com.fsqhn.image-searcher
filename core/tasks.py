@@ -35,6 +35,9 @@ class SearchOutcome:
     # 视觉和 Grok 同时命中时，best 那张是视觉挑的；Grok 帖子配图里最近的一张单独放这儿。
     # 只留在内存里，落盘不保存。
     grok_image_b64: str = ""
+    # 用户这次发来的原图（压成 JPEG 后的 base64）。合并转发的页尾要再贴一次，
+    # 群里一次连着好几单结果时才分得清哪张图搜出哪堆东西。只留在内存里，落盘不保存。
+    upload_b64: str = ""
     # 视觉兜底的执行情况：{"ok", "checked", "picked": [候选图地址], "reason", "model", "error"}。
     # 只在指纹一条都没命中时才有值，落盘保留，重放时也能说清当时复核了什么。
     vision: dict | None = None
@@ -60,6 +63,10 @@ class SearchOutcome:
     # "handle", "post", "distance", "x_name"}。hit 时结论已经换成那条帖子；none 只用来
     # 说明「翻过哪些号、都没有」，不改结论。
     repost_author: dict | None = None
+    # 按转载站标题里的作者名去 X 找号：{"status": hit/named/none, "author": "染三ran3",
+    # "variants": [...], "scanned": [...], "handle", "x_name", "post", "distance"}。
+    # hit 时结论已经换成那条帖子；named 只说明「名字对上了这个号」，仍要自己核对。
+    title_author: dict | None = None
     # 微博站内反查：{"status": hit/none/error, "query", "kind": name/uid, "uid", "name",
     # "followers", "url", "source", "max_fans", "floor"}。hit 只是线索（这个号确实是
     # 她本人），不改 best；none 说明搜过但没搜到粉丝量像正主的同名号。
@@ -73,6 +80,10 @@ class SearchOutcome:
     # "tiers": [{title, cents, currency, free}], "preview": {title, url}}。
     # 图包里的图公开渠道搜不到，这块是唯一能给到底的地方；没有付费页时为空。
     paywall: dict | None = None
+    # 图集 / 泄露页面上标的来源账号：[{platform, handle, url, count, site, page,
+    # author_page}]。落点在 picazor 这类站时，会从帖子页翻到发布者主页再抽一次，
+    # 这时 author_page 有值——比帖子页 meta 里抄的硬，但仍然只当线索。
+    gallery_sources: list[dict] = field(default_factory=list)
     # 展示用图片：候选图地址 → base64。只留在内存里，落盘不保存（体积太大）。
     images: dict[str, str] = field(default_factory=dict)
     # 这次结果来自按图缓存。命中时不重跑引擎，elapsed_ms 是当初那次的耗时。
@@ -100,9 +111,11 @@ class SearchOutcome:
             "same_person": self.same_person,
             "x_identity": self.x_identity,
             "repost_author": self.repost_author,
+            "title_author": self.title_author,
             "weibo": self.weibo,
             "role_hint": self.role_hint,
             "paywall": self.paywall,
+            "gallery_sources": self.gallery_sources or [],
         }
 
     @classmethod
@@ -129,9 +142,11 @@ class SearchOutcome:
             same_person=summary.get("same_person"),
             x_identity=summary.get("x_identity"),
             repost_author=summary.get("repost_author"),
+            title_author=summary.get("title_author"),
             weibo=summary.get("weibo"),
             role_hint=summary.get("role_hint"),
             paywall=summary.get("paywall"),
+            gallery_sources=summary.get("gallery_sources") or [],
         )
 
 

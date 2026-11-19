@@ -667,6 +667,15 @@ _WATERMARK_IDC = re.compile(r"@?\s*\bidc([A-Za-z0-9_]{4,15})", re.I)
 # 图上写着 © Ryomky，机器人自己的「理解图片」也读成 © Ryamky，可取号函数只认
 # @ 和 id=，于是这条唯一指向本人的线索被整条丢掉。
 _WATERMARK_COPY = re.compile(r"[©Ⓒ]\s*@?([A-Za-z0-9_.]{3,30})")
+# 模板词后面跟的那个才是名字：``Photo by kuru``、``Photographer: kuru``、
+# ``PHOTOGRAPHER kuru``。反过来，光是一个 ``PHOTOGRAPHER``（占位模板，谁都能用）
+# 后面什么都没有，就不是账号——实测 s-20261119-1605-e790 的水印只有这一个词，
+# 插件顺着它去核了 x.com/photographer，还比出一个同名微博，两条都是噪声。
+_WATERMARK_CREDIT = re.compile(
+    r"(?:photo(?:graph(?:y|er))?|shot|credit(?:\s+to)?|coser|cosplayer|model|artist)"
+    r"\s*(?:by|[:：]|@|\s)\s*([A-Za-z0-9_][A-Za-z0-9_.\-]{2,24})",
+    re.I,
+)
 # 模型说「没有」的各种写法。水印常常小到只有一个像素高，它照样会回一句「看不清」，
 # 这种不能当成「读到了一个 ID」。
 _WATERMARK_EMPTY = (
@@ -683,7 +692,9 @@ _WATERMARK_EMPTY = (
     "n/a",
     "no ",
 )
-# 水印里会出现的站名，不是账号。裸串命中这些词时不能当 handle。
+# 水印里会出现的站名和模板词，不是账号。裸串命中这些词时不能当 handle。
+# 模板词（PHOTOGRAPHER、CREDIT 这类）是通用的占位符，谁都能往图上打；真正有用的
+# 是它后面跟着的那个词，交给 _WATERMARK_CREDIT 取。
 _WATERMARK_PLATFORMS = frozenset(
     {
         "weibo",
@@ -698,6 +709,22 @@ _WATERMARK_PLATFORMS = frozenset(
         "http",
         "https",
         "com",
+        "photo",
+        "photos",
+        "photography",
+        "photographer",
+        "photographers",
+        "shot",
+        "credit",
+        "credits",
+        "coser",
+        "cosplayer",
+        "model",
+        "artist",
+        "edit",
+        "edits",
+        "picture",
+        "pics",
     }
 )
 
@@ -777,7 +804,7 @@ def handles_from_watermark(text: str, limit: int = 3) -> list[str]:
         if name not in found:
             found.append(name)
 
-    for pattern in (_WATERMARK_ID_PREFIX, _WATERMARK_IDC, _WATERMARK_COPY):
+    for pattern in (_WATERMARK_ID_PREFIX, _WATERMARK_IDC, _WATERMARK_CREDIT, _WATERMARK_COPY):
         for match in pattern.finditer(value):
             add(match.group(1))
     for match in _WATERMARK_HANDLE.finditer(value):
