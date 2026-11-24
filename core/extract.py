@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import re
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 MIRROR_URL_RE = re.compile(
     r"^https?://(?:[A-Za-z0-9-]+\.)*(?:sotwe\.com|twstalker\.com|twstalker\.org)/([A-Za-z0-9_]+)",
@@ -114,6 +114,37 @@ def is_pixiv_platform(platform: str, url: str = "") -> bool:
     """
     text = f"{platform or ''} {(urlparse(url).netloc or '')}".lower()
     return "pixiv.net" in text or "pximg.net" in text
+
+
+# 搬运站的图床文件名常把 pixiv 作品号拼进去，还顺手写上作者名：
+# `沒有名字-by-lol-with-Arknights-Endfield-…-152342429.webp`。这是「这张图出自
+# 哪个 pixiv 作品」的现成注脚，比任何相似度都硬——但必须回流到 pixiv 校验：
+# 作品号要真的存在，作者名要真的对得上，否则 `photo-20261123.jpg` 这种也能凑巧
+# 撞上一个 2016 年的旧作品号。
+_ARTWORK_TAIL_RE = re.compile(r"[-_](\d{6,10})\.(?:webp|jpe?g|png|avif|gif)$", re.I)
+
+
+def pixiv_filename_hint(url: str) -> tuple[str, str]:
+    """从图片地址的文件名里读 pixiv 作品号与作者名：返回 ``(作品号, 文件名)``。
+
+    抽不到作品号时返回 ``("", "")``。作者名不在这里判断，交给调用方跟 pixiv
+    返回的 ``userName`` 比——文件名里 `by-xxx` 那一段可能是「by admin」这种
+    站方署名，光看文件名分不清。
+    """
+    path = unquote(urlparse(url or "").path or "")
+    name = path.rsplit("/", 1)[-1]
+    if not name:
+        return "", ""
+    match = _ARTWORK_TAIL_RE.search(name)
+    if not match:
+        return "", ""
+    return match.group(1), name
+
+
+def pixiv_artwork_url(illust_id: str) -> str:
+    """pixiv 作品页地址（老链接一律归一成 /artworks/<id>）。"""
+    value = str(illust_id or "").strip()
+    return f"https://www.pixiv.net/artworks/{value}" if value else ""
 
 
 _SOCIAL_HOSTS = (
@@ -341,6 +372,126 @@ def is_forum_page(url: str = "", source: str = "") -> bool:
     return any(host == token or host.endswith("." + token) for token in _FORUM_HOSTS)
 
 
+# 站点的「列表页」：标签、分类、归档、分页、站内搜索。这类页面本身不是一篇帖子，
+# 页面上的图是列表里某一条的缩略图，指纹对上只说明「这张图出现在这个列表里」。
+# 实测 s-20261119-2329-c8e9：best 落在 `nudebird.biz/tag/bang-dream/`（距离 4），
+# 点进去是一整页缩略图，找不到这张图对应的那篇帖子。
+# `/page/N` 不算列表页信号：文章和图集自己也分页（`…/p/slug/page/2`、
+# `…/en/article/27949/page/3/`），那只是同一篇的第二页。实测 c077 那单真正那篇
+# 帖子因为带 `/page/2` 被降成「列表页」，接着挖层还从它挖到了站点合集页。
+_LISTING_PATH_RE = re.compile(
+    r"/(?:tag|tags|category|categories|label|labels|archive|archives|topic|topics"
+    r"|collection|collections|series)(?:/|$)",
+    re.I,
+)
+_LISTING_QUERY_RE = re.compile(r"(?:^|&)(?:s|tag|cat|category|label|q)=", re.I)
+_LISTING_TITLE_RE = re.compile(
+    r"\barchives?\b|^\s*tag\s*[:：]|\bpage\s*\d+\s*$|\bpage\s*\d+\s+of\s+\d+", re.I
+)
+
+
+def listing_page_kind(url: str = "", title: str = "") -> str:
+    """这条候选是不是站点的列表页；是的话返回中文叫法，不是返回空串。
+
+    只看 URL 路径段和标题，不按域名一刀切：同一个站点既有具体帖子页也有标签页
+    （`xx.knit.bid/en/article/32501/` 是帖子，`…/tag/xxx/` 是列表）。
+    """
+    text = (url or "").strip()
+    if text:
+        parsed = urlparse(text)
+        if _LISTING_PATH_RE.search(parsed.path or ""):
+            return "站点的标签／分类列表页"
+        if _LISTING_QUERY_RE.search(parsed.query or ""):
+            return "站点的搜索／分类列表页"
+    if title and _LISTING_TITLE_RE.search(str(title)):
+        return "站点的列表页"
+    return ""
+
+
+_ANCHOR_HREF_RE = re.compile(r'<a\b[^>]*href="([^"]+)"', re.I)
+_IMAGE_FILE_RE = re.compile(r"\.(?:jpe?g|png|webp|gif|avif|bmp)(?:$|\?)", re.I)
+
+
+def listing_entry_link(html: str = "", image_url: str = "", page_url: str = "") -> str:
+    """列表页里某张图所属那篇帖子的链接。
+
+    列表页上每张缩略图都包在一个指向具体帖子的 `<a>` 里：拿图片地址（找不到就
+    拿文件名主干）在 HTML 里定位，再往前找最近的那个链接，就是这一篇。
+
+    实测 `nudebird.biz/tag/bang-dream/`：缩略图 `…/21-1792635363-592x888-c.webp`
+    前一个链接是 `…/x-maru-on-the-road/`，那篇帖子的 og:image 正是原图（距离 4）。
+    """
+    text = str(html or "")
+    if not text:
+        return ""
+    index = -1
+    needle = str(image_url or "").strip()
+    if needle:
+        index = text.find(needle)
+    if index < 0 and needle:
+        # 懒加载会把地址改写（-592x888 这类尺寸后缀），退一步只认文件名主干。
+        name = needle.rsplit("/", 1)[-1]
+        stem = re.sub(r"[-_]\d+x\d+", "", name.rsplit(".", 1)[0])
+        if len(stem) >= 8:
+            index = text.find(stem)
+    if index < 0:
+        return ""
+    window = text[max(0, index - 4000):index]
+    links = _ANCHOR_HREF_RE.findall(window)
+    for href in reversed(links):
+        target = urljoin(page_url or "", str(href).strip())
+        if not target.startswith(("http://", "https://")):
+            continue
+        if target == (page_url or "").strip():
+            continue
+        if _IMAGE_FILE_RE.search(urlparse(target).path or ""):
+            continue
+        if listing_page_kind(target, ""):
+            continue
+        return target
+    return ""
+
+
+def is_site_name(word: str = "", urls: list[str] | None = None) -> bool:
+    """这个词是不是候选站点自己的名字。
+
+    图集站会把站名压到图上（`PixiBB` → `cosplay.pixibb.com`），水印那一步把它当账号
+    去核，X 上恰好有同名号就挂成了线索。实测 158d：`@pixiBB` 是个叫 brandy french
+    的号，跟这张图毫无关系，顺着它还去查了一遍微博。
+    """
+    core = re.sub(r"[^a-z0-9]", "", str(word or "").lower())
+    # 4 个字符以下太容易撞上站点名片段（`Pixi` 就是 `pixibb` 的前缀），不判。
+    if len(core) < 5:
+        return False
+    for url in urls or []:
+        host = urlparse(url).netloc.lower()
+        if not host:
+            continue
+        flat = re.sub(r"[^a-z0-9]", "", host)
+        if core in flat:
+            return True
+    return False
+
+
+def page_main_image(html: str = "", page_url: str = "") -> str:
+    """帖子页里那张“正文原图”：只认 og:image / twitter:image，别把站标当图。"""
+    text = str(html or "")
+    if not text:
+        return ""
+    for pattern in (
+        r'<meta[^>]+property="og:image"[^>]+content="([^"]+)"',
+        r'<meta[^>]+content="([^"]+)"[^>]+property="og:image"',
+        r'<meta[^>]+name="twitter:image"[^>]+content="([^"]+)"',
+        r'<meta[^>]+content="([^"]+)"[^>]+name="twitter:image"',
+    ):
+        found = re.search(pattern, text, re.I)
+        if found:
+            return urljoin(page_url or "", found.group(1).strip())
+    return ""
+
+
+
+
 def match_account(url: str = "") -> tuple[str, str, str] | None:
     """把链接解析成 (平台标识, 账号, 规范化的账号页地址)。
 
@@ -419,6 +570,12 @@ _PHOTO_COUNT_RE = re.compile(r"(?:set\s+of\s+)?(\d+)\s*photos?\b", re.I)
 # 后半截得像个套图说明（写着 cosplay / photos 之类），否则可能只是角色名
 # （"Nahida – Genshin Impact" 前半截是角色不是模特）。
 _SET_HINT_RE = re.compile(r"cosplay|photo|picture|album|image|set\b", re.I)
+# 图集站标题开头残留的分类标签（开括号被站方吃掉那种）：「Cosplay] 小仓千代w …」。
+_LEAD_TAG_RE = re.compile(
+    r"^\s*(?:cosplay|cosplayer|photo|photos|model|coser|gallery|set|写真|套图)\s*[\]\)】〕]\s*",
+    re.I,
+)
+_CJK_HINT = re.compile(r"[一-鿿]")
 
 
 def repost_model_name(title: str = "") -> str:
@@ -447,6 +604,11 @@ def split_repost_title(title: str = "") -> tuple[str, str]:
     text = _EMPTY_PAREN_RE.sub("", raw)
     had_prefix = bool(_MODEL_PREFIX_RE.match(text))
     text = _MODEL_PREFIX_RE.sub("", text)
+    # 开头的分类标签：「Cosplay] 小仓千代w 明日方舟W泳装| Xasiat」——图集站常把开
+    # 括号吃掉，只剩一个「Cosplay]」。不剥掉的话下面切出来的名字带着这截标签。
+    text = _LEAD_TAG_RE.sub("", text)
+    # 「泳装| Xasiat」这种竖线两边不带空格的写法也要能切。
+    text = re.sub(r"\s*\|\s*", " | ", text)
     text = _ANY_EMPTY_PAREN_RE.sub(" ", text)
     text = re.sub(r"\s{2,}", " ", text).strip()
     name, extra = text, ""
@@ -465,6 +627,12 @@ def split_repost_title(title: str = "") -> tuple[str, str]:
         extra = ""
     if extra:
         return name, _PHOTO_COUNT_RE.sub(r"\1 张", extra)
+    # 中文标题常把作品名直接跟在名字后面（「小仓千代w 明日方舟W泳装」），尾巴里
+    # 又没有 cosplay/photos 那几个词：名字就是开头那一截，后面是作品名。整条当名
+    # 字摆出来，用户看到的是一条脏标题（5832 那单）。
+    head = re.split(r"\s+", name, maxsplit=1)
+    if len(head) == 2 and _CJK_HINT.search(head[0]) and 2 <= len(head[0]) <= 24:
+        return head[0], head[1].strip()
     # 切不出套图说明时，只有标题自带「Model X」前缀才敢认这个名字；否则整条
     # 原样返回（"Nahida – Genshin Impact" 的 Nahida 是角色，不是模特）。
     return (name if had_prefix and name else raw), ""

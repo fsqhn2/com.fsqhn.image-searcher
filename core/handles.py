@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from urllib.parse import unquote
 
 _TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9_]{3,14}")
@@ -30,6 +31,15 @@ _STOP = {
     "nahida", "rukka", "rukkhadevata", "honkai", "starrail", "zenless",
     "patreon", "instagram", "twitter", "facebook", "tiktok", "onlyfans",
     "fansly", "youtube", "deviantart", "pixiv", "kemono", "reddit", "telegram",
+    # 站名：telegra.ph 的标题里写着「Telegraph」，X 上真有一个 @Telegraph，
+    # 于是被当成作者号收进来（2c76 那单）。xasiat 同上。
+    "telegraph", "telegra",
+    # 付费平台的品牌名。泄漏站的标题常把平台列成一串（「…läckta från Onlyfans
+    # Patreon Fansly FriendsOnly Fanvue iFans…」），2c76 那单就从里面挑出了
+    # @fanvue（7 万粉）。这不是人名，也不可能是作者的号。
+    "fanvue", "fansone", "fancentro", "friendsonly", "ifans", "manyvids",
+    "loyalfans", "justforfans", "fanbox", "fantia", "subscribestar",
+    "linktree", "carrd", "beacons",
     "galleryepic", "xasiat", "ehimejk", "masterfap", "v2ph", "wordpress",
     "fapello", "skeb", "kemono", "coomer", "thotsbay",
     "photo", "photos", "picture", "pictures", "pic", "pics", "album", "albums",
@@ -91,7 +101,15 @@ _SIG_BY = re.compile(
     r"\s+by\s+([A-Za-z0-9_.\-]{3,24})",
     re.I,
 )
-_SIG_GENERIC_BY = re.compile(r"\bby\s+([A-Za-z0-9_.\-]{3,24})", re.I)
+# 「drawn by」是画站的画师署名（danbooru 的标题一律写成
+# 「nozomi and hikari (blue archive) drawn by nemo_(leafnight ..」），跟 coser 的
+# 社交账号是两回事。411f 那单就是从这里抽出 nemo，去 X 撞上 1.6 万粉的
+# `@NemoNevermore_`，一路摆到首屏。画师的笔名不是本人账号，负向断言挡掉。
+_SIG_GENERIC_BY = re.compile(
+    r"(?<!\bdrawn )(?<!\billust )(?<!\billustrated )(?<!\bpainted )"
+    r"\bby\s+([A-Za-z0-9_.\-]{3,24})",
+    re.I,
+)
 _SIG_LABEL = re.compile(
     r"\b(?:coser|cosplayer|cn|model|credit|credit\s+to|photo|photography|photographer)"
     r"\s*[:：]\s*@?([A-Za-z0-9_.\-]{2,24})",
@@ -307,6 +325,79 @@ def title_author(text: str) -> str:
     return head[:40]
 
 
+# 内容平台的分享页把账号写在标题里：「夜色温柔，风也轻…@诗诗爱生活的动态」。
+# 这种标题的正文是号主自己写的一句话，账号只在 @ 后面跟着平台后缀出现；正文里
+# 随便一个 @ 不能当账号，所以只认带「的+平台名」的写法。
+_AT_AUTHOR = re.compile(
+    r"[@＠]\s*([^\s@＠,，。、;；:：!！?？\"'“”‘’()（）\[\]【】<>《》/\\|]{2,30}?)"
+    r"\s*的\s*(?:动态|主页|微博|微头条|百家号|B站|b站|哔哩哔哩|小红书|抖音|快手|视频|帖子|文章)"
+)
+
+
+def title_at_author(text: str) -> str:
+    """内容平台标题里的 ``@账号``：``「…@诗诗爱生活的动态」`` → ``「诗诗爱生活」``。
+
+    百度动态、百家号这类分享页的候选标题是正文首句，账号只出现在 ``<title>`` 的
+    ``@xxx的动态`` 里（b3b4 那单就是这样，页面上没有任何 author 字段）。只认带
+    ``的+平台名`` 的写法，避免把正文里的 ``@`` 当成账号。
+    """
+    match = _AT_AUTHOR.search(str(text or "").strip())
+    if not match:
+        return ""
+    value = match.group(1).strip()
+    if len(value) < 2 or value.lower() in _STOP or value.isdigit():
+        return ""
+    return value[:40]
+
+
+# 页面标题里直接写出来的 X 账号：「Model Kokura Chiyo (@yummychiyo) in cosplay W」。
+# cosplayrule34、galleryepic 这类图集站习惯这么标人，括号里的号一般就是原作者。
+# 比从名字展开出来的变体硬得多——变体是猜的，这个是页面自己写的。
+_TITLE_X_HANDLE = re.compile(r"[\(\（\[\【]\s*[@＠]\s*([A-Za-z0-9_]{3,15})\s*[\)\）\]\】]")
+# 没有括号的裸 @写法。前面必须是空白或标点，免得把邮箱 ``a@b.com`` 当账号。
+_TITLE_AT_HANDLE = re.compile(
+    r"(?:^|[\s,，、;；:：|｜/])\s*[@＠]([A-Za-z0-9_]{3,15})(?![A-Za-z0-9_])"
+)
+
+
+def is_stop_word(word: str = "") -> bool:
+    """这个词是不是平台名／通用词／站名（``_STOP`` 里那些）。
+
+    这类词不能当账号，也不能当人名：标题里写着 cosplay、照片里印着 pixibb，
+    都不代表账号或作者。
+    """
+    return str(word or "").strip().lower() in _STOP
+
+
+def title_handle(text: str) -> tuple[str, str]:
+    """标题里明写的 X 账号：返回 ``(账号, 账号前面的名字)``，没写返回 ``("", "")``。
+
+    只认 ``(@handle)`` 和前面带空白的 ``@handle`` 两种写法。中文名、``@诗诗爱生活
+    的动态`` 那类不带 ASCII 账号的写法在这里取不出来（那是 ``title_at_author``
+    的活），这里的返回值要直接拿去查 X。
+    """
+    value = str(text or "").strip()
+    if not value:
+        return "", ""
+    match = _TITLE_X_HANDLE.search(value)
+    if match is None:
+        match = _TITLE_AT_HANDLE.search(value)
+    if match is None:
+        return "", ""
+    handle = match.group(1)
+    if handle.isdigit() or handle.lower() in _STOP:
+        return "", ""
+    before = value[: match.start()].strip()
+    if before:
+        before = _TITLE_SPLIT.split(before)[-1].strip()
+    before = before.strip(" ([（【-–—|｜/").strip()
+    # 括号前面那一大串整句说明（「[X] Maru on the road」之类）不是名字，宁可不给：
+    # 名字只用来核显示名，给错了反而把真号挡在外面。
+    if len([word for word in re.split(r"\s+", before) if word]) > 4:
+        before = ""
+    return handle, before[:40]
+
+
 def split_author_name(value: str) -> tuple[str, str]:
     """把「中文名 + 英文 id」拆成两截：``染三ran3`` → ``(染三, ran3)``。
 
@@ -379,6 +470,66 @@ def llm_author_reply(text: str) -> tuple[str, str, str]:
         if not author and _looks_like_name(item):
             author = item
     return _finish_author(author, handle, name)
+
+
+def llm_author_list(text: str) -> list[dict[str, str]] | None:
+    """解析模型针对多个页面回的那串作者。
+
+    要求回 JSON 数组 ``[{"site", "author", "name", "handle", "x"}]``，只回一个对象、
+    或包一层 ``{"authors": [...]}`` 也接。返回 ``None`` 表示模型这轮什么都没说（空串、
+    只肯解释、JSON 坏了），调用方据此退回规则；返回空列表表示它明确答了「这些页面
+    都没写作者」——这两种情况的处理不一样，不能混。
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    body = re.sub(r"^```[a-zA-Z]*|```$", "", raw).strip()
+    data = _loads_first(body)
+    if data is None:
+        return None
+    items: list[object]
+    if isinstance(data, list):
+        items = list(data)
+    elif isinstance(data.get("authors"), list):  # type: ignore[union-attr]
+        items = list(data["authors"])  # type: ignore[index]
+    else:
+        items = [data]
+    found: list[dict[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        author, handle, name = _finish_author(
+            str(item.get("author") or ""),
+            str(item.get("handle") or ""),
+            str(item.get("name") or ""),
+            str(item.get("x") or item.get("link") or ""),
+        )
+        if not (author or handle or name):
+            continue
+        found.append(
+            {
+                "author": author or name or handle,
+                "name": name,
+                "handle": handle,
+                "site": str(item.get("site") or item.get("url") or ""),
+            }
+        )
+    return found
+
+
+def _loads_first(text: str) -> object | None:
+    """从一段可能夹着解释的文字里，取出第一个能解出来的 JSON 数组或对象。"""
+    text = str(text or "")
+    for index, char in enumerate(text):
+        if char not in "[{":
+            continue
+        try:
+            value, _ = json.JSONDecoder().raw_decode(text[index:])
+        except (ValueError, TypeError):
+            continue
+        if isinstance(value, (list, dict)):
+            return value
+    return None
 
 
 def _finish_author(author: str, handle: str, name: str, link: str = "") -> tuple[str, str, str]:
@@ -487,8 +638,8 @@ def name_matches(author: str, display: str) -> bool:
     ``「染三ran3」`` 对 ``「染三 ran3」`` 算对上；对 ``「あんらん」`` 不算。
     去空格后互相包含即可——中文名和英文名分开写时，两边都要出现。
     """
-    left = re.sub(r"\s+", "", str(author or "")).lower()
-    right = re.sub(r"\s+", "", str(display or "")).lower()
+    left = re.sub(r"\s+", "", fold(author)).lower()
+    right = re.sub(r"\s+", "", fold(display)).lower()
     if len(left) < 3 or not right:
         return False
     if left in right or right in left:
@@ -498,9 +649,20 @@ def name_matches(author: str, display: str) -> bool:
     return bool(cjk and latin and cjk in right and latin in right)
 
 
+def fold(text: str) -> str:
+    """把花体、全角字符折回普通写法。
+
+    X 的显示名爱用数学粗斜体（「𝑴𝒊𝒐 𝑲𝒖𝒖𝒌𝒐🍀」），全角字母也常见。不折回来，
+    标题里的「Mio Kuuko」跟她就是对不上——411f 那单的真号 `@Kuukow002` 就在
+    检索结果里摆着，显示名一比却是 False，于是被当成不认识的号丢掉。
+    NFKC 顺带把全角数字、连字之类的写法统一掉，对纯英文名没有副作用。
+    """
+    return unicodedata.normalize("NFKC", str(text or ""))
+
+
 def stem(handle: str) -> str:
     """去掉结尾的数字和下划线：kuukow002 → kuukow，kuuko_w → kuuko。"""
-    return re.sub(r"[_\d]+$", "", (handle or "").lower())
+    return re.sub(r"[_\d]+$", "", fold(handle).lower())
 
 
 # 模型读水印时最常见的错法就是把 w 读散：w 本来就是两个 u，
@@ -668,7 +830,7 @@ def match_score(handle: str, texts: list[str]) -> int:
     core = stem(handle)
     if len(core) < 6:
         return 0
-    joined = " ".join(texts).lower()
+    joined = " ".join(fold(text) for text in texts).lower()
     return len(core) if core in joined else 0
 
 
@@ -773,12 +935,20 @@ def shares_anchor(handle: str, texts: list[str]) -> bool:
 
 
 def _anchor_tokens(texts: list[str]) -> set[str]:
-    """把一批标题拆成去重后的小写主干，供相似判断用。"""
+    """把一批标题拆成去重后的小写主干，供相似判断用。
+
+    **停用词不算主干**：通用词人人都写着，靠它「对上」等于没对。实测 5832 那单的
+    标题里写着 cosplay，另一个 coser 的标题「Hiyuki cosplay by Carol」就靠共享
+    ``cosplay`` 把 ``@carol`` 送进了线索；2c76 的 ``@Telegraph`` 同理（telegra.ph
+    的站名写在标题里）。
+    """
     pool: set[str] = set()
     for text in texts:
-        for match in _TOKEN.finditer(text or ""):
+        for match in _TOKEN.finditer(fold(text)):
             low = match.group(0).lower()
             if len(low) < 4:
+                continue
+            if low in _STOP:
                 continue
             pool.add(stem(low) or low)
     return pool

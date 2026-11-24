@@ -224,6 +224,20 @@ class WatermarkTest(unittest.TestCase):
         self.assertIn("NothingLose", found)
         self.assertGreaterEqual(len(found), 2)
 
+    def test_watermark_url_is_not_split_into_junk(self):
+        """水印写着主页地址时只认 x/twitter；``t.me/xxx`` 不能拆出 ``me/xxx``。
+
+        2c76 那单的卡片上就拼出了 ``https://x.com/me/exhentai5starcosplay``。
+        """
+        self.assertEqual(vision.handles_from_watermark("t.me/exhentai5starcosplay"), [])
+        self.assertEqual(
+            vision.handles_from_watermark("x.com/kuru_xox"), ["kuru_xox"]
+        )
+        self.assertEqual(
+            vision.handles_from_watermark("https://twitter.com/kuru_xox/status/1"),
+            ["kuru_xox"],
+        )
+
     def test_handles_from_watermark_reads_copyright_name(self):
         """``© Ryomky`` 这种署名也要能取出来。
 

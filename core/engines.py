@@ -10,12 +10,13 @@ from __future__ import annotations
 import hashlib
 import html as html_lib
 import json
+import logging
 import re
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse
 
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import ReadTimeout, SSLError
@@ -27,6 +28,7 @@ from .extract import (
     extract_identity,
     is_avatar_image,
     is_crawler_placeholder,
+    listing_page_kind,
     platform_of,
     promote_mirror,
     relevance_rank,
@@ -35,14 +37,18 @@ from .extract import (
 )
 from .httpclient import (
     HttpError,
+    ProxySpec,
     download_image_multi,
     is_auth_failure,
     json_or_raise,
     make_session,
+    proxy_routes,
 )
 from .identity import SERPER_LENS, is_serper_key
 from .keypool import KeyPool
 from .keystate import renewal_deadline
+
+logger = logging.getLogger(__name__)
 
 SERP_ENDPOINT = "https://serpapi.com/search.json"
 SERP_IMAGE_ENDPOINT = "https://serpapi.com/image"
@@ -127,6 +133,18 @@ SIGHTENGINE_ENDPOINT = "https://api.sightengine.com/1.0/check.json"
 ENGINES_VERSION = "2026-11-03.1"
 
 YANDEX_HOSTS = ("https://yandex.ru", "https://yandex.com.tr", "https://yandex.com")
+
+# 单次尝试的超时上限（秒）。以前所有站点与线路共用 `engine_timeout`（线上 50 秒）
+# 那一个总预算，每次尝试又取「剩余时间」，于是第一条线路一卡就把预算吃光，
+# 后面的线路只剩两三秒——5 秒的上传跑不完，也被记成「超时」。
+# 2026-11-21 早上那单（s-20261121-1102-f443）的错误串只剩三项
+# `yandex.ru（代理）超时；yandex.ru（直连）超时；yandex.com.tr（代理）超时`，
+# `com.tr` 直连和 `yandex.com` 根本没轮到，就是这个原因（实测同一时刻
+# yandex.ru 两条线路都是 5.2 秒正常返回）。现在每次尝试单独封顶：
+# 哪条线卡住只损失这一份，后来的线还能拿到完整时间。
+# 12 秒在 6e92 那单上偏紧（代理 6.8 秒、直连 5.2 秒是常态，一抖就顶到上限），
+# 按用户 11-22 的决定抬到 15 秒。
+_ATTEMPT_TIMEOUT = 15.0
 BAIDU_UPLOAD = "https://graph.baidu.com/upload"
 
 
@@ -162,6 +180,14 @@ class Candidate:
     # 再加一种降级就得改五处字符串比对，漏一处就会出现「说不能当原帖、又按找到了
     # 展示」。老记录没有这个字段，downgrade_kind() 仍退回前缀判断。
     downgrade: str = ""
+    # 列表页里挖出来的那篇帖子，页面自己标着的来源账号（gallery.parse_source_accounts）。
+    # 只在「列表页 → 具体帖子」这条路上填：挖到帖子不等于到此为止，页面上写明的
+    # 账号要接着拿去翻她的带图帖核指纹，命中了才换结论。
+    source_accounts: list[dict[str, object]] = field(default_factory=list)
+    # 这条候选是「账号主页」而不是某一篇帖子（目前只有搜索页反解出来的 B 站空间页）。
+    # `_pick_best` 在真实帖子距离不比它差太多时优先选帖子：主页点进去看不到那张图，
+    # 把它当结论等于让用户自己去翻。
+    account_page: bool = False
 
     def finalize(self) -> "Candidate":
         """补全平台与身份字段。"""
@@ -271,7 +297,7 @@ def _say_to(note: Callable[[str], None] | None) -> Callable[..., None]:
     return _say
 
 
-def _upload_uguu(raw: bytes, proxy: str, timeout: float, say: Callable[..., None]) -> str:
+def _upload_uguu(raw: bytes, proxy: ProxySpec, timeout: float, say: Callable[..., None]) -> str:
     """uguu.se：``output=text`` 直接回一行直链，不用解 JSON。
 
     它偶尔整段回 502（实测直连和代理都一样，是它自己的故障），过一次再试一次
@@ -308,7 +334,7 @@ def _upload_uguu(raw: bytes, proxy: str, timeout: float, say: Callable[..., None
     return ""
 
 
-def _upload_chatglm(raw: bytes, proxy: str, timeout: float, say: Callable[..., None]) -> str:
+def _upload_chatglm(raw: bytes, proxy: ProxySpec, timeout: float, say: Callable[..., None]) -> str:
     """ChatGLM（智谱）的文件上传：不用 key，回一个 ``t1.chatglm.cn`` 的签名直链。
 
     链接带 ``expired_at`` 与 ``sign``，有时效；换成之后立刻拿去搜，别存着。
@@ -341,7 +367,7 @@ def _upload_chatglm(raw: bytes, proxy: str, timeout: float, say: Callable[..., N
         session.close()
 
 
-def _upload_cliim(raw: bytes, proxy: str, timeout: float, say: Callable[..., None]) -> str:
+def _upload_cliim(raw: bytes, proxy: ProxySpec, timeout: float, say: Callable[..., None]) -> str:
     """CliIm（草料二维码）的免费图床：文件名用图片 MD5，回阿里云杭州 OSS 直链。
 
     返回的是 ``http://oss-cn-hangzhou.aliyuncs.com/...``，Google 抓得到。
@@ -390,7 +416,7 @@ _UPLOADERS: dict[str, Callable[..., str]] = {
 
 def host_image_publicly(
     raw: bytes,
-    proxy: str = "",
+    proxy: ProxySpec = "",
     timeout: float = 40.0,
     note: Callable[[str], None] | None = None,
     hosting: Sequence[str] | None = None,
@@ -454,7 +480,7 @@ class LensEngine:
     def __init__(
         self,
         pool: KeyPool,
-        proxy: str = "",
+        proxy: ProxySpec = "",
         timeout: float = 40.0,
         retries: int = 2,
         retry_delay: float = 1.5,
@@ -750,65 +776,198 @@ class YandexEngine:
 
     name = "yandex"
 
-    def __init__(self, proxy: str = "", timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        proxy: ProxySpec = "",
+        timeout: float = 30.0,
+        routes: Sequence[str] | None = None,
+    ) -> None:
         self.proxy = proxy
         self.timeout = timeout
+        # 显式配了一串线路时，逐条都跑、候选并起来（11-23 实测：出口地区不同，
+        # Yandex 给的索引也不同——直连 72 条、美国出口 6 条且完全不是同一批站）。
+        self.routes = normalize_yandex_routes(routes)
 
     def _routes(self) -> list[str]:
-        """先走配置的代理，失败再试直连（"" 表示直连）。"""
+        """没配 routes 时走老规矩：主代理 → 备代理 → 直连（"" 表示直连）。"""
+        if self.routes:
+            return list(self.routes)
         routes: list[str] = []
-        for route in (self.proxy, ""):
+        for route in proxy_routes(self.proxy) + [""]:
             if route not in routes:
                 routes.append(route)
         return routes
 
+    def _attempt(self, host: str, route: str, raw: bytes, deadline: float) -> tuple[str, object]:
+        """一次请求：ok 拿到候选、retry 值得换个回合再试、stop 这条线别试了。"""
+        host_name = host.split("//", 1)[-1]
+        route_name = _route_name(route)
+        remaining = deadline - time.monotonic()
+        # 单次封顶：任何一条线卡住都只损失这一份，后面的线还能拿到完整时间
+        attempt_timeout = min(remaining, float(self.timeout), _ATTEMPT_TIMEOUT)
+        session = make_session(route)
+        started = time.monotonic()
+        try:
+            resp = session.post(
+                f"{host}/images/search",
+                params={"rpt": "imageview", "cbir_page": "sites"},
+                data={"prg": "1"},
+                files={"upfile": ("blob", raw, "image/jpeg")},
+                timeout=_timeout(attempt_timeout),
+            )
+            if resp.status_code != 200:
+                return "stop", f"{host_name}（{route_name}）HTTP {resp.status_code}"
+            sites = parse_yandex_sites(resp.text)
+            if sites is None:
+                # yandex.com 长期返回「服务建设中」空壳页，没有内嵌 state，
+                # 别再把它说成「结构变化」，那会误导排查方向。
+                kind = "返回空壳页" if is_yandex_shell_page(resp.text) else "结果页结构变化"
+                return "stop", f"{host_name}（{route_name}）{kind}"
+            return "ok", [to_yandex_candidate(site, self.name) for site in sites]
+        except ReadTimeout:
+            # 跨境链路偶发抖动：值得等所有线路都试完，再回头给一次机会
+            cost = time.monotonic() - started
+            return "retry", f"{host_name}（{route_name}）超时 {cost:.0f}s"
+        except (SSLError, RequestsConnectionError) as exc:
+            return "retry", f"{host_name}（{route_name}）{type(exc).__name__}"
+        except Exception as exc:  # noqa: BLE001
+            return "stop", f"{host_name}（{route_name}）{type(exc).__name__}"
+        finally:
+            session.close()
+
     def search(self, raw: bytes, image_url: str = "", stream_id: str = "") -> list[Candidate]:
+        """先轮一遍所有线路，都不行再回头重试，别把时间耗在同一条线上。
+
+        6e92 那单的教训：同一线路失败后原地重试一次，一次抖动就是 20 秒，
+        50 秒总预算被 `yandex.ru` 代理+直连各两次吃光，`com.tr` 直连和
+        `yandex.com` 压根没轮到。现在按「轮」走：第一轮把各条线各试一次，
+        只有超时／TLS 这类瞬时错误才进第二轮，HTTP 错误和空壳页不重试。
+
+        配了 `[yandex] routes` 时改走并集：同一条域名下每条线路都跑，候选去重后
+        一起交出去——不同出口拿到的站点完全不一样，只取第一条会白丢一半召回。
+        """
         failures: list[str] = []
         deadline = time.monotonic() + max(10.0, float(self.timeout))
+        if self.routes:
+            return self._search_merged(raw, deadline, failures)
+        return self._search_first(raw, deadline, failures)
+
+    def _search_first(
+        self, raw: bytes, deadline: float, failures: list[str]
+    ) -> list[Candidate]:
+        """老逻辑：第一条拿到候选的线路就用它，剩下的不再跑。"""
+        routes = self._routes()
         for host in YANDEX_HOSTS:
-            host_name = host.split("//", 1)[-1]
-            for route in self._routes():
-                route_name = "代理" if route else "直连"
-                for attempt in (1, 2):
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 3:
+            retry_later: list[str] = []
+            out_of_time = False
+            for round_index in (1, 2):
+                route_list = routes if round_index == 1 else retry_later
+                for route in route_list:
+                    if deadline - time.monotonic() <= 3:
+                        out_of_time = True
                         break
-                    session = make_session(route)
-                    try:
-                        resp = session.post(
-                            f"{host}/images/search",
-                            params={"rpt": "imageview", "cbir_page": "sites"},
-                            data={"prg": "1"},
-                            files={"upfile": ("blob", raw, "image/jpeg")},
-                            timeout=_timeout(min(remaining, self.timeout)),
-                        )
-                        if resp.status_code != 200:
-                            failures.append(f"{host_name}（{route_name}）HTTP {resp.status_code}")
-                            break
-                        sites = parse_yandex_sites(resp.text)
-                        if sites is None:
-                            # yandex.com 长期返回「服务建设中」空壳页，没有内嵌 state，
-                            # 别再把它说成「结构变化」，那会误导排查方向。
-                            kind = "返回空壳页" if is_yandex_shell_page(resp.text) else "结果页结构变化"
-                            failures.append(f"{host_name}（{route_name}）{kind}")
-                            break
-                        return [to_yandex_candidate(site, self.name) for site in sites]
-                    except ReadTimeout as exc:
-                        # 跨境链路偶发抖动，同一线路重试一次通常能过
-                        failures.append(f"{host_name}（{route_name}）超时")
-                        if attempt == 1:
-                            continue
-                        break
-                    except (SSLError, RequestsConnectionError) as exc:
-                        # TLS 被掐断、连不上：换线路比原地重试有意义
-                        failures.append(f"{host_name}（{route_name}）{type(exc).__name__}")
-                        break
-                    except Exception as exc:  # noqa: BLE001
-                        failures.append(f"{host_name}（{route_name}）{type(exc).__name__}")
-                        break
-                    finally:
-                        session.close()
+                    state, payload = self._attempt(host, route, raw, deadline)
+                    if state == "ok":
+                        return payload  # type: ignore[return-value]
+                    failures.append(str(payload))
+                    if state == "retry" and round_index == 1:
+                        retry_later.append(route)
+                if out_of_time:
+                    break
+            if out_of_time:
+                break
         raise EngineError(_attempt_summary(failures) or "Yandex 无响应")
+
+    def _search_merged(
+        self, raw: bytes, deadline: float, failures: list[str]
+    ) -> list[Candidate]:
+        """每条线路都跑一遍，候选去重后并起来；这个域名一条都没拿到才换下一个。"""
+        routes = self._routes()
+        for host in YANDEX_HOSTS:
+            got: list[Candidate] = []
+            retry_later: list[str] = []
+            for round_index in (1, 2):
+                route_list = routes if round_index == 1 else retry_later
+                for route in route_list:
+                    if deadline - time.monotonic() <= 3:
+                        break
+                    state, payload = self._attempt(host, route, raw, deadline)
+                    if state == "ok":
+                        got.extend(payload)  # type: ignore[arg-type]
+                    else:
+                        failures.append(str(payload))
+                        if state == "retry" and round_index == 1:
+                            retry_later.append(route)
+                if got:
+                    break
+            if got:
+                merged = merge_candidates(got)
+                if failures:
+                    # 并集里有一条线挂了不算失败，但得留痕：下次「怎么少了一半」能查到。
+                    logger.info(
+                        "Yandex 并集拿到 %s 条，另有线路失败：%s",
+                        len(merged),
+                        _attempt_summary(failures),
+                    )
+                return merged
+            if deadline - time.monotonic() <= 3:
+                break
+        raise EngineError(_attempt_summary(failures) or "Yandex 无响应")
+
+
+def normalize_yandex_routes(routes: Sequence[str] | None) -> list[str]:
+    """把配置里的线路名整理成可用的地址列表；填 direct／直连／留空都算直连。"""
+    cleaned: list[str] = []
+    for raw in routes or ():
+        text = str(raw or "").strip()
+        if text.lower() in {"direct", "直连", "none", "off"}:
+            text = ""
+        if text not in cleaned:
+            cleaned.append(text)
+    return cleaned
+
+
+def _route_name(route: str) -> str:
+    """失败串里怎么称呼这条线路：直连，或者代理的端口号。"""
+    if not route:
+        return "直连"
+    port = urlparse(route).port
+    return f"代理{port}" if port else "代理"
+
+
+def merge_candidates(rows: Sequence[Candidate]) -> list[Candidate]:
+    """把几条线路拿回来的候选并成一份，按页面地址去重、保留先出现的顺序。"""
+    seen: set[str] = set()
+    merged: list[Candidate] = []
+    for item in rows:
+        key = _route_dedupe_key(item.url or "") or _route_dedupe_key(item.image_url or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        merged.append(item)
+    return merged
+
+
+# Yandex 会在结果里挂自己的追踪参数，两条线路对同一个页面拼的可能不一样。
+_TRACKING_QUERY = {"hl", "lr", "redircnt", "yclid", "gclid", "fbclid"}
+
+
+def _route_dedupe_key(url: str) -> str:
+    """去重用的键：去掉追踪参数与结尾斜杠，同一个页面在两条线上算同一条。"""
+    raw = clean_url(url or "")
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    if not parsed.netloc:
+        return ""
+    query = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if key.lower() not in _TRACKING_QUERY and not key.lower().startswith("utm_")
+    ]
+    path = parsed.path.rstrip("/") or "/"
+    tail = f"?{urlencode(query)}" if query else ""
+    return f"{parsed.netloc.lower()}{path}{tail}"
 
 
 def _attempt_summary(failures: list[str]) -> str:
@@ -878,7 +1037,7 @@ class BaiduEngine:
 
     name = "baidu"
 
-    def __init__(self, proxy: str = "", timeout: float = 30.0) -> None:
+    def __init__(self, proxy: ProxySpec = "", timeout: float = 30.0) -> None:
         self.proxy = proxy
         self.timeout = timeout
 
@@ -1018,7 +1177,7 @@ class SauceNaoEngine:
     def __init__(
         self,
         pool: KeyPool,
-        proxy: str = "",
+        proxy: ProxySpec = "",
         timeout: float = 30.0,
         min_similarity: float = 75.0,
         db_full: str = "999",
@@ -1064,7 +1223,7 @@ class SauceNaoEngine:
         冷却划算——SauceNAO 是命中率最高的一条线之一，不该因为一次握手丢掉。
         """
         routes: list[str] = []
-        for route in (self.proxy, ""):
+        for route in proxy_routes(self.proxy) + [""]:
             if route not in routes:
                 routes.append(route)
         return routes
@@ -1162,7 +1321,7 @@ class SauceNaoEngine:
 def detect_ai(
     raw: bytes,
     pool: KeyPool,
-    proxy: str = "",
+    proxy: ProxySpec = "",
     timeout: float = 25.0,
 ) -> dict:
     """返回 {"ok": bool, "score": float|None, "error": str}。
@@ -1258,7 +1417,7 @@ def verify_candidate(
     candidate: Candidate,
     target_hash: int | None,
     threshold: int,
-    proxy: str = "",
+    proxy: ProxySpec = "",
     timeout: float = 12.0,
     allow_nets: tuple = (),
 ) -> Candidate:
@@ -1324,6 +1483,7 @@ def verify_candidate(
     # X 的主页、转发/点赞/回复列表页上出现的图，发布者是别人。指纹对上只能说明
     # 「这张图在这一页里出现过」，不能说明是这个号的帖子，所以不能当原帖发出去。
     page_kind = x_page_kind(candidate.url)
+    listing = listing_page_kind(candidate.url, candidate.title or candidate.name)
     if distance <= threshold and candidate.avatar:
         # 头像对上只说明「这张图被这个账号拿去当头像」：页面本身往往不显示它，
         # 点进去看不到图，也不能当原帖出处。名字多半是站点标题，一并清掉。
@@ -1335,6 +1495,10 @@ def verify_candidate(
         label = X_PAGE_LABELS.get(page_kind, "页面")
         candidate.status = "suspect"
         candidate.note = f"指纹一致（距离 {distance}），但这是 X 的{label}，不是哪条帖子"
+    elif distance <= threshold and listing:
+        # 列表页上那张是缩略图，点进去是整页图片列表，找不到对应那一篇。
+        candidate.status = "suspect"
+        candidate.note = f"指纹一致（距离 {distance}），但这是{listing}，不是具体帖子"
     elif distance <= threshold:
         candidate.status = "match"
         candidate.note = f"指纹一致（距离 {distance}）"

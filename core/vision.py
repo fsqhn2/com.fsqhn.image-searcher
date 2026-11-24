@@ -650,6 +650,12 @@ def reason_of(text: str) -> str:
 # 水印里像 X 账号的部分：@abc123，或者整串就是个裸账号。
 _WATERMARK_HANDLE = re.compile(r"@([A-Za-z0-9_]{2,15})")
 _WATERMARK_BARE = re.compile(r"[A-Za-z0-9_]{3,15}")
+# 水印写着主页地址时取出账号：``x.com/kuru_xox`` / ``twitter.com/kuru_xox``。
+# 别让 ``t.me/exhentai5starcosplay`` 那种「点号拆一半」混进来——2026-11-23 的 2c76
+# 就这样把 ``me/exhentai5starcosplay`` 当账号，卡片上还拼出了打不开的 x.com 链接。
+_WATERMARK_X_URL = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:x|twitter)\.com/([A-Za-z0-9_]{3,15})", re.I
+)
 
 # 中文平台习惯把 ID 写成 ``id=某某``、``id:某某``、``id.某某``，前面还可能带个 @。
 # 直接拿 _WATERMARK_HANDLE 去匹配会先撞上 ``@id``，把 ``id`` 当成账号——实测
@@ -801,12 +807,19 @@ def handles_from_watermark(text: str, limit: int = 3) -> list[str]:
         low = name.lower()
         if len(name) < 3 or name.isdigit() or low in _WATERMARK_PLATFORMS:
             return
+        # 只留 X 号能用的写法。带斜杠、点号、连字符的那截一定是从别的东西上切下来的
+        # （``t.me/xxx`` → ``me/xxx``、``id.NothingLose`` → ``id``），拿去拼
+        # ``x.com/<这串>`` 只会得到打不开的地址。
+        if not _WATERMARK_BARE.fullmatch(name):
+            return
         if name not in found:
             found.append(name)
 
     for pattern in (_WATERMARK_ID_PREFIX, _WATERMARK_IDC, _WATERMARK_CREDIT, _WATERMARK_COPY):
         for match in pattern.finditer(value):
             add(match.group(1))
+    for match in _WATERMARK_X_URL.finditer(value):
+        add(match.group(1))
     for match in _WATERMARK_HANDLE.finditer(value):
         add(match.group(1))
     # 点号分隔的写法（@id.NothingLose）拆开再试一次尾巴，x 的 handle 不能带点。

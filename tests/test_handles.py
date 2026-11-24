@@ -67,6 +67,16 @@ class MatchScoreTest(unittest.TestCase):
         found = [name.lower() for name in handles.extract(["精选Porn hentai"])]
         self.assertEqual(found, [])
 
+    def test_paid_platform_names_are_not_extracted(self) -> None:
+        """泄漏站标题里那串平台名不是人名：2c76 抽中过 @fanvue（7 万粉）。"""
+        title = (
+            "Kokura Chiyo - - - 21 utmanande bilder läckta från Onlyfans Patreon "
+            "Fansly FriendsOnly Fanvue iFans FanCentro"
+        )
+        found = [name.lower() for name in handles.extract([title])]
+        for junk in ("fanvue", "ifans", "fancentro", "friendsonly"):
+            self.assertNotIn(junk, found)
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -105,6 +115,19 @@ class AnchorTest(unittest.TestCase):
         self.assertFalse(
             handles.supported_by_context("murabitoufu", ["@murabitoufu"], anchors)
         )
+
+    def test_stop_words_are_not_anchors(self) -> None:
+        """通用词不能当主干：5832 的 ``@carol`` 就是靠共享 cosplay 混进来的。"""
+        anchors = ["Cosplay] 小仓千代w 明日方舟W泳装| Xasiat"]
+        texts = ["Hiyuki cosplay by Carol - Xasiat"]
+        self.assertFalse(handles.supported_by_context("carol", texts, anchors))
+        self.assertFalse(handles.shares_anchor("carol", anchors))
+
+    def test_site_name_is_not_an_anchor(self) -> None:
+        """站名同理：2c76 的 ``@Telegraph`` 靠标题里的 telegraph 通过了校验。"""
+        anchors = ["Telegraph - cosplay W from Ark"]
+        texts = ["Telegraph"]
+        self.assertFalse(handles.supported_by_context("telegraph", texts, anchors))
 
 
 class SlugMatchTest(unittest.TestCase):
@@ -337,6 +360,24 @@ class SignatureNameTest(unittest.TestCase):
         found = handles.signature_names(["posted by someone", "cosplay by KURU"])
         self.assertEqual(found[0], "KURU")
 
+    def test_artist_credit_is_not_a_coser(self) -> None:
+        """画站的「drawn by」是画师笔名，不是 coser 的社交账号。
+
+        s-20261123-1619-411f：四条 danbooru 插画候选的标题都写着
+        「… drawn by nemo_(leafnight ..」，抽出来的 nemo 一路撞上 X 上 1.6 万粉的
+        `@NemoNevermore_`，被摆到首屏当「疑似同一个人的 X」——跟图毫无关系。
+        """
+        self.assertEqual(
+            handles.signature_names(
+                ["nozomi and hikari (blue archive) drawn by nemo_(leafnight .."]
+            ),
+            [],
+        )
+        self.assertEqual(handles.signature_names(["Character illustrated by mint_cat"]), [])
+        self.assertEqual(handles.signature_names(["painted by xiaoxiaoyifan"]), [])
+        # coser 的署名照旧认。
+        self.assertEqual(handles.signature_names(["Vivian cosplay by KURU"]), ["KURU"])
+
     def test_stopwords_dropped(self) -> None:
         self.assertEqual(handles.signature_names(["Cosplay by Unknown"]), [])
         self.assertEqual(handles.signature_names(["photo by reddit"]), [])
@@ -422,6 +463,17 @@ class TitleAuthorTest(unittest.TestCase):
         self.assertTrue(handles.name_matches("Vivian", "vivian cos"))
         self.assertFalse(handles.name_matches("Vivian", ""))
 
+    def test_stylised_display_name_still_matches(self):
+        """花体／全角显示名要折回普通字母再比。
+
+        411f 的真号是 1.5 百万粉的 `@Kuukow002`，显示名写成数学粗斜体的
+        「𝑴𝒊𝒐 𝑲𝒖𝒖𝒌𝒐🍀」；不折回来，「Mio Kuuko」永远比不中，真号被当路人丢掉。
+        """
+        self.assertTrue(handles.name_matches("Mio Kuuko", "𝑴𝒊𝒐 𝑲𝒖𝒖𝒌𝒐🍀"))
+        self.assertTrue(handles.name_matches("Mio Kuuko", "ＭＩＯ ＫＵＵＫＯ"))
+        self.assertTrue(handles.name_matches("染三ran3", "染三 ｒａｎ３"))
+        self.assertFalse(handles.name_matches("Mio Kuuko", "𝑯𝒊𝒅𝒐𝒓𝒊 𝑹𝒐𝒔𝒆"))
+
     def test_leading_category_tag_is_not_the_author(self):
         """s-20261119-1722-fe9b：标题「Cosplay] ran3 - …」，开括号被站点吃掉了。
 
@@ -447,6 +499,35 @@ class TitleAuthorTest(unittest.TestCase):
         """标签没剥干净、只剩分类词时不算名字，省得白跑几个请求。"""
         self.assertEqual(handles.title_author("[Cosplay] Cosplay - something"), "")
         self.assertEqual(handles.x_variants("Cosplay"), [])
+
+
+class TitleHandleTest(unittest.TestCase):
+    """标题里直接写着 X 号的那种（``Model Kokura Chiyo (@yummychiyo)``）。
+
+    这是 2c76 那单的漏洞：真号就在标题括号里，旧逻辑只按分隔符切名字，切出来的
+    是 `CoserwW21photos` 这种垃圾变体，真号一次都没试。
+    """
+
+    def test_parenthesised_handle(self):
+        self.assertEqual(
+            handles.title_handle("Model Kokura Chiyo (@yummychiyo) in cosplay W from Ark"),
+            ("yummychiyo", "Model Kokura Chiyo"),
+        )
+
+    def test_fullwidth_and_bracket_forms(self):
+        self.assertEqual(handles.title_handle("染三ran3（@ran3ran3）"), ("ran3ran3", "染三ran3"))
+        self.assertEqual(handles.title_handle("[Cosplay] 渔蛋Sakana [@Sakana_fish]"), ("Sakana_fish", "渔蛋Sakana"))
+
+    def test_bare_at_handle(self):
+        self.assertEqual(handles.title_handle("KURU 的新套图 @kuru_xox"), ("kuru_xox", "KURU 的新套图"))
+
+    def test_email_and_cjk_account_are_not_handles(self):
+        """邮箱里的 a@b 不是账号；``@诗诗爱生活的动态`` 也不是 X 号。"""
+        self.assertEqual(handles.title_handle("contact me at coser@example.com"), ("", ""))
+        self.assertEqual(handles.title_handle("夜色温柔 @诗诗爱生活的动态"), ("", ""))
+
+    def test_stop_word_is_not_a_handle(self):
+        self.assertEqual(handles.title_handle("精选 (@cosplay) 套图"), ("", ""))
 
 
 class LlmAuthorReplyTest(unittest.TestCase):
@@ -512,3 +593,74 @@ class LlmAuthorReplyTest(unittest.TestCase):
 
     def test_parenthetical_explanation_is_dropped(self):
         self.assertEqual(handles.llm_author_reply("作者名：ran3（X 上叫 ran3ran3ran3）")[0], "ran3")
+
+
+class LlmAuthorListTest(unittest.TestCase):
+    """一次问好几个落点（搬运站／图集站）时，模型回的那串名字怎么解析。
+
+    返回 None = 这轮什么都没说（退回规则），空列表 = 明确答了「这些页都没写作者」。
+    两者不能混：前者要退回规则再抽一遍，后者表示白跑一趟。
+    """
+
+    def test_array_reply(self):
+        found = handles.llm_author_list(
+            '[{"site": "https://a.com/1", "author": "染三ran3", "handle": "ran3"},'
+            ' {"site": "https://b.com/2", "author": "渔蛋Sakana"}]'
+        )
+        self.assertEqual(len(found), 2)
+        self.assertEqual(found[0]["author"], "染三ran3")
+        self.assertEqual(found[0]["handle"], "ran3")
+        self.assertEqual(found[0]["site"], "https://a.com/1")
+        # 没给 handle 时从名字里自己拆。
+        self.assertEqual(found[1]["handle"], "Sakana")
+
+    def test_wrapped_and_fenced(self):
+        text = '```json\n{"authors": [{"author": "ran3"}]}\n```'
+        found = handles.llm_author_list(text)
+        self.assertIsNotNone(found)
+        self.assertEqual(found[0]["author"], "ran3")
+
+    def test_single_object(self):
+        found = handles.llm_author_list('{"author": "ran3", "site": "https://a.com"}')
+        self.assertEqual(found[0]["author"], "ran3")
+
+    def test_x_link_wins(self):
+        found = handles.llm_author_list(
+            '[{"author": "染三ran3", "handle": "ran3", "x": "https://x.com/ran3ran3ran3"}]'
+        )
+        self.assertEqual(found[0]["handle"], "ran3ran3ran3")
+
+    def test_explicit_empty_list_means_no_author(self):
+        """模型答了「都没写」，这是明确结论，不是失败。"""
+        self.assertEqual(handles.llm_author_list("[]"), [])
+        self.assertEqual(handles.llm_author_list('[{"author": "", "handle": ""}]'), [])
+
+    def test_silence_is_not_a_conclusion(self):
+        """空回复、只肯解释、JSON 坏了，都算这轮没说话，要退回规则。"""
+        self.assertIsNone(handles.llm_author_list(""))
+        self.assertIsNone(handles.llm_author_list("这几个页面都是搬运站，看不出作者"))
+        self.assertIsNone(handles.llm_author_list("[{author: ran3}]"))
+
+    def test_explanation_around_json_is_ignored(self):
+        text = '我看了这几页，结果如下：\n[{"author": "ran3"}]\n以上。'
+        self.assertEqual(handles.llm_author_list(text)[0]["author"], "ran3")
+
+
+class TitleAtAuthorTest(unittest.TestCase):
+    def test_reads_account_from_content_page_title(self) -> None:
+        """百度动态的 <title> 就长这样，正文标题里没有账号（b3b4）。"""
+        title = "夜色温柔，风也轻，jk女孩出没...@诗诗爱生活的动态"
+        self.assertEqual(handles.title_at_author(title), "诗诗爱生活")
+
+    def test_accepts_ascii_and_spaces(self) -> None:
+        self.assertEqual(handles.title_at_author("@ran3 的主页"), "ran3")
+        self.assertEqual(handles.title_at_author("今天出门玩 @ran3ran3ran3的动态"), "ran3ran3ran3")
+
+    def test_bare_mention_is_not_an_account(self) -> None:
+        """正文里随口 @ 一个人，不是这个号的账号名。"""
+        self.assertEqual(handles.title_at_author("谢谢 @诗诗爱生活 帮我拍照"), "")
+        self.assertEqual(handles.title_at_author("@诗诗爱生活"), "")
+
+    def test_ignores_empty_and_platform_words(self) -> None:
+        self.assertEqual(handles.title_at_author(""), "")
+        self.assertEqual(handles.title_at_author("@porn的动态"), "")

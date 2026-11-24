@@ -71,6 +71,25 @@ def _paid_pack_host(url: str, platform: str = "") -> str:
     return host if gallery.is_gallery_site(url, platform) else ""
 
 
+def _forum_thread_line(outcome: SearchOutcome) -> str:
+    """命中的是论坛讨论帖：答案常写在回复里，插件读不到，只能提示去翻。
+
+    b62e／ecaa 两单都只搜到 NGA，用户自己在回帖里找到了 pixiv 原图。NGA 对
+    未登录访客一律 403（read.php 回「访客不能直接访问」，app_api 要 access_token），
+    插件拿不到正文，能给的就是这一句——比让用户以为「这页没用」好。
+    """
+    threads = [
+        item
+        for item in outcome.candidates
+        if gallery.is_forum_site(item.url or "", item.platform or "")
+    ]
+    if not threads:
+        return ""
+    hosts = list(dict.fromkeys((_host_of(item.url) or item.platform or "").strip() for item in threads))
+    shown = "、".join([host for host in hosts if host][:2])
+    return f"💬 有候选落在 {shown} 这类论坛讨论帖上：答案常写在回复里，点开翻一眼比换引擎快。"
+
+
 def _paid_pack_line(outcome: SearchOutcome) -> str:
     """没搜到时补一句：候选落在付费图包页，公开索引里不会有原帖。
 
@@ -348,6 +367,15 @@ def _title_author_lines(outcome: SearchOutcome, *, detail: bool = False) -> list
         if via_llm:
             lines.append("（名字是模型从页面标题／正文里读出来的，不是按分隔符硬切出来的）")
         return lines
+    if status == "seen" and handle:
+        # 页面标题自己写着的号（``Model Kokura Chiyo (@yummychiyo)``）：账号可信，但
+        # 这张图没在她最近的帖子里翻到，所以只摆出来、不当结论。
+        display = str(info.get("x_name") or "").strip()
+        who = f"（显示名「{display}」）" if display else ""
+        return [
+            f"🔗 页面标题里直接写着 @{handle}{who}：https://x.com/{handle}",
+            "她最近的带图帖里没翻到这张，可能发得更早或被删——点开自己核一下。",
+        ]
     if status == "none" and detail:
         variants = [str(item) for item in (info.get("variants") or []) if item]
         if variants:
@@ -493,6 +521,148 @@ def _weibo_lines(outcome: SearchOutcome) -> list[str]:
     ]
 
 
+def _name_hunt_lines(outcome: SearchOutcome) -> list[str]:
+    """按标题里的名字找号：核到那张图就写明是这么找到的，只找到主页就列出来。
+
+    c077 那单的图只落在图集站上，页面上一个账号都不挂；标题里那个名字是唯一
+    还能指到人的东西。这条线永远只给「名字 → 主页」，谁都不能凭名字顶掉指纹
+    命中，所以文案里要写清「只是线索」。
+    """
+    info = outcome.name_hunt or {}
+    status = str(info.get("status") or "")
+    name = str(info.get("name") or "").strip()
+    source = str(info.get("source") or "").strip()
+    if status == "hit":
+        distance = int(info.get("distance") or 0)
+        if str(info.get("platform") or "").strip() == "微博":
+            who = f"微博 {info.get('account') or info.get('handle') or ''}".strip()
+        else:
+            who = f"@{str(info.get('handle') or '').strip().lstrip('@')}"
+        lines = [
+            f"🔎 按标题里的名字「{name}」找到 {who}，"
+            f"她自己的帖子里有这张图（指纹距离 {distance}）"
+        ]
+        if source:
+            lines.append(f"（{source}）")
+        return lines
+    if status != "seen":
+        return []
+    profiles = [item for item in (info.get("profiles") or []) if isinstance(item, dict)]
+    if not profiles:
+        return []
+    parts: list[str] = []
+    verified_handle = str(info.get("x_handle") or "").strip().lstrip("@").lower()
+    verified_fans = int(info.get("x_followers") or 0)
+    verified_name = str(info.get("x_name") or "").strip()
+    for item in profiles[:4]:
+        platform = str(item.get("platform") or "").strip()
+        handle = str(item.get("handle") or "").strip()
+        account = str(item.get("name") or "").strip()
+        fans = int(item.get("followers") or 0)
+        url = str(item.get("url") or "").strip()
+        if platform == "微博":
+            label = account or handle
+            extra = []
+            if fans:
+                extra.append(f"{_fans_text(fans)}粉")
+            if url:
+                extra.append(url)
+            parts.append(f"微博 {label}（{' · '.join(extra)}）" if extra else f"微博 {label}")
+        elif platform == "X":
+            label = f"X @{handle.lstrip('@')}"
+            if verified_handle and handle.lstrip("@").lower() == verified_handle:
+                # 显示名对得上的那个号才有粉丝数：只是列表里的同名号没核过。
+                detail = []
+                if verified_fans:
+                    detail.append(f"{_fans_text(verified_fans)}粉")
+                if verified_name:
+                    detail.append(f"显示名「{verified_name}」对得上")
+                if detail:
+                    label += f"（{'，'.join(detail)}）"
+            # 微博那条一直带链接，X 这边只写 @号，看着像线索而不是一个能点的主页。
+            label += f" https://x.com/{handle.lstrip('@')}"
+            parts.append(label)
+        else:
+            parts.append(f"{platform} {handle}".strip())
+    lines = [
+        f"🔎 按名字找出这些主页（名字「{name}」是从标题里读出来的）：" + " / ".join(parts),
+    ]
+    scanned = int(info.get("x_scanned_posts") or 0)
+    if verified_handle and scanned:
+        # 「核过但没对上」和「没核」看起来一样，用户会当成没查（8bc9 那单就是）。
+        # 把翻了几条写出来，同时交代预算截断——不能把「没翻完」暗示成「都翻过」。
+        images = int(info.get("x_scanned_images") or 0)
+        where = f"她的 X 最近 {scanned} 条带图帖" + (f"（{images} 张图）" if images else "")
+        tail = "；更早的还没翻完" if info.get("x_scan_truncated") else ""
+        lines.append(f"翻了{where}，没有这张{tail}。")
+    lines.append("这些只是线索：名字对得上不等于人就是同一个，没核到这张图之前不改结论。")
+    if source:
+        lines.append(f"（{source}）")
+    return lines
+
+
+def _other_accounts_lines(outcome: SearchOutcome) -> list[str]:
+    """候选 URL 里写明的其它平台账号：核到图的一条，核不上的列号。
+
+    X 之外能核图的只有 B 站（投稿封面）和有登录 cookie 的微博，TikTok / IG 没有
+    可用的公开封面（oembed 只回 iframe）。所以这些号大多数时候是「账号对得上」
+    而不是「图对上了」，文案必须写清这一点，否则用户会以为已经确认过了。
+    """
+    info = outcome.other_accounts or {}
+    hit = info.get("hit") or {}
+    hit_platform = str(hit.get("platform") or "").strip()
+    hit_handle = str(hit.get("handle") or "").strip().lower()
+    lines: list[str] = []
+    if hit_platform:
+        name = str(hit.get("name") or "").strip()
+        url = str(hit.get("url") or "").strip()
+        distance = int(hit.get("distance") or 0)
+        who = f"{hit_platform} {name}".strip()
+        line = f"🌐 她本人在 {who} 也发过这张（指纹距离 {distance}）"
+        if url:
+            line += f"：{url}"
+        lines.append(line)
+    rows = [
+        item
+        for item in (info.get("accounts") or [])
+        if isinstance(item, dict)
+        and str(item.get("handle") or "").strip()
+        and not (
+            str(item.get("platform") or "").strip() == hit_platform
+            and str(item.get("handle") or "").strip().lower() == hit_handle
+        )
+    ]
+    if not rows:
+        return lines
+    parts: list[str] = []
+    for item in rows[:5]:
+        platform = str(item.get("platform") or "").strip()
+        handle = str(item.get("handle") or "").strip()
+        name = str(item.get("name") or "").strip()
+        followers = int(item.get("followers") or 0)
+        detail: list[str] = []
+        if name:
+            detail.append(name)
+        elif handle.isdigit():
+            detail.append(f"UID {handle}")
+        else:
+            detail.append(f"@{handle.lstrip('@')}")
+        if followers:
+            detail.append(f"{_fans_text(followers)}粉")
+        if item.get("verified"):
+            detail.append("图对上了")
+        elif item.get("checked"):
+            detail.append("没核到这张图")
+        text = f"{platform} {' · '.join(detail)}".strip()
+        url = str(item.get("url") or "").strip()
+        parts.append(f"{text}（{url}）" if url else text)
+    lines.append("🌐 候选里写着这些平台账号：" + " / ".join(parts))
+    lines.append(
+        "这些只是账号线索：TikTok / Instagram 没有公开的图可核，B 站和微博没核到图之前不改结论。"
+    )
+    return lines
+
+
 def _paywall_lines(outcome: SearchOutcome) -> list[str]:
     """确认作者之后找到的售卖页：卖在哪、多少钱、有没有免费预览。
 
@@ -583,6 +753,34 @@ def _paid_lines(outcome: SearchOutcome) -> list[str]:
         head = f"从候选 {platform} 的标题里认出这个名字"
     lines.append(f"{head}，泄露站收录过该名字的付费内容{'：' + page_url if page_url else '。'}")
     lines.append("只是同一个人可能在卖的号，不是这张图的原帖。")
+    return lines
+
+
+def _trace_lines(outcome: SearchOutcome, *, detail: bool = False) -> list[str]:
+    """「这次是怎么找的」：水印读了哪一次、反查跑到哪停的。
+
+    只在「更多」里给——首次回复按用户的要求只留结论和图上水印那几段线索，
+    过程说明塞进去就成了刷屏。老任务与按图缓存里没有这份记录时什么都不写。
+
+    用户 2026-11-20 的原话：「把这次的水印读了哪次、反查停在哪写出来」。
+    以前「没触发」和「触发了没读到」在群里长得一模一样，分不出是漏了还是白跑。
+    """
+    if not detail:
+        return []
+    trace = [item for item in (outcome.trace or []) if isinstance(item, dict)]
+    if not trace:
+        return []
+    marks = {"hit": "✅", "ran": "·", "none": "×", "skip": "○"}
+    lines = ["—", "🧭 这次是怎么找的"]
+    for item in trace:
+        step = str(item.get("step") or "").strip()
+        if not step:
+            continue
+        state = str(item.get("state") or "")
+        note = str(item.get("note") or "").strip()
+        if not note:
+            note = "这一步没跑" if state == "skip" else "跑完了，没有结果"
+        lines.append(f"{marks.get(state, '·')} {step}：{note}")
     return lines
 
 
@@ -688,11 +886,11 @@ def _downgraded_pick_line(outcome: SearchOutcome) -> str:
     pool = [
         item
         for item in outcome.candidates
-        if downgrade_kind(item) in {"repost", "request"} and (item.url or "").strip()
+        if downgrade_kind(item) in {"repost", "request", "aggregator"} and (item.url or "").strip()
     ]
     if (
         best is not None
-        and downgrade_kind(best) in {"repost", "request"}
+        and downgrade_kind(best) in {"repost", "request", "aggregator"}
         and (best.url or "").strip()
     ):
         pick = best
@@ -749,6 +947,12 @@ def _best_block(outcome: SearchOutcome, *, skip_grok: bool = False, detail: bool
     extra.extend(_title_author_lines(outcome, detail=detail))
     extra.extend(_paywall_lines(outcome))
     extra.extend(_gallery_source_lines(outcome))
+    if (
+        outcome.best is not None
+        and not downgrade_kind(outcome.best)
+        and (outcome.best.url or "") != str((outcome.pixiv_source or {}).get("url") or "")
+    ):
+        extra.extend(_pixiv_source_lines(outcome, compact=True))
     if not skip_grok and GROK_QUIET_NOTE not in text:
         miss = _grok_miss_line(outcome)
         if miss:
@@ -756,8 +960,11 @@ def _best_block(outcome: SearchOutcome, *, skip_grok: bool = False, detail: bool
     extra.extend(_same_person_lines(outcome))
     extra.extend(_x_guess_lines(outcome))
     extra.extend(_weibo_lines(outcome))
+    extra.extend(_name_hunt_lines(outcome))
+    extra.extend(_other_accounts_lines(outcome))
     extra.extend(_role_hint_lines(outcome))
     extra.extend(_paid_lines(outcome))
+    extra.extend(_trace_lines(outcome, detail=detail))
     if extra:
         text = "\n".join([text, *extra])
     return text
@@ -827,6 +1034,12 @@ def _vision_watermark_line(outcome: SearchOutcome) -> str:
     same_person = bool(mark_name) and mark_name == post_name
     if text:
         url = str(vision.get("watermark_url") or "").strip()
+        # 老任务里可能存着「t.me/xxx」被点号拆出来的垃圾地址（`x.com/me/xxx`）：
+        # 主页路径只有一段才算数，多一段就宁可不给链接，别让用户点开是个 404。
+        if url:
+            path = urlparse(url).path.strip("/")
+            if not re.fullmatch(r"[A-Za-z0-9_]{2,20}", path):
+                url = ""
         note = str(vision.get("watermark_note") or "").strip()
         if post:
             # 水印号自己的带图帖里翻到了这张：这是核对过的结论，直接把帖子给出来。
@@ -957,6 +1170,60 @@ def _conclusion_handle(outcome: SearchOutcome) -> str:
     return ""
 
 
+def _pixiv_source_lines(outcome: SearchOutcome, *, compact: bool = False) -> list[str]:
+    """从搬运站文件名里读到的 pixiv 作品：出处是哪个作品、作者是谁。
+
+    这条与其它线索不同——它不是「可能同一个人」，而是「这张图出自哪个作品」：
+    搬运站按 pixiv 作品扒图时把作品号抄进了图床文件名，回 pixiv 核对标题与
+    作者名都能对上。但 pixiv 未登录（连非 R-18 也一样）给不了图片地址，所以
+    比不了指纹，文案必须写明这一点，别让人以为核过图。
+    """
+    info = outcome.pixiv_source or {}
+    if not info.get("illust_id"):
+        return []
+    title = str(info.get("title") or "").strip()
+    user_name = str(info.get("user_name") or "").strip()
+    user_id = str(info.get("user_id") or "").strip()
+    url = str(info.get("url") or "").strip()
+    head = f"🎯 原图出自 pixiv：{'《' + title + '》' if title else '作品'}"
+    if user_name:
+        head += ("" if head.endswith("》") else " ") + f"by {user_name}"
+    detail: list[str] = []
+    if user_id:
+        detail.append(f"users/{user_id}")
+    if int(info.get("x_restrict") or 0):
+        detail.append("R-18")
+    pages = int(info.get("page_count") or 0)
+    if pages > 1:
+        detail.append(f"{pages} 页")
+    created = str(info.get("create_date") or "")[:10]
+    if created:
+        detail.append(created)
+    if detail:
+        head += f"（{' · '.join(detail)}）"
+    lines = [head]
+    if url:
+        lines.append(url)
+    if compact:
+        return lines
+    distance = info.get("distance")
+    read_from = str(info.get("read_from") or "").strip()
+    if len(read_from) > 48:
+        read_from = "…" + read_from[-46:]
+    if distance is not None:
+        note = "作品号是从转载站的图床文件名里读到的"
+        if read_from:
+            note += f"（{read_from}）"
+        note += f"，取回 pixiv 原图比过指纹，距离 {distance}。"
+    else:
+        note = "作品号是从转载站的图床文件名里读到的"
+        if read_from:
+            note += f"（{read_from}）"
+        note += "，pixiv 未登录看不到这张图，没能比指纹。"
+    lines.append(note)
+    return lines
+
+
 def _gallery_source_lines(outcome: SearchOutcome) -> list[str]:
     """图集 / 泄露站页面上标的来源账号。
 
@@ -1033,6 +1300,19 @@ def _leak_line(best) -> str:
     return f"⚠️ 这条落在 {site} 上，那是盗图/资源站：页面上的账号是从标题里抄的，不是作者主页。"
 
 
+def _search_page_line(outcome: SearchOutcome) -> str:
+    """搜索页反解的结果摆到结论里。
+
+    反解到号但图对不上时，这句话以前只挂在搜索页那条候选的 account_note 上；
+    可那条永远是 suspect、不会被选成结论，用户等于完全看不到这一步跑过。
+    """
+    info = outcome.search_page or {}
+    note = str(info.get("note") or "").strip()
+    if not note:
+        return ""
+    return f"🔎 搜索页反解：{note}"
+
+
 def _best_block_core(outcome: SearchOutcome, *, skip_grok: bool = False, detail: bool = False) -> str:
     best = outcome.best
     grok = outcome.grok or {}
@@ -1105,11 +1385,21 @@ def _best_block_core(outcome: SearchOutcome, *, skip_grok: bool = False, detail:
         # 可靠出处」，群里会以为连链接都没有（s-20261112-1244-7c22）。两句说的是同一件
         # 事，合成一行，别在群里摆两行重复的话。
         reposted = any(downgrade_kind(item) == "repost" for item in outcome.candidates)
+        aggregated = any(downgrade_kind(item) == "aggregator" for item in outcome.candidates)
         lines = [
-            "⚠️ 未找到可靠出处：只找到别的网站的转发，没能找到原始出处。"
-            if reposted
-            else "⚠️ 未找到可靠出处"
+            "⚠️ 未找到可靠出处：只找到内容号发的同款，证明不了是本人。"
+            if aggregated
+            else (
+                "⚠️ 未找到可靠出处：只找到别的网站的转发，没能找到原始出处。"
+                if reposted
+                else "⚠️ 未找到可靠出处"
+            )
         ]
+        # 读到 pixiv 作品号时，出处其实已经有了：转载站那一条只是「这张图也被搬过」。
+        # 这句话要顶到最前面，别让「未找到」把真正的出处盖住。
+        pixiv_lines = _pixiv_source_lines(outcome)
+        if pixiv_lines:
+            lines = pixiv_lines
         if compared and nearest is not None:
             if nearest.status == "suspect":
                 # 距离够近但被降级（转发页、头像这类）：不能说「均未通过阈值」，
@@ -1126,10 +1416,16 @@ def _best_block_core(outcome: SearchOutcome, *, skip_grok: bool = False, detail:
             lines.append(f"已比对 {compared} 条候选，都没到阈值。")
         else:
             lines.append("候选图都没能取到或解码，无法验证。")
+        search_page_line = _search_page_line(outcome)
+        if search_page_line:
+            lines.append(search_page_line)
         # 上一句说「原因见下」，这里就得真给出来：搬运页/求图帖那条连同链接一起摆。
         clue = _downgraded_pick_line(outcome)
         if clue:
             lines.append(clue)
+        forum_line = _forum_thread_line(outcome)
+        if forum_line:
+            lines.append(forum_line)
         vision = outcome.vision or {}
         if vision.get("ok") and vision.get("checked"):
             if vision.get("downgraded"):
@@ -1263,6 +1559,10 @@ def engine_groups(
         # 视觉挑中的那条也要留在参考区，结论里「那张候选见参考区」才对得上号；
         # 指纹命中时 best 已经在结论里给过，不必重复列。
         if item is best and (best is None or best.status != "vision"):
+            continue
+        # 电商同款不进参考区：838e 那单是只可莉背包，参考区被五条卖包的页面占满，
+        # 看着像淘宝搜索结果。挡了多少条记在 trace 的「商品页」那一步。
+        if gallery.is_shop_site(item.url or "", item.platform or ""):
             continue
         groups.setdefault(item.engine, []).append(item)
     result: list[tuple[str, list[Candidate]]] = []
@@ -1892,6 +2192,9 @@ def build_miss_nodes(
     paid_pack = _paid_pack_line(outcome)
     if paid_pack:
         first.append({"type": "text", "content": paid_pack})
+    # 没搜到的时候，候选里那些账号线索更该给出来——人可能就在那儿，只是图没核上。
+    for line in _other_accounts_lines(outcome):
+        first.append({"type": "text", "content": line})
     nodes: list[dict] = [_node(first, nickname, user_id)]
     shown: set[str] = set()
     shown_urls: dict[str, str] = {}

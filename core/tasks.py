@@ -71,6 +71,11 @@ class SearchOutcome:
     # "followers", "url", "source", "max_fans", "floor"}。hit 只是线索（这个号确实是
     # 她本人），不改 best；none 说明搜过但没搜到粉丝量像正主的同名号。
     weibo: dict | None = None
+    # 按标题里的名字找号：{"name", "status": hit/seen/none, "platform": X/微博,
+    # "handle", "account", "followers", "post", "distance", "profiles": [{platform,
+    # handle, url, name, followers}], "source"}。hit 时结论已经换成那条帖；
+    # seen 只说明「找到这些主页了」，其余平台一律只当线索，不改结论。
+    name_hunt: dict | None = None
     # 按角色找人的线索：{"roles": ["明日方舟｜死芒 Necrass"],
     # "accounts": [{"handle", "fans", "post"}], "keywords": [...], "model", "reason"}。
     # 只在图搜图没结论时才有，纯线索——角色对得上不等于人是同一个，认人仍然靠指纹。
@@ -80,10 +85,33 @@ class SearchOutcome:
     # "tiers": [{title, cents, currency, free}], "preview": {title, url}}。
     # 图包里的图公开渠道搜不到，这块是唯一能给到底的地方；没有付费页时为空。
     paywall: dict | None = None
+    # 从搬运站图床文件名里读到的 pixiv 作品：{"illust_id", "title", "user_name",
+    # "user_id", "x_restrict", "create_date", "page_count", "shop_url", "read_from",
+    # "author_matched"}。`read_from` 是那条带着作品号的文件名，`author_matched`
+    # 表示文件名里的作者名跟 pixiv 返回的 userName 对上了（对不上不采纳）。
+    # pixiv 未登录给不了图片地址，所以这条只能给「出处是哪个作品」，比不了指纹。
+    pixiv_source: dict | None = None
     # 图集 / 泄露页面上标的来源账号：[{platform, handle, url, count, site, page,
     # author_page}]。落点在 picazor 这类站时，会从帖子页翻到发布者主页再抽一次，
     # 这时 author_page 有值——比帖子页 meta 里抄的硬，但仍然只当线索。
     gallery_sources: list[dict] = field(default_factory=list)
+    # 候选落在平台搜索页（`search.bilibili.com/all?keyword=…`）时做的反解：
+    # {"state": "hit"/"none"/"skip", "note": "…", "keyword": "…", "accounts": [...]}。
+    # 反解到号但图对不上时，这句话必须出现在结论里——以前只挂在那条候选的
+    # account_note 上，而那条候选永远是 suspect、不会被选中，等于用户看不到。
+    search_page: dict | None = None
+    # 候选 URL 里写明的其它平台账号（B站 / 微博 / TikTok / Instagram）：
+    # {"status": "hit"/"seen", "hit": {platform, handle, name, url, image, distance,
+    # source} | None, "accounts": [{kind, platform, handle, url, name, followers,
+    # source, checked, verified}]}。status=hit 时结论已经换成核过图的那条；
+    # seen 只说明这些账号写在候选里，没核到这张图，一律只当线索。
+    # TikTok / Instagram 没有可用的公开封面，只能当账号线索。
+    other_accounts: dict | None = None
+    # 这次「怎么找的」：每一步的触发与结果，只在「更多」里展示。
+    # 形如 [{"step": "读水印", "state": "ran"|"skip"|"hit", "note": "…"}]。
+    # 用户 2026-11-20 的要求：十几距离那批不额外开反查，但得让人看得出这次读了
+    # 哪一次水印、反查停在哪——不然「没触发」和「触发了没结果」在群里长得一样。
+    trace: list[dict] = field(default_factory=list)
     # 展示用图片：候选图地址 → base64。只留在内存里，落盘不保存（体积太大）。
     images: dict[str, str] = field(default_factory=dict)
     # 这次结果来自按图缓存。命中时不重跑引擎，elapsed_ms 是当初那次的耗时。
@@ -113,9 +141,14 @@ class SearchOutcome:
             "repost_author": self.repost_author,
             "title_author": self.title_author,
             "weibo": self.weibo,
+            "name_hunt": self.name_hunt,
             "role_hint": self.role_hint,
             "paywall": self.paywall,
+            "pixiv_source": self.pixiv_source,
             "gallery_sources": self.gallery_sources or [],
+            "search_page": self.search_page,
+            "other_accounts": self.other_accounts,
+            "trace": self.trace or [],
         }
 
     @classmethod
@@ -144,9 +177,14 @@ class SearchOutcome:
             repost_author=summary.get("repost_author"),
             title_author=summary.get("title_author"),
             weibo=summary.get("weibo"),
+            name_hunt=summary.get("name_hunt"),
             role_hint=summary.get("role_hint"),
             paywall=summary.get("paywall"),
+            pixiv_source=summary.get("pixiv_source"),
             gallery_sources=summary.get("gallery_sources") or [],
+            search_page=summary.get("search_page"),
+            other_accounts=summary.get("other_accounts"),
+            trace=summary.get("trace") or [],
         )
 
 

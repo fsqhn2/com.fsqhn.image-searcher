@@ -1096,10 +1096,634 @@ class TitleAuthorLlmSwitchTest(unittest.TestCase):
         # 抓不到页面就不带正文那一段（规则里「优先看页面正文…」这句是固定文案，不算）
         self.assertNotIn("页面正文（去掉标签后的纯文字", captured["prompt"])
 
+    def test_empty_answer_is_treated_as_failure(self) -> None:
+        """模型回空串不是「页面里没作者」：0fd8 那单就此收工，标题里明明写着染三ran3。"""
+        module, plugin, config = self._plugin(True)
+
+        async def call(name, **kwargs):
+            return {"success": True, "response": "   "}
+
+        plugin_ctx = mock.Mock()
+        plugin_ctx.call_capability = call
+
+        async def fetch(self, url):
+            return ""
+
+        with (
+            mock.patch.object(module.ImageSearcherPlugin, "_vlog", lambda *a, **k: None),
+            mock.patch.object(module.ImageSearcherPlugin, "_fetch_page_html", fetch),
+            mock.patch.object(module.ImageSearcherPlugin, "config", config, create=True),
+            mock.patch.object(module.ImageSearcherPlugin, "ctx", plugin_ctx, create=True),
+        ):
+            answer = asyncio.run(plugin._ask_title_author(self._best(module)))
+
+        # None 表示「这次没问出结果」，调用方会退回规则，而不是当成没有作者。
+        self.assertIsNone(answer)
+
+    def test_explicit_empty_json_still_stops(self) -> None:
+        """真回了空 JSON 才算模型明确说「页面里没作者名」。"""
+        module, plugin, config = self._plugin(True)
+
+        async def call(name, **kwargs):
+            return {
+                "success": True,
+                "response": '{"author": "", "name": "", "handle": "", "x": ""}',
+            }
+
+        plugin_ctx = mock.Mock()
+        plugin_ctx.call_capability = call
+
+        async def fetch(self, url):
+            return ""
+
+        with (
+            mock.patch.object(module.ImageSearcherPlugin, "_vlog", lambda *a, **k: None),
+            mock.patch.object(module.ImageSearcherPlugin, "_fetch_page_html", fetch),
+            mock.patch.object(module.ImageSearcherPlugin, "config", config, create=True),
+            mock.patch.object(module.ImageSearcherPlugin, "ctx", plugin_ctx, create=True),
+        ):
+            answer = asyncio.run(plugin._ask_title_author(self._best(module)))
+
+        self.assertEqual(answer, ("", "", ""))
+
+
+class XGuessSourceFilterTest(unittest.TestCase):
+    """疑似 X 账号只从核过图的候选里抽名字，别拿没比过图的页面标题去撞。"""
+
+    def test_unverified_page_title_is_not_a_source(self) -> None:
+        module = import_plugin()
+        plugin = object.__new__(module.ImageSearcherPlugin)
+        config = mock.Mock()
+        matched = module.Candidate(
+            engine="lens",
+            url="https://xx.knit.bid/en/article/32501/",
+            title="Cosplay] ran3 - Cure Nyammy black stockings purple staff ...",
+            source="爱妹子",
+        )
+        matched.status = "match"
+        matched.distance = 0
+        facebook = module.Candidate(
+            engine="lens",
+            url=(
+                "https://www.facebook.com/vivivision/posts/"
+                "my-kda-ahri-cosplay-for-twitch-con-europe-is-almost-done/"
+            ),
+            title="My KDA Ahri cosplay for Twitch Con Europe is almost done ...",
+            source="facebook.com",
+        )
+        facebook.status = "unverified"
+        asked: list[str] = []
+
+        async def profile(self, handle):
+            asked.append(handle)
+            return {"screen_name": handle, "name": handle, "followers": 9446496}
+
+        with (
+            mock.patch.object(module.ImageSearcherPlugin, "_vlog", lambda *a, **k: None),
+            mock.patch.object(module.ImageSearcherPlugin, "_profile", profile),
+            mock.patch.object(module.ImageSearcherPlugin, "config", config, create=True),
+        ):
+            asyncio.run(plugin._hunt_x_handle([matched, facebook]))
+
+        # 0fd8 那单就冒出过 944 万粉的 @Twitch：Twitch 只是那篇帖子的活动名。
+        self.assertNotIn("Twitch", asked)
+
+    def test_unhashed_suspect_is_not_a_source(self) -> None:
+        """没量过距离的 suspect 也不参与：158d 那单从 danbooru 的图片地址里抽出了 @Strike。"""
+        module = import_plugin()
+        plugin = object.__new__(module.ImageSearcherPlugin)
+        config = mock.Mock()
+        matched = module.Candidate(
+            engine="lens",
+            url="https://xx.knit.bid/en/article/32501/",
+            title="Cosplay] ran3 - Cure Nyammy black stockings purple staff ...",
+        )
+        matched.status = "match"
+        matched.distance = 0
+        danbooru = module.Candidate(
+            engine="saucenao",
+            url="https://danbooru.donmai.us/post/show/2715953",
+            title=(
+                "https://vignette3.wikia.nocookie.net/strike-the-blood/images/f/fc/P073.jpg"
+            ),
+            name="manyako, manyako (mohumohu)",
+        )
+        danbooru.status = "suspect"
+        danbooru.distance = None
+        asked: list[str] = []
+
+        async def profile(self, handle):
+            asked.append(handle)
+            return {"screen_name": handle, "name": handle, "followers": 165791}
+
+        with (
+            mock.patch.object(module.ImageSearcherPlugin, "_vlog", lambda *a, **k: None),
+            mock.patch.object(module.ImageSearcherPlugin, "_profile", profile),
+            mock.patch.object(module.ImageSearcherPlugin, "config", config, create=True),
+        ):
+            asyncio.run(plugin._hunt_x_handle([matched, danbooru]))
+
+        self.assertNotIn("Strike", asked)
+
+
+class XGuessSiteNameTest(unittest.TestCase):
+    """候选标题里的站名不能当账号：2c76 那单的 @Telegraph 就是这么来的。"""
+
+    def test_site_name_in_title_is_not_a_handle(self) -> None:
+        module = import_plugin()
+        plugin = object.__new__(module.ImageSearcherPlugin)
+        config = mock.Mock()
+        matched = module.Candidate(
+            engine="lens",
+            url="https://misskon.com/p/coser-w-yong-zhuang/",
+            title="MissKon - cosplay W from Ark",
+            name="MissKon",
+        )
+        matched.status = "match"
+        matched.distance = 0
+        asked: list[str] = []
+
+        async def profile(self, handle):
+            asked.append(handle)
+            return {"screen_name": handle, "name": handle, "followers": 300000}
+
+        with (
+            mock.patch.object(module.ImageSearcherPlugin, "_vlog", lambda *a, **k: None),
+            mock.patch.object(module.ImageSearcherPlugin, "_profile", profile),
+            mock.patch.object(module.ImageSearcherPlugin, "config", config, create=True),
+        ):
+            asyncio.run(plugin._hunt_x_handle([matched]))
+
+        self.assertEqual(asked, [])
+
+
+class ListingPageExpansionTest(unittest.TestCase):
+    """指纹命中落在站点列表页上时，顺着那张缩略图挖到具体那篇帖子。"""
+
+    def _plugin(self):
+        module = import_plugin()
+        plugin = object.__new__(module.ImageSearcherPlugin)
+        config = mock.Mock()
+        config.plugin.hash_threshold = 8
+        config.plugin.download_timeout = 5
+        plugin._verify_pool = None
+        return module, plugin, config
+
+    def _page(self, module):
+        page = module.Candidate(
+            engine="lens",
+            url="https://site.example/tag/bang-dream/",
+            title="bang dream Archives - Nude Bird",
+            source="Nude Bird",
+            platform="site.example",
+            image_url="https://site.example/img/21-1792635363-592x888-c.webp",
+        )
+        page.distance = 4
+        page.status = "suspect"
+        return page
+
+    def test_listing_entry_becomes_the_post(self) -> None:
+        module, plugin, config = self._plugin()
+        listing_html = (
+            '<div class="item"><a href="https://site.example/post/one/" title="[X] Maru">'
+            '<img src="https://site.example/img/21-1792635363-592x888-c.webp"></a></div>'
+        )
+        post_html = (
+            "<html><head>"
+            '<meta property="og:image" content="https://site.example/img/21-1792635363.webp">'
+            "<title>[X] Maru on the road</title></head><body>"
+            # 页面自己标的来源账号（出现 3 次以上才算，见 gallery.MIN_HITS）
+            '<a href="https://x.com/ran3ran3ran3">1</a>'
+            '<a href="https://x.com/ran3ran3ran3">2</a>'
+            '<a href="https://x.com/ran3ran3ran3">3</a>'
+            "</body></html>"
+        )
+
+        async def fetch(self, url):
+            return post_html if "/post/" in url else listing_html
+
+        def fake_verify(candidate, target, threshold, proxy, timeout, nets=None):
+            candidate.distance = 3
+            candidate.status = "match"
+            candidate.note = "指纹一致（距离 3）"
+            return candidate
+
+        with (
+            mock.patch.object(module.ImageSearcherPlugin, "_vlog", lambda *a, **k: None),
+            mock.patch.object(module.ImageSearcherPlugin, "_fetch_page_html", fetch),
+            mock.patch.object(module, "verify_candidate", fake_verify),
+            mock.patch.object(module.ImageSearcherPlugin, "_proxy", lambda self: ""),
+            mock.patch.object(module.ImageSearcherPlugin, "_fake_ip_nets", lambda self: ()),
+            mock.patch.object(module.ImageSearcherPlugin, "config", config, create=True),
+        ):
+            found = asyncio.run(plugin._expand_listing_pages([self._page(module)], 12345))
+
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].url, "https://site.example/post/one/")
+        self.assertIn("列表页里那一篇", found[0].note)
+        # 挖到帖子不算完：页面上标的来源账号要接着往下用
+        self.assertEqual(
+            [str(account.get("handle")) for account in found[0].source_accounts],
+            ["ran3ran3ran3"],
+        )
+
+    def test_listing_account_goes_into_the_repost_hunt(self) -> None:
+        """挖到的帖子上标着 X 号时，那个号要排进「翻她带图帖」的名单最前面。"""
+        module = import_plugin()
+        plugin = object.__new__(module.ImageSearcherPlugin)
+        best = module.Candidate(
+            engine="lens",
+            url="https://site.example/post/one/",
+            title="[X] Maru on the road",
+        )
+        best.status = "match"
+        best.source_accounts = [
+            {"platform": "X", "handle": "ran3ran3ran3", "url": "https://x.com/ran3ran3ran3", "count": 3}
+        ]
+        other = module.Candidate(engine="lens", url="https://x.com/someone", title="x")
+        other.handle = "someone"
+        plugin._REPOST_AUTHOR_LIMIT = 5
+        handles = plugin._repost_x_handles([other], best)
+        self.assertEqual(handles[0], "ran3ran3ran3")
+        self.assertIn("someone", handles)
+
+    def test_post_that_does_not_match_is_dropped(self) -> None:
+        """挖出来的那篇对不上指纹时不能拿它顶替，宁可保持「列表页」的降级。"""
+        module, plugin, config = self._plugin()
+        listing_html = (
+            '<a href="https://site.example/post/one/">'
+            '<img src="https://site.example/img/21-1792635363-592x888-c.webp"></a>'
+        )
+
+        async def fetch(self, url):
+            return "" if "/post/" in url else listing_html
+
+        def fake_verify(candidate, target, threshold, proxy, timeout, nets=None):
+            candidate.distance = 30
+            candidate.status = "mismatch"
+            candidate.note = "指纹不符（距离 30）"
+            return candidate
+
+        with (
+            mock.patch.object(module.ImageSearcherPlugin, "_vlog", lambda *a, **k: None),
+            mock.patch.object(module.ImageSearcherPlugin, "_fetch_page_html", fetch),
+            mock.patch.object(module, "verify_candidate", fake_verify),
+            mock.patch.object(module.ImageSearcherPlugin, "_proxy", lambda self: ""),
+            mock.patch.object(module.ImageSearcherPlugin, "_fake_ip_nets", lambda self: ()),
+            mock.patch.object(module.ImageSearcherPlugin, "config", config, create=True),
+        ):
+            found = asyncio.run(plugin._expand_listing_pages([self._page(module)], 12345))
+
+        self.assertEqual(found, [])
+
+    def test_plain_post_is_not_expanded(self) -> None:
+        """普通帖子页不参与这一步，别白白多抓两页。"""
+        module, plugin, config = self._plugin()
+        best = module.Candidate(
+            engine="lens",
+            url="https://xx.knit.bid/en/article/32501/",
+            title="Cosplay] ran3 - Cure Nyammy",
+        )
+        best.distance = 0
+        best.status = "match"
+        with mock.patch.object(module.ImageSearcherPlugin, "config", config, create=True):
+            self.assertEqual(asyncio.run(plugin._expand_listing_pages([best], 1)), [])
+
+    def test_expansion_refuses_to_land_on_another_listing(self) -> None:
+        """挖到的链接本身是合集页时不许用：c077 从帖子挖到了 `/collection/coser`。"""
+        module, plugin, config = self._plugin()
+        post_html = (
+            "<html><head>"
+            '<meta property="og:image" content="https://site.example/img/x.webp">'
+            "<title>Collection: Coser</title></head><body></body></html>"
+        )
+
+        async def fetch(self, url):
+            return post_html
+
+        def fake_verify(candidate, target, threshold, proxy, timeout, nets=None):
+            candidate.distance = 0
+            candidate.status = "match"
+            candidate.note = "指纹一致（距离 0）"
+            return candidate
+
+        with (
+            mock.patch.object(module.ImageSearcherPlugin, "_vlog", lambda *a, **k: None),
+            mock.patch.object(module.ImageSearcherPlugin, "_fetch_page_html", fetch),
+            # 直接让这一步吐出合集页链接，专门验插件自己那道闸
+            mock.patch.object(
+                module, "listing_entry_link", lambda *a, **k: "https://site.example/collection/coser/"
+            ),
+            mock.patch.object(module, "verify_candidate", fake_verify),
+            mock.patch.object(module.ImageSearcherPlugin, "_proxy", lambda self: ""),
+            mock.patch.object(module.ImageSearcherPlugin, "_fake_ip_nets", lambda self: ()),
+            mock.patch.object(module.ImageSearcherPlugin, "config", config, create=True),
+        ):
+            found = asyncio.run(plugin._expand_listing_pages([self._page(module)], 12345))
+
+        self.assertEqual(found, [])
+
+    def test_expansion_skips_post_without_its_own_image(self) -> None:
+        """帖子页没有主图时不许退回列表页缩略图，那等于自己跟自己比，必然距离 0。"""
+        module, plugin, config = self._plugin()
+        listing_html = (
+            '<a href="https://site.example/post/one/">'
+            '<img src="https://site.example/img/21-1792635363-592x888-c.webp"></a>'
+        )
+        post_html = "<html><head><title>one</title></head><body></body></html>"
+
+        async def fetch(self, url):
+            return post_html if "/post/" in url else listing_html
+
+        def fake_verify(candidate, target, threshold, proxy, timeout, nets=None):
+            candidate.distance = 0
+            candidate.status = "match"
+            candidate.note = "指纹一致（距离 0）"
+            return candidate
+
+        with (
+            mock.patch.object(module.ImageSearcherPlugin, "_vlog", lambda *a, **k: None),
+            mock.patch.object(module.ImageSearcherPlugin, "_fetch_page_html", fetch),
+            mock.patch.object(module, "verify_candidate", fake_verify),
+            mock.patch.object(module.ImageSearcherPlugin, "_proxy", lambda self: ""),
+            mock.patch.object(module.ImageSearcherPlugin, "_fake_ip_nets", lambda self: ()),
+            mock.patch.object(module.ImageSearcherPlugin, "config", config, create=True),
+        ):
+            found = asyncio.run(plugin._expand_listing_pages([self._page(module)], 12345))
+
+        self.assertEqual(found, [])
+
+
+class MultiSiteAuthorTest(unittest.TestCase):
+    """一次搜索命中好几个搬运站时，每个站上的作者名都得追，不能只看 best。
+
+    45de 那单 best 是 nudebird 的搬运页（署 By admin、页面里抽不出任何账号），
+    另一条 d=0 是 pixibb 的图集页；158d 那单更是 xx.knit.bid 和 pixibb 都写着
+    「染三ran3」。以前只按 best 那条链抽名字，别的站上白纸黑字写着的名字没人看。
+    """
+
+    @staticmethod
+    def _page(module, url, title, distance, status="match"):
+        item = module.Candidate(engine="lens", url=url, title=title, source="")
+        item.name = title
+        item.status = status
+        item.distance = distance
+        return item
+
+    def _plugin(self, llm=False):
+        module = import_plugin()
+        plugin = object.__new__(module.ImageSearcherPlugin)
+        config = mock.Mock()
+        config.title_author.enabled = llm
+        config.title_author.task = "utils"
+        config.title_author.model = ""
+        config.title_author.timeout = 30
+        return module, plugin, config
+
+    def test_lead_pages_skips_accounts_far_matches_and_same_host(self) -> None:
+        """只追「网页上没账号、核过图、距离够近」的落点，同域名只留一条。"""
+        module, plugin, _config = self._plugin()
+        best = self._page(
+            module, "https://nudebird.biz/x-maru-on-the-road/", "[X] Maru on the road", 0
+        )
+        same_host = self._page(
+            module, "https://nudebird.biz/tag/bang-dream/", "bang dream Archives", 4
+        )
+        profile = self._page(module, "https://x.com/chinojam1", "有栖酱", 0)
+        profile.platform = "X"
+        handled = self._page(module, "https://xx.knit.bid/en/article/1/", "Cosplay] ran3", 0)
+        handled.handle = "ran3"
+        far = self._page(module, "https://danbooru.donmai.us/posts/6765832", "higuchi madoka", 26)
+        gallery_page = self._page(
+            module, "https://cosplay.pixibb.com/x/", "染三ran3 - 森亚露露卡", 0
+        )
+
+        leads = plugin._lead_pages(
+            [best, same_host, profile, handled, far, gallery_page], best
+        )
+
+        self.assertEqual([item.url for item in leads], [best.url, gallery_page.url])
+
+    def test_author_from_another_site_is_followed(self) -> None:
+        """best 那个站标题里没名字，另一个站写着「染三ran3」：要顺着它追到人。"""
+        module, plugin, config = self._plugin()
+        best = self._page(
+            module,
+            "https://nudebird.biz/x-maru-on-the-road/",
+            "[X] Maru on the road - Nude Bird",
+            0,
+        )
+        other = self._page(
+            module, "https://cosplay.pixibb.com/x/", "染三ran3 - 名侦探光之美少女", 0
+        )
+        asked: list[str] = []
+
+        async def excerpt(self, url):
+            return ""
+
+        async def profile(self, handle):
+            asked.append(handle)
+            if handle == "ran3ran3ran3":
+                return {"screen_name": handle, "name": "染三 ran3", "followers": 24037}
+            return {"screen_name": handle, "name": "あんらん", "followers": 1}
+
+        async def media(self, handle, upload):
+            return {"url": "https://x.com/ran3ran3ran3/status/123", "distance": 0}
+
+        with (
+            mock.patch.object(module.ImageSearcherPlugin, "_vlog", lambda *a, **k: None),
+            mock.patch.object(module.ImageSearcherPlugin, "_fetch_page_html", excerpt),
+            mock.patch.object(module.ImageSearcherPlugin, "_profile", profile),
+            mock.patch.object(module.ImageSearcherPlugin, "_media_lookup", media),
+            mock.patch.object(module.ImageSearcherPlugin, "config", config, create=True),
+        ):
+            result = asyncio.run(plugin._hunt_title_author(best, b"img", [best, other]))
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["status"], "hit")
+        self.assertEqual(result["handle"], "ran3ran3ran3")
+        self.assertEqual(result["site"], other.url)
+        # 标题里剥出来的一句话（[X] Maru on the road）不该拿去查号。
+        self.assertTrue(all(not handle.startswith("Maru") for handle in asked))
+
+    def test_model_is_asked_once_for_all_sites(self) -> None:
+        """两个站都不带名字时，模型只问一次（一次看完所有页）。"""
+        module, plugin, config = self._plugin(llm=True)
+        first = self._page(module, "https://a.com/1", "sample page one", 0)
+        second = self._page(module, "https://b.com/2", "sample page two", 0)
+        calls: list[str] = []
+
+        async def call(name, **kwargs):
+            calls.append(str(kwargs.get("prompt") or ""))
+            return {
+                "success": True,
+                "response": '[{"site": "https://b.com/2", "author": "染三ran3"}]',
+            }
+
+        plugin_ctx = mock.Mock()
+        plugin_ctx.call_capability = call
+
+        async def excerpt(self, url):
+            return ""
+
+        async def profile(self, handle):
+            if handle == "ran3ran3ran3":
+                return {"screen_name": handle, "name": "染三 ran3", "followers": 24037}
+            return None
+
+        async def media(self, handle, upload):
+            return {"url": "https://x.com/ran3ran3ran3/status/9", "distance": 0}
+
+        with (
+            mock.patch.object(module.ImageSearcherPlugin, "_vlog", lambda *a, **k: None),
+            mock.patch.object(module.ImageSearcherPlugin, "_fetch_page_html", excerpt),
+            mock.patch.object(module.ImageSearcherPlugin, "_profile", profile),
+            mock.patch.object(module.ImageSearcherPlugin, "_media_lookup", media),
+            mock.patch.object(module.ImageSearcherPlugin, "config", config, create=True),
+            mock.patch.object(module.ImageSearcherPlugin, "ctx", plugin_ctx, create=True),
+        ):
+            result = asyncio.run(plugin._hunt_title_author(first, b"img", [first, second]))
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(result["status"], "hit")
+        self.assertEqual(result["handle"], "ran3ran3ran3")
+
+
+class WatermarkPlanTest(unittest.TestCase):
+    """水印读哪一次收成一个决策：行为跟以前一样，但理由能说清。
+
+    以前三处各判各的（兜底那段的 needs_watermark、拼图顺带读、重读再判一遍），
+    结果页上「没触发」和「触发了没读到」长得一模一样。
+    """
+
+    def _plan(self, **kwargs):
+        module = import_plugin()
+        plugin = object.__new__(module.ImageSearcherPlugin)
+        base = {
+            "vision_enabled": True,
+            "on_repost": True,
+            "has_best": False,
+            "has_handle": False,
+            "is_drawing": False,
+            "has_upload": True,
+        }
+        base.update(kwargs)
+        return plugin._watermark_plan(**base)
+
+    def test_alone_when_repost_page_has_no_account(self) -> None:
+        plan = self._plan(has_best=True)
+        self.assertEqual(plan["mode"], "alone")
+        self.assertTrue(plan["read"])
+        self.assertIn("落点没有账号", plan["reason"])
+
+    def test_nothing_when_site_already_gives_an_account(self) -> None:
+        plan = self._plan(has_best=True, has_handle=True)
+        self.assertEqual(plan["mode"], "none")
+        self.assertFalse(plan["read"])
+        self.assertIn("本来就有账号", plan["reason"])
+
+    def test_puzzle_when_no_fingerprint_hit(self) -> None:
+        plan = self._plan()
+        self.assertEqual(plan["mode"], "puzzle")
+
+    def test_repost_switch_off_is_said_out_loud(self) -> None:
+        plan = self._plan(has_best=True, on_repost=False)
+        self.assertEqual(plan["mode"], "none")
+        self.assertIn("watermark_on_repost", plan["reason"])
+
+    def test_drawing_route_and_no_upload_skip(self) -> None:
+        self.assertEqual(self._plan(is_drawing=True)["mode"], "none")
+        self.assertEqual(self._plan(has_upload=False)["mode"], "none")
+        self.assertEqual(self._plan(vision_enabled=False)["mode"], "none")
+
+
+    def test_helpers_can_be_called_through_an_instance(self) -> None:
+        """这两个函数以前都是 staticmethod，加新代码时装饰器挪错位置会当场炸：
+        通过实例调用会报 `takes 0 positional arguments`，整单直接失败。
+        2026-11-20 上午群里那次「搜图直接失败」就是这么来的，这里用实例调一遍。"""
+        module = import_plugin()
+        plugin = object.__new__(module.ImageSearcherPlugin)
+        self.assertTrue(
+            plugin._should_reread_watermark(
+                vision_enabled=True,
+                reread_enabled=True,
+                had_best=False,
+                watermark_post="",
+                grok_post="",
+            )
+        )
+        self.assertEqual(
+            plugin._watermark_plan(
+                vision_enabled=True,
+                on_repost=True,
+                has_best=False,
+                has_handle=False,
+                is_drawing=False,
+                has_upload=True,
+            )["mode"],
+            "puzzle",
+        )
+
+
+class SiteNameWatermarkTest(unittest.TestCase):
+    """水印读出来的是站点名时，别把它当账号，也别顺着它去查微博。"""
+
+    def test_site_name_watermark_is_dropped(self) -> None:
+        module = import_plugin()
+        plugin = object.__new__(module.ImageSearcherPlugin)
+        vision = {
+            "watermark": "PixiBB",
+            "watermark_text": "免费分享 Q群:176675909",
+            "watermark_handle": "pixiBB",
+            "watermark_url": "https://x.com/pixiBB",
+            "watermark_state": "ok",
+            "watermark_user_id": "1071945139",
+            "watermark_name": "brandy french",
+            "watermark_note": "最近十几条带图帖和搜索结果里都没有这张",
+            "watermark_readings": [
+                {
+                    "source": "vision-候选2",
+                    "raw": "PixiBB",
+                    "handle": "pixiBB",
+                    "state": "ok",
+                    "name": "brandy french",
+                }
+            ],
+        }
+        ordered = [
+            module.Candidate(
+                engine="lens",
+                url="https://cosplay.pixibb.com/coser-detective-precure-moria-ruruka/",
+                title="染三ran3: 名侦探光之美少女森亚露露卡",
+            )
+        ]
+        with mock.patch.object(module.ImageSearcherPlugin, "_vlog", lambda *a, **k: None):
+            plugin._drop_site_name_watermarks(vision, ordered)
+
+        self.assertEqual(vision["watermark_handle"], "")
+        self.assertEqual(vision["watermark_url"], "")
+        self.assertEqual(vision["watermark_readings"], [])
+        # 图上确实写着这串字，原文留着，只是不再当账号线索
+        self.assertEqual(vision["watermark"], "PixiBB")
+
+    def test_real_account_survives(self) -> None:
+        module = import_plugin()
+        plugin = object.__new__(module.ImageSearcherPlugin)
+        vision = {
+            "watermark": "@ran3ran3ran3",
+            "watermark_handle": "ran3ran3ran3",
+            "watermark_url": "https://x.com/ran3ran3ran3",
+            "watermark_readings": [{"handle": "ran3ran3ran3", "state": "ok"}],
+        }
+        ordered = [module.Candidate(engine="lens", url="https://xx.knit.bid/en/article/32501/")]
+        with mock.patch.object(module.ImageSearcherPlugin, "_vlog", lambda *a, **k: None):
+            plugin._drop_site_name_watermarks(vision, ordered)
+        self.assertEqual(vision["watermark_handle"], "ran3ran3ran3")
+        self.assertEqual(len(vision["watermark_readings"]), 1)
+
 
 class ProfileLookupRetryTest(unittest.TestCase):
     """查 X 账号资料失败时：404 直接收手，429／5xx 重试一次，失败要留日志。"""
-
     class _Response:
         def __init__(self, code: int, payload: dict | None = None) -> None:
             self.status_code = code
@@ -1150,6 +1774,43 @@ class ProfileLookupRetryTest(unittest.TestCase):
         user, seen = self._run([self._Response(502), self._Response(503)])
         self.assertIsNone(user)
         self.assertEqual(len(seen), 2)
+
+
+class ProxyFallbackConfigTest(unittest.TestCase):
+    """主代理 + 备代理：`_proxy()` 交出的是线路列表，底层认这个列表才会换线。"""
+
+    def _plugin(self, primary: str, alt: str):
+        module = import_plugin()
+        plugin = object.__new__(module.ImageSearcherPlugin)
+        config = mock.Mock()
+        config.plugin.proxy = primary
+        config.plugin.proxy_alt = alt
+        plugin._plugin_config_instance = config
+        try:
+            plugin.config = config
+        except AttributeError:
+            pass
+        return module, plugin
+
+    def test_proxy_alt_is_a_field(self) -> None:
+        module = import_plugin()
+        self.assertIn("proxy_alt", module.PluginSectionConfig.model_fields)
+
+    def test_primary_then_spare(self) -> None:
+        _module, plugin = self._plugin("http://127.0.0.1:6789", "http://127.0.0.1:10809")
+        self.assertEqual(
+            plugin._proxy(), ["http://127.0.0.1:6789", "http://127.0.0.1:10809"]
+        )
+
+    def test_spare_left_empty_means_single_route(self) -> None:
+        _module, plugin = self._plugin("http://127.0.0.1:6789", "")
+        self.assertEqual(plugin._proxy(), ["http://127.0.0.1:6789"])
+
+    def test_direct_keyword_means_no_proxy(self) -> None:
+        _module, plugin = self._plugin("direct", "http://127.0.0.1:10809")
+        self.assertEqual(plugin._proxy(), ["http://127.0.0.1:10809"])
+        _module, plugin = self._plugin("direct", "direct")
+        self.assertEqual(plugin._proxy(), [""])
 
 
 if __name__ == "__main__":

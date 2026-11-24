@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from requests.exceptions import SSLError
+from requests.exceptions import ReadTimeout
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -18,7 +19,10 @@ from core.engines import (  # noqa: E402
     host_image_publicly,
     LensEngine,
     YandexEngine,
+    _ATTEMPT_TIMEOUT,
     is_yandex_shell_page,
+    merge_candidates,
+    normalize_yandex_routes,
     reference_candidates,
     to_yandex_candidate,
     verify_candidate,
@@ -203,6 +207,16 @@ class XPageKindTest(unittest.TestCase):
         result = self._verify("https://x.com/AlbertGreen69/with_replies")
         self.assertEqual(result.status, "suspect")
         self.assertIn("回复列表页", result.note)
+
+    def test_tag_page_is_not_the_original_post(self) -> None:
+        """s-20261119-2329-c8e9 的实况：nudebird 的标签页被当成命中发了出去。"""
+        result = self._verify(
+            "https://nudebird.biz/tag/bang-dream/",
+            name="bang dream Archives - Nude Bird",
+        )
+        self.assertEqual(result.status, "suspect")
+        self.assertIn("列表页", result.note)
+        self.assertIn("不是具体帖子", result.note)
         self.assertIn("指纹一致（距离 0）", result.note)
 
     def test_profile_page_is_not_a_post(self) -> None:
@@ -675,6 +689,206 @@ class YandexEngineRouteTest(unittest.TestCase):
         self.assertFalse(is_yandex_shell_page("<html><div data-state='{}'></div></html>"))
 
 
+class _RouteSession:
+    """把「哪条线路」写进页面正文，解析那步再按正文回对应的站点列表。"""
+
+    def __init__(self, route: str, fail: bool = False) -> None:
+        self.route = route
+        self.fail = fail
+
+    def post(self, *args, **kwargs):
+        if self.fail:
+            raise ReadTimeout("read timed out")
+        return _FakeResponse(self.route)
+
+    def close(self) -> None:
+        pass
+
+
+class YandexMergeRoutesTest(unittest.TestCase):
+    """配了多条线路就都跑、候选并集：不同出口拿到的是完全不同的站点。
+
+    11-23 实测（同一张图各 3 轮）：直连 3/3、yandex.ru 给 72~73 条；走
+    127.0.0.1:10809（美国出口）3/3、每次只有 6 条，而且两批站点几乎不重叠。
+    只取第一条线会白丢另一半召回，所以按用户决定改成「都跑、去重后并起来」。
+    """
+
+    def test_routes_are_normalized(self) -> None:
+        self.assertEqual(normalize_yandex_routes(None), [])
+        self.assertEqual(normalize_yandex_routes(["  "]), [""])
+        self.assertEqual(
+            normalize_yandex_routes(["direct", "", "直连", "http://127.0.0.1:10809"]),
+            ["", "http://127.0.0.1:10809"],
+        )
+        self.assertEqual(
+            YandexEngine("http://p", routes=["direct", "http://127.0.0.1:10809"])._routes(),
+            ["", "http://127.0.0.1:10809"],
+        )
+
+    def test_merge_dedupes_by_url(self) -> None:
+        rows = [
+            Candidate(engine="yandex", url="https://a.com/1"),
+            Candidate(engine="yandex", url="https://a.com/1?utm_source=direct"),
+            Candidate(engine="yandex", url="https://b.com/2"),
+            Candidate(engine="yandex", url=""),
+        ]
+        self.assertEqual(
+            [item.url for item in merge_candidates(rows)],
+            ["https://a.com/1", "https://b.com/2"],
+        )
+
+    def test_merged_search_runs_every_route(self) -> None:
+        used: list[str] = []
+        pages = {
+            "": [{"url": "https://a.com/1", "title": "a"}],
+            "http://127.0.0.1:10809": [
+                {"url": "https://a.com/1", "title": "a"},
+                {"url": "https://b.com/2", "title": "b"},
+            ],
+        }
+
+        def factory(proxy: str = ""):
+            used.append(proxy)
+            return _RouteSession(proxy)
+
+        engine = YandexEngine(
+            "http://127.0.0.1:6789",
+            timeout=50,
+            routes=["direct", "http://127.0.0.1:10809"],
+        )
+        with mock.patch("core.engines.make_session", side_effect=factory), mock.patch(
+            "core.engines.parse_yandex_sites", side_effect=lambda page: pages.get(page)
+        ):
+            got = engine.search(b"img")
+        self.assertEqual(used, ["", "http://127.0.0.1:10809"], "两条线都跑，且不碰 6789")
+        self.assertEqual([item.url for item in got], ["https://a.com/1", "https://b.com/2"])
+
+    def test_one_route_failing_still_returns_the_other(self) -> None:
+        pages = {"": [{"url": "https://a.com/1", "title": "a"}]}
+
+        def factory(proxy: str = ""):
+            return _RouteSession(proxy, fail=bool(proxy))
+
+        engine = YandexEngine("", timeout=50, routes=["direct", "http://127.0.0.1:10809"])
+        with mock.patch("core.engines.make_session", side_effect=factory), mock.patch(
+            "core.engines.parse_yandex_sites", side_effect=lambda page: pages.get(page)
+        ):
+            got = engine.search(b"img")
+        self.assertEqual(len(got), 1, "一条线挂掉不影响另一条的候选")
+
+    def test_all_routes_failing_reports_each_line(self) -> None:
+        used: list[str] = []
+
+        def factory(proxy: str = ""):
+            used.append(proxy)
+            return _RouteSession(proxy, fail=True)
+
+        engine = YandexEngine("", timeout=30, routes=["direct", "http://127.0.0.1:10809"])
+        with mock.patch("core.engines.make_session", side_effect=factory):
+            with self.assertRaises(EngineError) as ctx:
+                engine.search(b"img")
+        message = str(ctx.exception)
+        self.assertIn("直连", message)
+        self.assertIn("代理10809", message)
+        self.assertEqual(set(used), {"", "http://127.0.0.1:10809"}, "只跑配的两条线")
+        self.assertEqual(used.count(""), 6, "三条域名各两轮，全都失败才报错")
+
+
+class YandexAttemptBudgetTest(unittest.TestCase):
+    """一条线卡住不能把总预算吃光：每次尝试单独封顶。
+
+    2026-11-21 早上那单（f443）三条线路全报超时，实际是第一条线路卡住把
+    50 秒总预算耗尽，后面的线路只分到两三秒，5 秒的上传跑不完也被记成超时。
+    """
+
+    def test_attempt_timeout_is_capped(self) -> None:
+        seen: list[tuple[float, float]] = []
+
+        class _TimeoutSession(_FakeSession):
+            def post(self, *args, **kwargs):
+                seen.append(kwargs.get("timeout"))
+                raise ReadTimeout("read timed out")
+
+        with mock.patch("core.engines.make_session", return_value=_TimeoutSession()):
+            with self.assertRaises(EngineError) as ctx:
+                YandexEngine("http://p", timeout=50).search(b"img")
+
+        # _timeout(12) → (10, 12)：即便总预算还有 50 秒，单次也只给 12 秒
+        self.assertEqual(seen[0], (10.0, _ATTEMPT_TIMEOUT))
+        self.assertIn("超时", str(ctx.exception))
+
+    def test_timeout_on_proxy_switches_route_before_retrying(self) -> None:
+        """代理超时先换直连，不原地再打一次代理。"""
+        used: list[str] = []
+        site = {"url": "https://x.com/a/status/1", "title": "t"}
+
+        class _TimeoutSession(_FakeSession):
+            def post(self, *args, **kwargs):
+                raise ReadTimeout("read timed out")
+
+        def factory(proxy: str = ""):
+            used.append(proxy)
+            return _TimeoutSession() if proxy else _FakeSession()
+
+        with mock.patch("core.engines.make_session", side_effect=factory), mock.patch(
+            "core.engines.parse_yandex_sites", return_value=[site]
+        ):
+            got = YandexEngine("http://p", timeout=50).search(b"img")
+
+        # 第一轮只走代理 → 直连，直连成功就收工，代理没有被重试
+        self.assertEqual(used, ["http://p", ""])
+        self.assertEqual(len(got), 1)
+
+    def test_both_routes_fail_before_any_retry(self) -> None:
+        """两条线路都不通时才回头重试，且顺序还是代理、直连。"""
+        used: list[str] = []
+
+        class _TimeoutSession(_FakeSession):
+            def post(self, *args, **kwargs):
+                raise ReadTimeout("read timed out")
+
+        def factory(proxy: str = ""):
+            used.append(proxy)
+            return _TimeoutSession()
+
+        with mock.patch("core.engines.make_session", side_effect=factory), mock.patch(
+            "core.engines.YANDEX_HOSTS", ("https://yandex.ru",)
+        ):
+            with self.assertRaises(EngineError):
+                YandexEngine("http://p", timeout=50).search(b"img")
+
+        # 单站点两轮：代理、直连、再代理、再直连
+        self.assertEqual(used, ["http://p", "", "http://p", ""])
+
+    def test_squeezed_attempt_still_tries_other_route(self) -> None:
+        """总预算很小时也不能只喂给一条线路。"""
+        used: list[tuple[str, float]] = []
+
+        class _TimeoutSession(_FakeSession):
+            def post(self, *args, **kwargs):
+                raise ReadTimeout("read timed out")
+
+        def factory(proxy: str = ""):
+            session = _TimeoutSession()
+
+            def post(*args, **kwargs):
+                used.append((proxy, kwargs.get("timeout")[1]))
+                raise ReadTimeout("read timed out")
+
+            session.post = post  # type: ignore[method-assign]
+            return session
+
+        with mock.patch("core.engines.make_session", side_effect=factory), mock.patch(
+            "core.engines.YANDEX_HOSTS", ("https://yandex.ru",)
+        ):
+            with self.assertRaises(EngineError):
+                YandexEngine("http://p", timeout=10).search(b"img")
+
+        # 预算 10 秒：两次尝试都拿不到封顶值，但两条线路都轮到了
+        self.assertGreaterEqual(len({route for route, _ in used}), 2)
+        self.assertTrue(all(value < _ATTEMPT_TIMEOUT for _, value in used))
+
+
 class LensTimeoutBudgetTest(unittest.TestCase):
     """6440：lens 一次要跑「上传图 + 检索」两步，外部时限按两步给。
 
@@ -792,20 +1006,27 @@ class LensUploadQuotaTest(unittest.TestCase):
         self.assertFalse(pool.is_exhausted("k"))
 
     def test_quota_deadline_comes_from_the_account_api(self) -> None:
-        """屏蔽到哪天要问账号接口：这两把 key 的重置日是 11-22，不是月初。"""
+        """屏蔽到哪天要问账号接口：按它给的重置日算，不是月初。
+
+        日期要取「从现在往后推」，不能写死某一天——写死的那个日子一过，
+        `snapshot()` 会把过期记录清掉，这个用例就变成一条红叉（11-22 踩过）。
+        """
+        import datetime as dt
+
         from core import keystate
         from core.keypool import KeyPool
 
+        renewal = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=10)).strftime("%Y-%m-%d")
         pool = KeyPool(["dead"])
         session = self._session(
             [self._resp(429, text='{"error": "Your account has run out of searches."}')]
         )
-        session.get.return_value = self._resp(payload={"plan_renewal_date": "2026-11-22"})
+        session.get.return_value = self._resp(payload={"plan_renewal_date": renewal})
         with mock.patch("core.engines.make_session", return_value=session):
             with self.assertRaises(EngineError):
                 LensEngine(pool, retries=0)._search_once(b"img")
         until = pool.snapshot()[keystate.key_id("dead")]
-        self.assertEqual(until, keystate.renewal_deadline("2026-11-22"))
+        self.assertEqual(until, keystate.renewal_deadline(renewal))
 
     def test_quota_deadline_falls_back_to_month_end(self) -> None:
         """问不到重置日才按自然月兜底。"""

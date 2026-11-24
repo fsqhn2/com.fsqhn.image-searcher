@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 API_BASE = "https://api.fxtwitter.com"
 
@@ -147,12 +147,39 @@ class MediaPost:
     media: list[str] = field(default_factory=list)
 
 
-def build_media_url(handle: str) -> str:
-    """账号最近的带图帖子列表。只包含它自己发的，不含转发。"""
+def build_media_url(handle: str, count: int = 0) -> str:
+    """账号最近的带图帖子列表。只包含它自己发的，不含转发。
+
+    默认一页只有十几条，``count`` 能一次多要几条：2026-11 实测同一个号，不带
+    ``count`` 回 14 条／15 张图，``count=50`` 回 39 条／42 张图。翻一位经常发图
+    的 coser，十多条只盖得住最近几天，套图帖一过期就永远翻不到。
+    """
     user = (handle or "").strip().lstrip("@")
     if not user or not _HANDLE.match(user):
         return ""
-    return f"{API_BASE}/2/profile/{user}/media"
+    base = f"{API_BASE}/2/profile/{user}/media"
+    if count and count > 0:
+        return f"{base}?count={min(int(count), 100)}"
+    return base
+
+
+def thumb_url(url: str, size: str = "small") -> str:
+    """把 pbs.twimg.com 的原图地址换成缩略图（``?name=small``）。
+
+    翻帖只用来比指纹，不需要原图：2026-11 实测同一批 12 张，原图 6 路并发
+    10.3 秒，缩略图 4.2 秒，而两者 dHash 距离是 0～1（阈值 8），判定不受影响。
+    省下来的时间全换成「多翻几十条帖」，一单里差的就是这个覆盖率。
+    """
+    text = (url or "").strip()
+    if not text:
+        return ""
+    host = (urlparse(text).hostname or "").lower()
+    if not (host == "pbs.twimg.com" or host.endswith(".pbs.twimg.com")):
+        return text
+    if "?name=" in text:
+        return re.sub(r"\?name=[A-Za-z0-9_]+", f"?name={size}", text, count=1)
+    joiner = "&" if "?" in text else "?"
+    return f"{text}{joiner}name={size}"
 
 
 # 账号核实结果。以前用 cdn.syndication.twimg.com 的 followbutton 接口，2026-11

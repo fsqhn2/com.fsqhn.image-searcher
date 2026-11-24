@@ -1,7 +1,8 @@
 """HTTP 会话与图片下载。
 
 SerpAPI 和 twimg 在国内直连不通，需要走本地代理；引擎与图片下载共用
-``[plugin] proxy`` 这一个代理设置，留空即直连。
+``[plugin] proxy``（主）与 ``[plugin] proxy_alt``（备）这一对代理设置，
+留空即直连。配了备代理时，主代理连接层失败会自动换它重放同一个请求。
 """
 
 from __future__ import annotations
@@ -10,10 +11,14 @@ import ipaddress
 import re
 import socket
 import time
+from collections.abc import Sequence
 from typing import Any
 from urllib.parse import urlparse
 
 import requests
+from requests.exceptions import ConnectionError, ReadTimeout, SSLError
+
+ProxySpec = str | Sequence[str]
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -106,21 +111,71 @@ def is_public_url(url: str, *, allow_nets: tuple[ipaddress._BaseNetwork, ...] = 
 
 
 
-def make_session(proxy: str = "", *, headers: dict[str, str] | None = None) -> requests.Session:
-    session = requests.Session()
+def proxy_routes(value: ProxySpec = "") -> list[str]:
+    """把「一个代理」或「一串代理」整理成线路列表（"" 表示直连），去重保序。
+
+    11-23 起配置支持主代理 + 次代理互备：主代理连不上（超时、TLS 被掐断、连接被重置）
+    就换下一条，不会因为一个代理抽风就让整单搜不动。
+    """
+    if isinstance(value, str) or value is None:
+        items: list[Any] = [value or ""]
+    else:
+        items = list(value)
+    routes: list[str] = []
+    for item in items:
+        text = str(item or "").strip()
+        if text not in routes:
+            routes.append(text)
+    return routes
+
+
+class FailoverSession(requests.Session):
+    """主代理挂了自动换下一个：只在连接类错误上换线，对端拒绝（4xx）不换。
+
+    「换线」是在同一个请求上重放，所以调用方不用关心配了几个代理：拿到 session 直接
+    用，主代理连不上时它会自己走次代理，两次都倒才把原始异常抛出去。
+    """
+
+    def __init__(self, routes: Sequence[str]) -> None:
+        super().__init__()
+        self._routes = [str(route or "").strip() for route in routes]
+
+    def request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        last: Exception | None = None
+        for route in self._routes:
+            kwargs["proxies"] = {"http": route, "https": route} if route else {}
+            try:
+                return super().request(method, url, **kwargs)
+            except (ConnectionError, ReadTimeout, SSLError) as exc:
+                last = exc
+                continue
+        raise last or ConnectionError("配置的代理线路都连不上")
+
+
+def make_session(
+    proxy: ProxySpec = "", *, headers: dict[str, str] | None = None
+) -> requests.Session:
+    routes = proxy_routes(proxy)
+    session: requests.Session
+    if len(routes) > 1:
+        session = FailoverSession(routes)
+    else:
+        session = requests.Session()
+        route = routes[0] if routes else ""
+        if route:
+            session.proxies.update({"http": route, "https": route})
     session.headers.update({"User-Agent": USER_AGENT})
     if headers:
         session.headers.update(headers)
-    if proxy:
-        session.proxies.update({"http": proxy, "https": proxy})
     return session
 
 
-def download_routes(url: str, proxy: str = "") -> list[str]:
+def download_routes(url: str, proxy: ProxySpec = "") -> list[str]:
     """按主机决定先走哪条线路，返回要去重尝试的顺序（"" 表示直连）。"""
     host = (urlparse(url).hostname or "").lower()
     direct_first = any(host == suffix or host.endswith("." + suffix) for suffix in _DIRECT_FIRST_SUFFIXES)
-    routes = ["", proxy] if direct_first else [proxy, ""]
+    configured = proxy_routes(proxy)
+    routes = ([""] + configured) if direct_first else (configured + [""])
     ordered: list[str] = []
     for route in routes:
         if route not in ordered:
@@ -163,7 +218,7 @@ def referer_of(url: str) -> str:
 
 def download_image_multi(
     url: str,
-    proxy: str = "",
+    proxy: ProxySpec = "",
     timeout: float = 15.0,
     attempts: int = 3,
     *,
@@ -205,7 +260,7 @@ def download_image_multi(
 
 def download_image(
     url: str,
-    proxy: str = "",
+    proxy: ProxySpec = "",
     timeout: float = 15.0,
     referer: str = "",
     *,

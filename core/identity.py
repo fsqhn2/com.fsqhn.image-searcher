@@ -17,9 +17,12 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Any
 
 import requests
+
+from .httpclient import make_session
 
 # 检索结果里常被当成 handle 抓到的路径词，不是账号。
 NOISE_HANDLES = frozenset(
@@ -79,9 +82,7 @@ def web_search(
     query = (query or "").strip()
     if not query or not api_key:
         return {}
-    session = requests.Session()
-    if proxy:
-        session.proxies.update({"http": proxy, "https": proxy})
+    session = make_session(proxy)
     try:
         if is_serper_key(api_key):
             response = session.post(
@@ -120,7 +121,9 @@ class IdentityError(RuntimeError):
 
 
 def _clean(text: str) -> str:
-    return _CLEAN_RE.sub("", (text or "").lower())
+    # 先 NFKC 再删分隔符：X／微博的昵称常写成数学粗斜体（「𝑴𝒊𝒐 𝑲𝒖𝒖𝒌𝒐」）或全角，
+    # 不折回普通字母的话，「Mio Kuuko」跟本人永远比不中（411f 的 @Kuukow002）。
+    return _CLEAN_RE.sub("", unicodedata.normalize("NFKC", text or "").lower())
 
 
 def name_matches(left: str, right: str) -> bool:
@@ -225,9 +228,7 @@ def _visitor_session(proxy: str, timeout: float) -> requests.Session:
     不带这一步，``ajax/profile/info`` 只回 ``{"error":"Forbidden"}``；带上之后
     同一个接口就能读到昵称。cookie 只在这个 session 里用，成功与否都不往外存。
     """
-    session = requests.Session()
-    if proxy:
-        session.proxies.update({"http": proxy, "https": proxy})
+    session = make_session(proxy)
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -272,9 +273,7 @@ def _weibo_cookie_session(cookie: str, proxy: str, timeout: float) -> requests.S
     配了登录 cookie 时用它：``s.weibo.com`` 的搜索结果更全、也不吃访客 cookie
     那套偶发的 432。没配时一律回落到 :func:`_visitor_session`，所以不登录也能跑。
     """
-    session = requests.Session()
-    if proxy:
-        session.proxies.update({"http": proxy, "https": proxy})
+    session = make_session(proxy)
     session.headers.update(
         {
             "User-Agent": (
@@ -650,32 +649,47 @@ def search_x_handles(
 # 一条检索结果里能落地的平台主页。顺序就是展示优先级：X 排头，因为只有 X 能
 # 顺着主页翻带图帖核对原图，其他平台这里只当线索。
 _PROFILE_PATTERNS: tuple[tuple[str, re.Pattern[str], frozenset[str]], ...] = (
-    ("X", re.compile(r"(?:x|twitter)\.com/([A-Za-z0-9_]{2,20})", re.I), NOISE_HANDLES),
+    # 左边锚一道：`coserindex.com/models/188` 里含「x.com/models/188」，不锚就会被
+    # 当成 X 账号 @models 混进主页线索（411f 实测）。前面是字母或数字的一律不算，
+    # 但 `www.` 这种以「.」结尾的子域要放行，所以点号不在排除项里。
+    ("X", re.compile(r"(?<![A-Za-z0-9-])(?:x|twitter)\.com/([A-Za-z0-9_]{2,20})", re.I), NOISE_HANDLES),
     (
         "Instagram",
-        re.compile(r"instagram\.com/([A-Za-z0-9_.]{2,30})", re.I),
+        re.compile(r"(?<![A-Za-z0-9-])instagram\.com/([A-Za-z0-9_.]{2,30})", re.I),
         frozenset({"p", "reel", "reels", "explore", "accounts", "tv", "stories", "share"}),
     ),
-    ("TikTok", re.compile(r"tiktok\.com/@([A-Za-z0-9_.]{2,30})", re.I), frozenset()),
+    ("TikTok", re.compile(r"(?<![A-Za-z0-9-])tiktok\.com/@([A-Za-z0-9_.]{2,30})", re.I), frozenset()),
     (
         "微博",
-        re.compile(r"weibo\.(?:com|cn)/(?:u/|profile/)?(\d{4,20})", re.I),
+        re.compile(r"(?<![A-Za-z0-9-])weibo\.(?:com|cn)/(?:u/|profile/)?(\d{4,20})", re.I),
         frozenset(),
     ),
     (
         "Patreon",
-        re.compile(r"patreon\.com/(?:user\?u=)?([A-Za-z0-9_-]{2,30})", re.I),
-        frozenset({"join", "posts", "login", "home"}),
+        re.compile(
+            r"(?<![A-Za-z0-9-])patreon\.com/(?:user\?u=)?([A-Za-z0-9_-]{2,30})"
+            r"(?!/?(?:cw|posts|collections?|join|login)/)",
+            re.I,
+        ),
+        frozenset({"join", "posts", "login", "home", "cw", "collection", "collections"}),
     ),
-    ("Reddit", re.compile(r"reddit\.com/(?:u|user)/([A-Za-z0-9_-]{3,20})", re.I), frozenset()),
-    ("Bilibili", re.compile(r"space\.bilibili\.com/(\d{4,20})", re.I), frozenset()),
+    ("Reddit", re.compile(r"(?<![A-Za-z0-9-])reddit\.com/(?:u|user)/([A-Za-z0-9_-]{3,20})", re.I), frozenset()),
+    ("Bilibili", re.compile(r"(?<![A-Za-z0-9-])space\.bilibili\.com/(\d{4,20})", re.I), frozenset()),
+    # `/videos/`、`/posts/`、`/photos/` 后面跟的是单条内容，前面那截只是页面 ID。
+    # 不挡的话 `facebook.com/100092272067015/videos/...` 会被读成「账号
+    # 100092272067015」（9b22 实测：那条其实是一段不相干的 cosplay 视频）。
     (
         "Facebook",
-        re.compile(r"facebook\.com/([A-Za-z0-9_.]{3,30})", re.I),
+        re.compile(
+            r"(?<![A-Za-z0-9-])facebook\.com/([A-Za-z0-9_.]{3,30})"
+            r"(?![A-Za-z0-9_.])"
+            r"(?!/(?:videos|posts|photos|reel|watch|story|permalink|media|share)/)",
+            re.I,
+        ),
         frozenset({"profile.php", "pages", "groups", "watch", "reel", "share", "login"}),
     ),
-    ("YouTube", re.compile(r"youtube\.com/@([A-Za-z0-9_.-]{2,30})", re.I), frozenset()),
-    ("小红书", re.compile(r"xiaohongshu\.com/user/profile/([0-9a-f]{10,40})", re.I), frozenset()),
+    ("YouTube", re.compile(r"(?<![A-Za-z0-9-])youtube\.com/@([A-Za-z0-9_.-]{2,30})", re.I), frozenset()),
+    ("小红书", re.compile(r"(?<![A-Za-z0-9-])xiaohongshu\.com/user/profile/([0-9a-f]{10,40})", re.I), frozenset()),
 )
 
 
@@ -702,6 +716,10 @@ def profiles_from_search(payload: Any, limit: int = 6) -> list[dict[str, str]]:
             for handle in pattern.findall(text):
                 key = (platform, handle.lower())
                 if handle.lower() in noise or key in seen:
+                    continue
+                # `facebook.com/photo.php?fbid=…`、`profile.php?id=…` 这类是脚本页，
+                # 不是账号名（649c 的主页线索里就混进过一条「Facebook photo.php」）。
+                if handle.lower().endswith(".php"):
                     continue
                 seen.add(key)
                 found.append(

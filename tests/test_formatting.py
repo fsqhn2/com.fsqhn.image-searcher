@@ -1597,6 +1597,31 @@ class DowngradedByKindTest(unittest.TestCase):
         self.assertIn("https://www.gamersky.com/ent/202601/13451846.shtml", text)
         self.assertIn("只找到别的网站的转发，没能找到原始出处", text)
 
+    def _aggregator_best(self) -> Candidate:
+        """b3b4：百度动态页，标题账号和水印同名，但内容号证明不了本人。"""
+        best = Candidate(
+            engine="baidu",
+            url="http://mbd.baidu.com/newspage/data/dtlandingsuper?nid=dt_4737138101278019876",
+            platform="mbd.baidu.com",
+            name="夜色温柔，风也轻，jk女孩出没#jk元气少女#",
+            distance=1,
+            status="suspect",
+            downgrade="aggregator",
+            note="内容号落地页：这个号（诗诗爱生活）和图上水印同名，但内容号证明不了图是她拍的",
+        )
+        best.finalize()
+        return best
+
+    def test_content_page_is_not_a_conclusion(self) -> None:
+        """百度动态/百家号上的同名账号不能当出处。"""
+        best = self._aggregator_best()
+        outcome = SearchOutcome(status="ok", best=best, candidates=[best])
+        text = formatting._best_block(outcome)
+        self.assertIn("未找到可靠出处", text)
+        self.assertIn("只找到内容号发的同款", text)
+        self.assertIn("诗诗爱生活", text)
+        self.assertIn("mbd.baidu.com", text)
+
     def test_request_post_is_not_a_conclusion(self) -> None:
         """0.7.93 把求图帖降成 suspect，文案这边也得跟着走「未找到」。"""
         item = Candidate(
@@ -2528,6 +2553,54 @@ class TitleAuthorLineTest(unittest.TestCase):
         self.assertIn("https://x.com/ran3ran3ran3", text)
         self.assertIn("点开自己核一下", text)
 
+    def test_page_written_handle_is_shown_as_a_clue(self) -> None:
+        """页面标题自己写着的号（2c76 的 @yummychiyo）：只当线索，说明来路。"""
+        outcome = self._make_outcome(
+            title_author={
+                "status": "seen",
+                "author": "Model Kokura Chiyo",
+                "name": "Kokura Chiyo",
+                "handle": "yummychiyo",
+                "x_name": "こくらちよ",
+                "variants": ["yummychiyo"],
+                "scanned": ["yummychiyo"],
+                "via": "title",
+                "explicit": True,
+            }
+        )
+        lines = formatting._title_author_lines(outcome)
+        self.assertTrue(lines)
+        self.assertIn("页面标题里直接写着 @yummychiyo", lines[0])
+        self.assertIn("https://x.com/yummychiyo", lines[0])
+        self.assertIn("点开自己核一下", lines[1])
+
+    def test_broken_profile_url_is_not_printed(self) -> None:
+        """老任务里存着 ``x.com/me/xxx`` 这种垃圾地址时，别把链接摆出去。"""
+        outcome = SearchOutcome(
+            vision={
+                "watermark": "t.me/exhentai5starcosplay",
+                "watermark_handle": "me/exhentai5starcosplay",
+                "watermark_url": "https://x.com/me/exhentai5starcosplay",
+                "watermark_state": "ok",
+                "watermark_note": "这个号存在，但没有原图，没法核对它发没发过",
+            }
+        )
+        text = formatting._vision_watermark_line(outcome)
+        self.assertIn("t.me/exhentai5starcosplay", text)
+        self.assertNotIn("x.com/me/", text)
+
+    def test_normal_profile_url_is_kept(self) -> None:
+        outcome = SearchOutcome(
+            vision={
+                "watermark": "kuru_xox",
+                "watermark_handle": "kuru_xox",
+                "watermark_url": "https://x.com/kuru_xox",
+                "watermark_state": "ok",
+                "watermark_note": "这个号存在，但没有原图，没法核对它发没发过",
+            }
+        )
+        self.assertIn("https://x.com/kuru_xox", formatting._vision_watermark_line(outcome))
+
     def test_name_and_account_are_split_in_the_line(self) -> None:
         """「染三ran3」要拆成名字「染三」+ 账号「ran3」，别当成一个人名。"""
         outcome = self._make_outcome(
@@ -2585,3 +2658,208 @@ class TitleAuthorLineTest(unittest.TestCase):
         )
         self.assertEqual(formatting._title_author_lines(outcome), [])
         self.assertTrue(formatting._title_author_lines(outcome, detail=True))
+
+
+class TraceLinesTest(unittest.TestCase):
+    """「这次是怎么找的」只在更多里给，首条不加。"""
+
+    def _make(self, trace):
+        return SearchOutcome(status="not_found", trace=trace)
+
+    def test_hidden_in_first_reply(self) -> None:
+        outcome = self._make([{"step": "读水印", "state": "skip", "note": "视觉开关关着"}])
+        self.assertEqual(formatting._trace_lines(outcome), [])
+
+    def test_shown_in_more(self) -> None:
+        outcome = self._make(
+            [
+                {"step": "读水印", "state": "ran", "note": "原图单独读，图上读到「染三ran3」"},
+                {"step": "标题作者", "state": "none", "note": "标题里没认出名字"},
+                {"step": "重读水印", "state": "skip", "note": "水印已经核到帖子 https://x.com/a/status/1"},
+            ]
+        )
+        lines = formatting._trace_lines(outcome, detail=True)
+        self.assertEqual(lines[1], "🧭 这次是怎么找的")
+        self.assertTrue(any("读水印：原图单独读" in line for line in lines))
+        self.assertTrue(any(line.startswith("× 标题作者") for line in lines))
+        self.assertTrue(any(line.startswith("○ 重读水印") for line in lines))
+
+    def test_empty_trace_writes_nothing(self) -> None:
+        self.assertEqual(formatting._trace_lines(self._make([]), detail=True), [])
+
+    def test_bad_entries_are_skipped(self) -> None:
+        lines = formatting._trace_lines(self._make([{"state": "ran"}, "乱码"]), detail=True)
+        self.assertEqual(lines, ["—", "🧭 这次是怎么找的"])
+
+    def test_trace_survives_the_round_trip(self) -> None:
+        """落盘再读回来不能把这份记录弄丢：回「更多」和重放都要看得到。"""
+        outcome = SearchOutcome(
+            status="ok", trace=[{"step": "读水印", "state": "ran", "note": "读到「染三ran3」"}]
+        )
+        restored = SearchOutcome.from_summary(outcome.to_summary())
+        self.assertEqual(restored.trace, outcome.trace)
+
+
+class SearchPageLineTest(unittest.TestCase):
+    """反解到号、图对不上时，这句话必须出现在结论里。
+
+    以前只挂在搜索页那条候选的 account_note 上，而那条永远是 suspect、不会被
+    `_pick_best` 选中——用户完全看不到这一步跑过。
+    """
+
+    def test_miss_note_reaches_the_conclusion(self) -> None:
+        outcome = SearchOutcome(status="not_found")
+        outcome.search_page = {
+            "state": "none",
+            "note": "「XxMiss Naruko」反解到 3 个号，投稿封面都对不上",
+        }
+        text = formatting._best_block_core(outcome)
+        self.assertIn("搜索页反解", text)
+        self.assertIn("XxMiss Naruko", text)
+
+    def test_no_search_page_keeps_quiet(self) -> None:
+        outcome = SearchOutcome(status="not_found")
+        self.assertNotIn("搜索页反解", formatting._best_block_core(outcome))
+
+    def test_search_page_survives_the_round_trip(self) -> None:
+        outcome = SearchOutcome(status="not_found", search_page={"state": "none", "note": "x"})
+        restored = SearchOutcome.from_summary(outcome.to_summary())
+        self.assertEqual(restored.search_page, {"state": "none", "note": "x"})
+
+
+class ShopPageFilterTest(unittest.TestCase):
+    """838e：可莉背包的图，参考区被同款商品页占满，看着像淘宝搜索。"""
+
+    def test_shop_pages_are_not_listed(self) -> None:
+        shop = Candidate(
+            engine="lens",
+            url="https://dokidokicos.com/products/dokidoki-game-genshin-impact-cosplay-klee-itabag",
+            platform="dokidokicos.com",
+            distance=24,
+            status="mismatch",
+        )
+        shop.finalize()
+        other = Candidate(
+            engine="lens",
+            url="https://example.com/post/1",
+            platform="example.com",
+            distance=30,
+            status="mismatch",
+        )
+        other.finalize()
+        outcome = SearchOutcome(status="not_found", best=None, candidates=[shop, other])
+        groups = engine_groups(outcome, None, 10)
+        urls = [item.url for _, items in groups for item in items]
+        self.assertNotIn(shop.url, urls)
+        self.assertIn(other.url, urls)
+
+    def test_only_shop_pages_drop_the_engine_group(self) -> None:
+        shop = Candidate(
+            engine="baidu",
+            url="https://www.gcosplay.com/products/x",
+            platform="gcosplay.com",
+            distance=25,
+            status="mismatch",
+        )
+        shop.finalize()
+        outcome = SearchOutcome(status="not_found", best=None, candidates=[shop])
+        self.assertEqual(engine_groups(outcome, None, 10), [])
+
+
+class OtherAccountsLinesTest(unittest.TestCase):
+    """其它平台账号那一行：核到图才敢说「也发过这张」，没核到只能列账号。
+
+    838e 那单的 TikTok `@starrychibun` 以前根本没露过面；现在要露，也必须写清
+    它只是账号线索——TikTok 和 IG 没有公开封面可比，含糊过去就等于骗人。
+    """
+
+    def test_hit_says_she_posted_it_elsewhere(self) -> None:
+        outcome = SearchOutcome(
+            status="ok",
+            other_accounts={
+                "status": "hit",
+                "hit": {
+                    "platform": "B站",
+                    "handle": "9",
+                    "name": "真号",
+                    "url": "https://space.bilibili.com/9",
+                    "distance": 3,
+                },
+                "accounts": [
+                    {
+                        "kind": "bilibili",
+                        "platform": "B站",
+                        "handle": "9",
+                        "url": "https://space.bilibili.com/9",
+                        "name": "真号",
+                    },
+                    {
+                        "kind": "tiktok",
+                        "platform": "TikTok",
+                        "handle": "starrychibun",
+                        "url": "https://www.tiktok.com/@starrychibun",
+                    },
+                ],
+            },
+        )
+        lines = formatting._other_accounts_lines(outcome)
+        self.assertIn("也发过这张", lines[0])
+        self.assertIn("指纹距离 3", lines[0])
+        joined = "\n".join(lines)
+        self.assertIn("TikTok @starrychibun", joined)
+        # 已经当结论的那个号不再在线索里重复一遍
+        self.assertEqual(joined.count("B站 真号"), 1)
+        self.assertIn("只是账号线索", joined)
+
+    def test_clues_only_do_not_claim_verification(self) -> None:
+        outcome = SearchOutcome(
+            status="not_found",
+            other_accounts={
+                "status": "seen",
+                "hit": None,
+                "accounts": [
+                    {
+                        "kind": "tiktok",
+                        "platform": "TikTok",
+                        "handle": "starrychibun",
+                        "url": "https://www.tiktok.com/@starrychibun",
+                    }
+                ],
+            },
+        )
+        lines = formatting._other_accounts_lines(outcome)
+        self.assertTrue(lines)
+        self.assertNotIn("也发过这张", "\n".join(lines))
+        self.assertIn("TikTok @starrychibun", lines[0])
+
+    def test_nothing_collected_renders_nothing(self) -> None:
+        self.assertEqual(formatting._other_accounts_lines(SearchOutcome()), [])
+
+    def test_best_block_includes_the_line(self) -> None:
+        best = Candidate(
+            engine="lens",
+            url="https://hotgirlpix.com/p/coser-x",
+            title="小仓千代w",
+            platform="hotgirlpix.com",
+            distance=2,
+            status="match",
+        )
+        best.finalize()
+        outcome = SearchOutcome(
+            status="ok",
+            best=best,
+            candidates=[best],
+            other_accounts={
+                "status": "seen",
+                "hit": None,
+                "accounts": [
+                    {
+                        "kind": "tiktok",
+                        "platform": "TikTok",
+                        "handle": "starrychibun",
+                        "url": "https://www.tiktok.com/@starrychibun",
+                    }
+                ],
+            },
+        )
+        self.assertIn("TikTok @starrychibun", formatting._best_block(outcome))

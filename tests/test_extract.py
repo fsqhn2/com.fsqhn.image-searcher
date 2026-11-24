@@ -222,6 +222,111 @@ class PlatformTest(unittest.TestCase):
         self.assertFalse(extract.is_forum_page("https://galleryepic.com/a"))
         self.assertFalse(extract.is_forum_page(""))
 
+    def test_listing_pages(self) -> None:
+        """站点标签页不是帖子：c8e9 那单把 nudebird 的 /tag/bang-dream/ 当成了命中。"""
+        self.assertTrue(
+            extract.listing_page_kind("https://nudebird.biz/tag/bang-dream/", "")
+        )
+        self.assertTrue(
+            extract.listing_page_kind("https://site.example/category/cosplay/page/2/", "")
+        )
+        self.assertTrue(extract.listing_page_kind("https://site.example/?s=ran3", ""))
+        # 标题里带 Archives 的也认，哪怕 URL 看着像一篇帖子
+        self.assertTrue(
+            extract.listing_page_kind(
+                "https://site.example/post/1", "bang dream Archives - Nude Bird"
+            )
+        )
+        # 具体帖子页不能误杀
+        self.assertEqual(extract.listing_page_kind("https://xx.knit.bid/en/article/32501/", ""), "")
+        self.assertEqual(extract.listing_page_kind("https://x.com/ran3ran3ran3/status/1", ""), "")
+        # `/page/N` 自己不是列表页信号：文章、图集分页仍是同一篇（c077 就栽在这）
+        self.assertEqual(
+            extract.listing_page_kind(
+                "https://www.hotgirlpix.com/p/coser-xiao-cang-qian-dai-w-8211-ming-ri-fang-zhou-w-yong-zhuang/page/2",
+                "",
+            ),
+            "",
+        )
+        self.assertEqual(
+            extract.listing_page_kind("https://xx.knit.bid/en/article/27949/page/3/", ""), ""
+        )
+        # 但列表页带分页时照样要认出来
+        self.assertTrue(
+            extract.listing_page_kind("https://nudebird.biz/tag/bang-dream/page/2/", "")
+        )
+        # 站点的合集页是列表，不是一篇帖子
+        self.assertTrue(extract.listing_page_kind("https://www.hotgirlpix.com/collection/coser", ""))
+        self.assertEqual(extract.listing_page_kind("", ""), "")
+
+    def test_listing_entry_link(self) -> None:
+        """列表页里那张缩略图所属的帖子：往前找最近的链接。"""
+        html = (
+            '<div class="item"><a href="https://site.example/post/one/" title="[X] Maru">'
+            '<img src="https://site.example/img/21-1792635363-592x888-c.webp"></a></div>'
+        )
+        self.assertEqual(
+            extract.listing_entry_link(
+                html,
+                "https://site.example/img/21-1792635363-592x888-c.webp",
+                "https://site.example/tag/bang-dream/",
+            ),
+            "https://site.example/post/one/",
+        )
+        # 懒加载把尺寸后缀改写过时，按文件名主干也能认出来
+        self.assertEqual(
+            extract.listing_entry_link(
+                html, "https://site.example/img/21-1792635363.webp", "https://site.example/tag/x/"
+            ),
+            "https://site.example/post/one/",
+        )
+        # 定位不到图就返回空，别乱指一篇
+        self.assertEqual(extract.listing_entry_link(html, "", "https://site.example/tag/x/"), "")
+        # 指向列表页本身或图片文件的链接跳过
+        nav = (
+            '<a href="https://site.example/tag/other/">x</a>'
+            '<a href="https://site.example/img/21-1792635363.webp">y</a>'
+            '<img src="https://site.example/img/21-1792635363-592x888-c.webp">'
+        )
+        self.assertEqual(
+            extract.listing_entry_link(
+                nav, "21-1792635363", "https://site.example/tag/x/"
+            ),
+            "",
+        )
+
+    def test_site_name_is_not_an_account(self) -> None:
+        """图的角落印着站名时，那不是作者账号。"""
+        urls = [
+            "https://cosplay.pixibb.com/coser-detective-precure-moria-ruruka/",
+            "https://xx.knit.bid/en/article/32501/",
+        ]
+        self.assertTrue(extract.is_site_name("pixiBB", urls))
+        self.assertTrue(extract.is_site_name("@PixiBB", urls))
+        self.assertTrue(extract.is_site_name("knitbid", urls))
+        # 真账号不能误杀
+        self.assertFalse(extract.is_site_name("ran3ran3ran3", urls))
+        self.assertFalse(extract.is_site_name("Pixi", urls))  # 不足 4 个字符不判
+        self.assertFalse(extract.is_site_name("pixiBB", []))
+
+    def test_page_main_image(self) -> None:
+        """帖子页只认 og:image / twitter:image，别把站标当主图。"""
+        self.assertEqual(
+            extract.page_main_image(
+                '<meta property="og:image" content="/uploads/a.webp">',
+                "https://site.example/post/one/",
+            ),
+            "https://site.example/uploads/a.webp",
+        )
+        self.assertEqual(
+            extract.page_main_image(
+                '<meta content="https://cdn.example/b.jpg" name="twitter:image">',
+                "https://site.example/post/one/",
+            ),
+            "https://cdn.example/b.jpg",
+        )
+        self.assertEqual(extract.page_main_image("<html></html>", "https://a.example/"), "")
+
     def test_request_posts(self) -> None:
         """求图帖不是出处：实测那单距离 0 命中「求出处」帖，被当成结论回了群。"""
         self.assertTrue(
@@ -448,3 +553,27 @@ class XPageHandleTest(unittest.TestCase):
         self.assertEqual(extract.x_page_handle("https://x.com/search?q=abc"), "")
         self.assertEqual(extract.x_page_handle("https://sotwe.com/someone"), "")
         self.assertEqual(extract.x_page_handle(""), "")
+
+
+class SplitRepostTitleTest(unittest.TestCase):
+    """图集站标题切成「名字 + 套图」，别把整条脏标题摆给用户看。"""
+
+    def test_chinese_title_with_work_name(self) -> None:
+        """5832 那单：分类标签被吃掉、竖线两边没空格。"""
+        self.assertEqual(
+            extract.split_repost_title("Cosplay] 小仓千代w 明日方舟W泳装| Xasiat"),
+            ("小仓千代w", "明日方舟W泳装"),
+        )
+
+    def test_english_set_title_still_splits(self) -> None:
+        self.assertEqual(
+            extract.split_repost_title("Xidaidai – Aemeath 18+ Cosplay (Wuthering Waves), 18 Photos"),
+            ("Xidaidai", "Aemeath 18+ Cosplay (Wuthering Waves), 18 张"),
+        )
+
+    def test_character_name_only_is_left_alone(self) -> None:
+        """「Nahida – Genshin Impact」前面的 Nahida 是角色，不是模特。"""
+        self.assertEqual(
+            extract.split_repost_title("Nahida – Genshin Impact"),
+            ("Nahida – Genshin Impact", ""),
+        )

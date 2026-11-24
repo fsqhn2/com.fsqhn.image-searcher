@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 from core import identity
 
@@ -157,6 +158,68 @@ class ProfilesFromSearchTest(unittest.TestCase):
         }
         self.assertEqual(identity.profiles_from_search(payload), [])
 
+    def test_script_pages_and_collection_paths_are_not_profiles(self) -> None:
+        """脚本页与合集路径不是账号：649c 的主页线索里冒出过「Facebook photo.php」。
+
+        `facebook.com/photo.php?fbid=…` 是单张照片页，`patreon.com/cw/xxx` 是合集页，
+        两者都被旧规则切成了「账号 photo.php / cw」。
+        """
+        payload = {
+            "organic_results": [
+                {
+                    "title": "纸悦Etsu_ko",
+                    "link": "https://www.facebook.com/photo.php?fbid=1687347159615334",
+                    "snippet": "",
+                },
+                {
+                    "title": "纸悦Etsu_ko | Patreon",
+                    "link": "https://www.patreon.com/cw/ZhiYueEtsu_ko",
+                    "snippet": "",
+                },
+                {
+                    "title": "纸悦Etsu_ko (@Etsuko827) / X",
+                    "link": "https://x.com/Etsuko827",
+                    "snippet": "",
+                },
+            ]
+        }
+        found = identity.profiles_from_search(payload)
+        got = {(row["platform"], row["handle"]) for row in found}
+        self.assertNotIn(("Facebook", "photo.php"), got)
+        self.assertNotIn(("Patreon", "cw"), got)
+        self.assertIn(("X", "Etsuko827"), got)
+
+    def test_facebook_video_page_is_not_a_profile(self) -> None:
+        """`facebook.com/<页面ID>/videos/<id>` 是单条视频，不是主页。
+
+        9b22：按名字搜到的「Facebook 100092272067015」其实是那段视频页的页面 ID，
+        标题里根本没有被搜的那个名字。
+        """
+        payload = {
+            "organic_results": [
+                {
+                    "title": "iagf 特约嘉宾 cosplay 视频来袭",
+                    "link": "https://www.facebook.com/100092272067015/videos/842215387835094/",
+                    "snippet": "",
+                },
+                {
+                    "title": "coser",
+                    "link": "https://www.facebook.com/coser.home/photos/123",
+                    "snippet": "",
+                },
+                {
+                    "title": "某个主页",
+                    "link": "https://www.facebook.com/some.coser",
+                    "snippet": "",
+                },
+            ]
+        }
+        found = identity.profiles_from_search(payload)
+        got = {(row["platform"], row["handle"]) for row in found}
+        self.assertNotIn(("Facebook", "100092272067015"), got)
+        self.assertNotIn(("Facebook", "coser.home"), got)
+        self.assertIn(("Facebook", "some.coser"), got)
+
     def test_same_handle_twice_only_once(self) -> None:
         payload = {
             "organic_results": [
@@ -171,6 +234,64 @@ class ProfilesFromSearchTest(unittest.TestCase):
         self.assertEqual(identity.search_profiles("", "key"), [])
         self.assertEqual(identity.search_profiles("NothingLose", ""), [])
         self.assertEqual(identity.profiles_from_search(None), [])
+
+    def test_fallback_retries_with_bare_name(self) -> None:
+        """「名字 + cosplay」搜回来的全是不相干的图板时，要拿裸名字再搜一次。
+
+        411f 的「Mio Kuuko」加 cosplay 之后九条全是 pinterest 图板，一条主页都没有；
+        裸名字才搜到 x.com/Kuukow002 与 instagram.com/kuuko_w。调用方以前写死
+        ``fallback=False``，等于白搜一次。
+        """
+        calls: list[str] = []
+
+        def fake_search(query, api_key, proxy="", **kwargs):
+            calls.append(query)
+            if "cosplay" in query:
+                return {"organic_results": [
+                    {"title": "Video vui nhộn", "link": "https://pinterest.com/pin/1", "snippet": ""}
+                ]}
+            return {"organic_results": [
+                {"title": "𝑴𝒊𝒐 𝑲𝒖𝒖𝒌𝒐🍀 (@Kuukow002) / X", "link": "https://x.com/Kuukow002", "snippet": ""}
+            ]}
+
+        with mock.patch.object(identity, "web_search", fake_search):
+            found = identity.search_profiles("Mio Kuuko", "a" * 64, fallback=True)
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(found[0], {"platform": "X", "handle": "Kuukow002", "url": "https://x.com/Kuukow002"})
+
+    def test_no_fallback_when_first_query_hits(self) -> None:
+        calls: list[str] = []
+
+        def fake_search(query, api_key, proxy="", **kwargs):
+            calls.append(query)
+            return {"organic_results": [
+                {"title": "someone (@someone)", "link": "https://x.com/someone", "snippet": ""}
+            ]}
+
+        with mock.patch.object(identity, "web_search", fake_search):
+            identity.search_profiles("someone", "a" * 64, fallback=True)
+        self.assertEqual(len(calls), 1)
+
+    def test_domain_that_ends_with_x_is_not_x(self) -> None:
+        """`coserindex.com/models/188` 里含「x.com/models」，不能当成 X 账号。
+
+        411f 实测：主页线索里混进一条「X / @models」，其实那是 coserindex 的路径。
+        `www.` 这种子域要照常认。
+        """
+        payload = {
+            "organic_results": [
+                {"title": "KuukoW - 个人资料", "link": "https://coserindex.com/models/188", "snippet": ""},
+                {"title": "Mio Kuuko (@kuuko_w)", "link": "https://www.instagram.com/kuuko_w/", "snippet": ""},
+                {"title": "𝑴𝒊𝒐 𝑲𝒖𝒖𝒌𝒐🍀 (@Kuukow002) / X", "link": "https://x.com/Kuukow002", "snippet": ""},
+            ]
+        }
+        found = identity.profiles_from_search(payload)
+        handles = [(item["platform"], item["handle"]) for item in found]
+        self.assertIn(("X", "Kuukow002"), handles)
+        self.assertIn(("Instagram", "kuuko_w"), handles)
+        self.assertNotIn(("X", "models"), handles)
+
 
 
 class SerperTest(unittest.TestCase):
@@ -214,12 +335,10 @@ class SerperTest(unittest.TestCase):
             def close(self):
                 pass
 
-        original = identity.requests.Session
-        identity.requests.Session = lambda: FakeSession()
-        try:
+        # 代理与 session 现在统一由 httpclient.make_session 建（主备代理在这里换线），
+        # 所以桩要打在 identity 拿到的那个名字上，而不是 requests.Session。
+        with mock.patch.object(identity, "make_session", lambda *a, **k: FakeSession()):
             payload = identity.web_search("a_b", self.SERPER_KEY)
-        finally:
-            identity.requests.Session = original
         self.assertEqual(payload["organic_results"][0]["link"], "https://x.com/a_b")
 
 
@@ -236,6 +355,16 @@ class NameMatchesTest(unittest.TestCase):
 
     def test_different_people_do_not_match(self) -> None:
         self.assertFalse(identity.name_matches("纸悦Etsu_ko", "白银81"))
+
+    def test_stylised_display_name_matches(self) -> None:
+        """花体／全角的昵称要折回普通字母再比。
+
+        411f 的真号 `@Kuukow002` 显示名写成数学粗斜体「𝑴𝒊𝒐 𝑲𝒖𝒖𝒌𝒐🍀」，不折回来
+        就会判成「对不上」，真号被当成同名路人丢掉。
+        """
+        self.assertTrue(identity.name_matches("Mio Kuuko", "𝑴𝒊𝒐 𝑲𝒖𝒖𝒌𝒐🍀"))
+        self.assertTrue(identity.name_matches("Mio Kuuko", "ＭＩＯ　ＫＵＵＫＯ"))
+        self.assertFalse(identity.name_matches("Mio Kuuko", "𝑯𝒊𝒅𝒐𝒓𝒊 𝑹𝒐𝒔𝒆"))
 
 
 if __name__ == "__main__":

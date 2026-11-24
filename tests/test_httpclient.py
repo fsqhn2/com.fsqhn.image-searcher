@@ -6,7 +6,10 @@ import io
 import unittest
 from unittest import mock
 
+import requests
 from PIL import Image
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import ReadTimeout
 
 from core import httpclient
 from core.hashing import dhash, prepare_upload
@@ -236,3 +239,76 @@ class RefererTest(unittest.TestCase):
     def test_invalid(self) -> None:
         self.assertEqual(httpclient.referer_of(""), "")
         self.assertEqual(httpclient.referer_of("not-a-url"), "")
+
+
+class ProxyFailoverTest(unittest.TestCase):
+    """主备代理：主代理连接层挂了，同一个请求自动换次代理重放。
+
+    `[plugin] proxy` 是主、`proxy_alt` 是备。11-23 实测里主代理（香港出口）三站只成
+    一站、8 秒读超时，次代理（美国出口）9/9 全过——不互备的话一个代理抽风就整单搜不动。
+    """
+
+    def test_proxy_routes_normalizes(self) -> None:
+        self.assertEqual(httpclient.proxy_routes("http://a:1"), ["http://a:1"])
+        self.assertEqual(httpclient.proxy_routes(""), [""])
+        self.assertEqual(httpclient.proxy_routes(None), [""])
+        self.assertEqual(
+            httpclient.proxy_routes([" http://a:1 ", "", "http://a:1", "http://b:2"]),
+            ["http://a:1", "", "http://b:2"],
+        )
+
+    def test_single_proxy_keeps_plain_session(self) -> None:
+        session = httpclient.make_session("http://a:1")
+        self.assertNotIsInstance(session, httpclient.FailoverSession)
+        self.assertEqual(session.proxies["https"], "http://a:1")
+
+    def test_two_proxies_switch_on_connection_error(self) -> None:
+        used: list[str] = []
+        response = object()
+
+        def fake_request(self, method, url, **kwargs):
+            used.append(kwargs["proxies"].get("https", ""))
+            if len(used) == 1:
+                raise RequestsConnectionError("主代理挂了")
+            return response
+
+        session = httpclient.make_session(["http://a:1", "http://b:2"])
+        with mock.patch.object(requests.Session, "request", fake_request):
+            got = session.request("GET", "https://example.com")
+        self.assertIs(got, response)
+        self.assertEqual(used, ["http://a:1", "http://b:2"], "主代理失败后换次代理")
+
+    def test_every_route_failing_raises_last_error(self) -> None:
+        def fake_request(self, method, url, **kwargs):
+            raise ReadTimeout("都超时了")
+
+        session = httpclient.make_session(["http://a:1", "http://b:2"])
+        with mock.patch.object(requests.Session, "request", fake_request):
+            with self.assertRaises(ReadTimeout):
+                session.request("GET", "https://example.com")
+
+    def test_non_network_error_does_not_switch(self) -> None:
+        """不是连接类错误就别换线——换线只会把同一个程序错误再犯一次。"""
+        used: list[str] = []
+
+        def fake_request(self, method, url, **kwargs):
+            used.append(kwargs["proxies"].get("https", ""))
+            raise ValueError("参数写错了")
+
+        session = httpclient.make_session(["http://a:1", "http://b:2"])
+        with mock.patch.object(requests.Session, "request", fake_request):
+            with self.assertRaises(ValueError):
+                session.request("GET", "https://example.com")
+        self.assertEqual(used, ["http://a:1"])
+
+    def test_download_routes_keeps_direct_last_for_normal_hosts(self) -> None:
+        self.assertEqual(
+            download_routes("https://example.com/a.jpg", ["http://a:1", "http://b:2"]),
+            ["http://a:1", "http://b:2", ""],
+        )
+        # Yandex 图床直连比代理快，直连要排在最前
+        self.assertEqual(
+            download_routes("https://avatars.mds.yandex.net/i?id=1", ["http://a:1", "http://b:2"]),
+            ["", "http://a:1", "http://b:2"],
+        )
+

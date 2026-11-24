@@ -187,6 +187,38 @@ class MediaListTest(unittest.TestCase):
         self.assertEqual(fxtwitter.build_media_url(""), "")
         self.assertEqual(fxtwitter.build_media_url("a/b"), "")
 
+    def test_build_url_with_count(self) -> None:
+        """默认一页只给十几条，count 能多要一些；超过 100 按 100 封顶。"""
+        self.assertEqual(
+            fxtwitter.build_media_url("@NERUchi890", count=50),
+            "https://api.fxtwitter.com/2/profile/NERUchi890/media?count=50",
+        )
+        self.assertEqual(
+            fxtwitter.build_media_url("NERUchi890", count=500),
+            "https://api.fxtwitter.com/2/profile/NERUchi890/media?count=100",
+        )
+        self.assertEqual(
+            fxtwitter.build_media_url("@NERUchi890", count=0),
+            "https://api.fxtwitter.com/2/profile/NERUchi890/media",
+        )
+
+    def test_thumb_url(self) -> None:
+        """翻帖比指纹用缩略图：同一张图原图与缩略图的指纹差 0～1。"""
+        self.assertEqual(
+            fxtwitter.thumb_url("https://pbs.twimg.com/media/ABC.jpg?name=orig"),
+            "https://pbs.twimg.com/media/ABC.jpg?name=small",
+        )
+        self.assertEqual(
+            fxtwitter.thumb_url("https://pbs.twimg.com/media/ABC.jpg"),
+            "https://pbs.twimg.com/media/ABC.jpg?name=small",
+        )
+        # 不是 twitter 图床就原样返回，别把别人的地址改坏。
+        self.assertEqual(
+            fxtwitter.thumb_url("https://cdn.example.com/a.jpg?name=orig"),
+            "https://cdn.example.com/a.jpg?name=orig",
+        )
+        self.assertEqual(fxtwitter.thumb_url(""), "")
+
     def test_parse_photos(self) -> None:
         payload = {
             "code": 200,

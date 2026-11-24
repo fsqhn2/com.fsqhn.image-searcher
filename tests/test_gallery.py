@@ -17,11 +17,90 @@ class GallerySiteTest(unittest.TestCase):
         self.assertTrue(gallery.is_gallery_site("https://www.v2ph.com/album/z4ox3ona.html"))
         self.assertTrue(gallery.is_gallery_site("https://beauty-draw.02o.app/beauty/EPCZxsR"))
         self.assertTrue(gallery.is_gallery_site(platform="acgtang.com"))
+        # c51b 那单：页面 JSON-LD 的 author 就是站名，标题里的人名是站方分类。
+        self.assertTrue(gallery.is_gallery_site("https://hentai.yoga/es/gallery/open/mai-khan-han-3"))
+        self.assertTrue(gallery.is_gallery_site("https://cdn.hentai.yoga/gallery/x/1.jpg"))
+        # c077 那单：图集站按 /model/<名字> 分套搬图，页面里没有任何社媒账号。
+        self.assertTrue(
+            gallery.is_gallery_site(
+                "https://www.hotgirlpix.com/p/coser-xiao-cang-qian-dai-w-8211-ming-ri-fang-zhou-w-yong-zhuang/page/2"
+            )
+        )
+        self.assertTrue(
+            gallery.is_gallery_site(
+                "https://misskon.com/coser-xiao-cang-qian-dai-w-w-yong-zhuang-21-photos/2/"
+            )
+        )
+        # 5832 那单：xasiat 把套图成套搬走，距离 0 落在它上面时被当成「找到了」，
+        # 用户点开只是一堆转载。它进了图集站名单，结论才会降级成线索。
+        self.assertTrue(
+            gallery.is_gallery_site("https://xasiat.com/p/coser-w-yong-zhuang/")
+        )
+        self.assertTrue(gallery.is_repost_site("https://xasiat.com/p/coser-w-yong-zhuang/"))
+        # 649c：COS团（costuan）是资源打包站（34P-182MB、度盘下载），署名是站方编辑。
+        # 不认它的话结论会被当「找到了」，微博那条按名字的腿也整条被挡掉。
+        self.assertTrue(gallery.is_gallery_site("https://www.costuan.com/14090.html"))
+        self.assertTrue(gallery.is_repost_site("https://www.costuan.com/14090.html"))
+
+    def test_shop_pages(self):
+        """838e：可莉背包的图，引擎回的全是同款商品页，参考区不该摆这些。"""
+        self.assertTrue(
+            gallery.is_shop_site(
+                "https://dokidokicos.com/products/dokidoki-game-genshin-impact-cosplay-klee-itabag"
+            )
+        )
+        self.assertTrue(gallery.is_shop_site("https://www.gcosplay.com/products/x", "gcosplay.com"))
+        self.assertTrue(gallery.is_shop_site("https://www.aliexpress.com/item/1005006.html"))
+        self.assertTrue(gallery.is_shop_site("https://item.taobao.com/item.htm?id=1"))
+        # 模板路径 + 商店域名才认；光有 /products/ 不算。
+        self.assertTrue(gallery.is_shop_site("https://mystore.example.com/products/x"))
+        self.assertFalse(gallery.is_shop_site("https://cosplay.pixibb.com/products/x"))
+        self.assertFalse(gallery.is_shop_site("https://www.pixiv.net/artworks/1"))
+        self.assertFalse(gallery.is_shop_site(""))
 
     def test_normal_sites_are_not_galleries(self):
         self.assertFalse(gallery.is_gallery_site("https://x.com/someone/status/1"))
         self.assertFalse(gallery.is_gallery_site("https://www.pixiv.net/artworks/1"))
         self.assertFalse(gallery.is_gallery_site(""))
+
+    def test_baidu_content_pages(self):
+        """百度动态/百家号只能当线索，不能当作者主页（b3b4 那单）。"""
+        self.assertTrue(
+            gallery.is_content_site(
+                "http://mbd.baidu.com/newspage/data/dtlandingsuper?nid=dt_4737138101278019876"
+            )
+        )
+        self.assertTrue(gallery.is_content_site("https://baijiahao.baidu.com/s?id=1"))
+        self.assertTrue(gallery.is_content_site(platform="mbd.baidu.com"))
+        # 百度主域是搜索引擎，不能跟着一起降级。
+        self.assertFalse(gallery.is_content_site("https://www.baidu.com/s?wd=x"))
+        self.assertFalse(gallery.is_content_site("https://x.com/someone/status/1"))
+        self.assertFalse(gallery.is_content_site(""))
+
+    def test_clickme_is_a_content_site(self) -> None:
+        """411f 落在 clickme 那篇《Mio Kuuko》文章上：是资讯站，不是作者主页。"""
+        self.assertTrue(gallery.is_content_site("https://clickme.net/62904"))
+        self.assertTrue(gallery.is_content_site(platform="clickme.net"))
+        self.assertFalse(gallery.is_content_site("https://notclickme.net/x"))
+
+    def test_honkaihaven_is_a_repost_site(self) -> None:
+        """cdfa 落在 honkaihaven 的 `/gallery/<id>/` 上：扒 pixiv 图的站，不是作者主页。
+
+        它的图床文件名还留着 pixiv 作品号与作者名（`…-by-lol-…-152342429.webp`），
+        页面本身只是图集。归搬运站这档（不是付费图包站），降级文案才不会写成
+        「付费图包页」。
+        """
+        self.assertTrue(gallery.is_repost_site("https://honkaihaven.com/gallery/1129766/漫画预告"))
+        self.assertFalse(gallery.is_gallery_site("https://honkaihaven.com/gallery/1129766/"))
+        self.assertFalse(gallery.is_repost_site("https://nothonkaihaven.com/gallery/1/"))
+
+    def test_forum_threads_are_recognized(self) -> None:
+        """b62e／ecaa 只搜到 NGA：那类是讨论帖，答案常在回复里。"""
+        self.assertTrue(gallery.is_forum_site("https://bbs.nga.cn/read.php?tid=47962202"))
+        self.assertTrue(gallery.is_forum_site(platform="ngabbs.com"))
+        self.assertTrue(gallery.is_forum_site("https://tieba.baidu.com/p/123"))
+        self.assertFalse(gallery.is_forum_site("https://x.com/someone/status/1"))
+        self.assertFalse(gallery.is_forum_site("https://honkaihaven.com/gallery/1/"))
 
     def test_suffix_lookalikes_do_not_match(self):
         """域名得按后缀精确匹配，否则仿站会被当成已知站点。"""
@@ -122,6 +201,13 @@ class SourceAccountTest(unittest.TestCase):
     def test_garbage_and_empty(self):
         self.assertEqual(gallery.parse_source_accounts("", "https://4play.to/x"), [])
         self.assertEqual(gallery.parse_source_accounts("<html>nothing</html>", "https://4play.to/x"), [])
+
+    def test_image_host_path_is_not_an_x_account(self):
+        """图床路径里的 `x.com/files` 不是 X 号：c077 那单 best 上挂着 count=10 的假账号。"""
+        html = (
+            '<img src="https://f.hotgirlpix.com/files/2025/03/03/21/idgbfogx70.jpg">' * 10
+        )
+        self.assertEqual(gallery.parse_source_accounts(html, "https://www.hotgirlpix.com/x"), [])
 
 
 class AuthorPageTest(unittest.TestCase):
