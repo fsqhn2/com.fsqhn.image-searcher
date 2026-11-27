@@ -369,6 +369,19 @@ def is_stop_word(word: str = "") -> bool:
     return str(word or "").strip().lower() in _STOP
 
 
+# 百度贴吧的板块名：`@cosplay吧`、`@崩坏星穹铁道吧`。图上打的是板块，不是账号。
+_BOARD_NAME = re.compile(r"[@＠]?[A-Za-z0-9_\u4e00-\u9fff·]{1,20}吧")
+
+
+def is_board_name(text: str = "") -> bool:
+    """这是不是贴吧的板块名（``@cosplay吧``），不是账号。
+
+    贴吧水印是把板块名当署名打的。拆出来的「cosplay」拿去查 X 往往真有个同名号，
+    一附主页就把人引过去（b55a 那条 @cosplay 还是个被封的号）。
+    """
+    return bool(_BOARD_NAME.fullmatch(str(text or "").strip()))
+
+
 def title_handle(text: str) -> tuple[str, str]:
     """标题里明写的 X 账号：返回 ``(账号, 账号前面的名字)``，没写返回 ``("", "")``。
 

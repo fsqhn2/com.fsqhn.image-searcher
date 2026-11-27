@@ -37,6 +37,7 @@ from .core import (
     same_person,
     searchpage,
     vision,
+    watermark,
 )
 from .core.commands import build_command_pattern, build_more_pattern, split_force
 from .core.config import migrate_legacy_sections
@@ -70,6 +71,7 @@ from .core.extract import (
     page_main_image,
     pixiv_artwork_url,
     pixiv_filename_hint,
+    pixiv_url_hint,
     x_page_handle,
     x_page_kind,
     x_title_name,
@@ -80,9 +82,11 @@ from .core.gallery import (
     is_author_page_site,
     is_content_site,
     is_gallery_site,
+    is_help_page,
     is_repost_site,
     is_shop_site,
     parse_source_accounts,
+    social_links_from_html,
 )
 from .core import weibopost
 from .core.hashing import dhash, hamming, prepare_upload
@@ -101,6 +105,15 @@ DEFAULT_COMMAND = "麦麦寻人"
 PLUGIN_NAME = "麦麦寻人"
 _BASE64_KEYS = ("binary_data_base64", "base64", "image_base64", "file_base64")
 _URL_KEYS = ("url", "image_url", "file_url", "download_url")
+
+# 求助站/图集的页面标题本身就是站方模板（whos.tv 那页叫「求出处或资源」）。拿它
+# 去各平台按名字搜只会白花额度：826c 那单就是这么白搜了微博和 B 站。整串精确匹配，
+# 别把真名里带「求助」的也挡掉。
+_SITE_BOILERPLATE_NAME_RE = re.compile(
+    r"^(?:求出处|求资源|求出处或资源|求原图|求番号|求助|求图|这是什么|出自哪里|"
+    r"help(?:\s*post)?|request|unknown|untitled|无题|未命名)$",
+    re.I,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -2548,6 +2561,12 @@ class ImageSearcherPlugin(MaiBotPlugin):
                     scan = vision_info.get("watermark_scan") or {}
                     if watermark_post:
                         note = f"拿水印号翻带图帖，核到 {watermark_post}"
+                    elif str(vision_info.get("watermark_weak") or "").strip():
+                        note = (
+                            f"读到「{vision_info.get('watermark') or ''}」，"
+                            f"但 X 上那个同名号{vision_info.get('watermark_weak')}，"
+                            "不像图上的人，没往下查"
+                        )
                     elif scan.get("scanned_posts"):
                         note = (
                             f"翻了 {scan['scanned_posts']} 条带图帖／"
@@ -2812,6 +2831,36 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 ),
                 self._author_trace_note(title_author, "标题里没认出名字"),
             )
+        # 落在「求图 / 问答」帖上时（whos.tv 这类），答案常直接写在最佳回复里：
+        # 把正文里的 X 帖链接拿来取图核对，比让人自己点开翻强。826c 那单的
+        # 最佳答案就写着「原图在这儿 https://x.com/Ahab_Channel/status/…」。
+        help_post: dict[str, Any] | None = None
+        if upload and not (
+            best is not None and best.status == "match" and (best.handle or "").strip()
+        ):
+            try:
+                help_post = await self._hunt_help_post(ordered, best, upload)
+            except Exception as error:  # noqa: BLE001 - 读不到页面不影响已有结论
+                self.ctx.logger.warning("求助帖正文反查失败：%s", error)
+                help_post = None
+            if help_post and help_post.get("status") == "hit":
+                best = self._promote_help_post(best, help_post)
+            if help_post:
+                state = str(help_post.get("status") or "none")
+                if state == "hit":
+                    note = f"求助帖的回复里给出 @{help_post.get('handle')}，指纹一致"
+                elif state == "clue":
+                    note = f"求助帖里给出 X @{help_post.get('handle')}，没能比指纹"
+                elif state == "unreadable":
+                    note = "求助帖读不到正文"
+                else:
+                    note = "求助帖里没有可核对的出处"
+                self._trace(
+                    trace,
+                    "求助帖正文",
+                    "hit" if state == "hit" else ("ran" if state in {"clue", "none"} else "none"),
+                    note,
+                )
         # 结论里的账号核一下死活：被封的号 handle 会被释放，只剩数字 ID 能对上人。
         best = await self._check_best_account(best, vision_info)
 
@@ -3083,6 +3132,10 @@ class ImageSearcherPlugin(MaiBotPlugin):
             blocked={str((pixiv_source or {}).get("title") or "")},
             trusted=llm_names,
         )
+        # 图上的水印名也进这条腿。中文水印以前只走微博（那条腿按昵称搜人），X 与
+        # 其它平台根本不知道这个名字：cf7d 的水印「咲鱼咔咔」微博认到了主页，可
+        # X 那条腿拿的是标题里的「Tsuki_月隐」，同一个人的两条线各查一半。
+        name_candidates = self._with_watermark_names(name_candidates, vision_info)
         # 标题作者那条线「查过但没找到」时不要当成「已经搜过」：c077 那单正是
         # X 上按显示名找不到中文名，才需要换各平台再试一次。只有真的认到号
         # （hit / named）才把那个名字从这一轮里排掉，别白花检索额度。
@@ -3402,6 +3455,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
             gallery_sources=gallery_sources,
             search_page=search_page_info,
             other_accounts=other_accounts,
+            help_post=help_post,
             trace=trace,
         )
 
@@ -4223,6 +4277,38 @@ class ImageSearcherPlugin(MaiBotPlugin):
         await self._send_forward(task, self._more_limit(), replay=True, target=current)
         return True, "已重发上次结果", 2
 
+    async def _plain_task(self, current: str, user_id: str, wanted: str) -> tuple[bool, str, int]:
+        """把某一单的结果改发成一条普通图文消息。
+
+        用途是合并转发卡片偶发不被客户端渲染时的退路：卡片已经发出去了、服务端也存着，
+        但群里看不见，用户补一句「直发」就能拿到同一份结论（文字 + 最多三张关键图）。
+        跟「更多」一样：带编号找指定单，不带编号找本会话最近一单；找不到时裸指令静静
+        返回，交给正常聊天。
+        """
+        if self._tasks is None:
+            return False, "插件尚未初始化", 0
+        keep = formatting.ttl_text(self.config.plugin.task_ttl_minutes)
+        if wanted:
+            task = self._tasks.get(wanted)
+            if task is None:
+                await self.ctx.send.text(
+                    f"任务 {wanted} 的结果已经清掉了（只保留 {keep}）。重新发图搜一次吧。",
+                    current,
+                )
+                return True, "任务缓存已过期", 2
+            if task.status != "done" or task.outcome is None:
+                await self.ctx.send.text(f"任务 {wanted} 还没搜完，稍等一下再发。", current)
+                return True, "任务未完成", 2
+        else:
+            task = self._latest_task(current, user_id)
+            if task is None or task.status != "done" or task.outcome is None:
+                return False, "", 0
+        # 磁盘恢复的老任务没有配图，补一次再发，否则只有文字。
+        await self._ensure_image(task)
+        await self._ensure_engine_images(task, limit=self._more_limit(), whole=False)
+        await self._send_first_reply(task, current, reason="直发")
+        return True, "已直发结果", 2
+
     def _eta_text(self) -> str:
         """给用户看的耗时提示。
 
@@ -4521,6 +4607,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
         *,
         data_url: str = "",
         label: str = "",
+        extra_data_url: str = "",
     ) -> dict[str, Any]:
         """只读原图上的水印：命中搬运站时，这一步比再拼一次对照图更值得。
 
@@ -4562,11 +4649,21 @@ class ImageSearcherPlugin(MaiBotPlugin):
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": vision.build_watermark_prompt(label=label)},
+                    {
+                        "type": "text",
+                        "text": vision.build_watermark_prompt(
+                            label=label, enhanced=bool(extra_data_url)
+                        ),
+                    },
                     {"type": "image_url", "image_url": {"url": data_url}},
                 ],
             }
         ]
+        if extra_data_url:
+            # 同一处文字的增强版：白字压同色背景时原样那张几乎读不出来。
+            messages[0]["content"].append(
+                {"type": "image_url", "image_url": {"url": extra_data_url}}
+            )
         timeout = max(10, int(section.timeout))
         options: dict[str, Any] = {
             "prompt": messages,
@@ -5590,16 +5687,29 @@ class ImageSearcherPlugin(MaiBotPlugin):
             return
         primary = next((item for item in results if item.get("post")), None)
         if primary is None:
+            # 没有核到帖子的：先挑画像说得过去的那条——读歪撞上的同名号排后面，
+            # 免得把「不像」的读法写成首屏那条线索。
             primary = next(
-                (item for item in results if item.get("source") == "vision"), results[0]
+                (
+                    item
+                    for item in results
+                    if item.get("source") == "vision" and not item.get("weak")
+                ),
+                None,
             )
+        if primary is None:
+            primary = next((item for item in results if not item.get("weak")), results[0])
+        weak = str(primary.get("weak") or "").strip()
         vision_info["watermark"] = primary.get("raw") or ""
-        vision_info["watermark_handle"] = primary.get("handle") or ""
-        vision_info["watermark_url"] = primary.get("url") or ""
+        vision_info["watermark_weak"] = weak
+        vision_info["watermark_handle"] = "" if weak else (primary.get("handle") or "")
+        vision_info["watermark_url"] = "" if weak else (primary.get("url") or "")
         vision_info["watermark_state"] = primary.get("state") or ""
-        vision_info["watermark_user_id"] = primary.get("user_id") or ""
-        if primary.get("name"):
+        vision_info["watermark_user_id"] = "" if weak else (primary.get("user_id") or "")
+        if primary.get("name") and not weak:
             vision_info["watermark_name"] = primary["name"]
+        elif weak:
+            vision_info.pop("watermark_name", None)
         if primary.get("note"):
             vision_info["watermark_note"] = primary["note"]
         if primary.get("post"):
@@ -5840,7 +5950,11 @@ class ImageSearcherPlugin(MaiBotPlugin):
             return {"info": {}, "readings": [], "known": set(known), "hit": False}
 
         async def read_into(
-            slot: dict[str, Any], source: bytes, label: str, data_url: str = ""
+            slot: dict[str, Any],
+            source: bytes,
+            label: str,
+            data_url: str = "",
+            extra: str = "",
         ) -> bool:
             if not await take_call():
                 return False
@@ -5852,6 +5966,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 data_url=data_url,
                 label=label,
                 verify=upload,
+                extra_data_url=extra,
             )
 
         def absorb(slot: dict[str, Any]) -> None:
@@ -5883,7 +5998,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
             slot["hit"] = await self._locate_and_read(
                 source,
                 label,
-                lambda src, name, data_url="": read_into(slot, src, name, data_url),
+                lambda src, name, data_url="", extra="": read_into(
+                    slot, src, name, data_url, extra
+                ),
             )
             return slot
 
@@ -6064,10 +6181,25 @@ class ImageSearcherPlugin(MaiBotPlugin):
             self._vlog("水印定位%s 裁剪失败：%s", where, str(error)[:40])
             return False
         spot = str(located.get("where") or "").strip() or "定位点"
+        extra = ""
+        try:
+            # 同一处再给一张背景差分的增强版：白字压在同色背景上时，原样裁出来
+            # 的字跟背景只差十几个灰度级，模型抄不出来（832b 那串白色连笔字）。
+            extra, _same_box = await asyncio.to_thread(
+                vision.enhanced_crop_data_url, source, located["box"]
+            )
+        except Exception as error:  # noqa: BLE001 - 增强失败就用原裁块
+            self._vlog("水印定位%s 增强失败：%s", where, str(error)[:40])
         self.ctx.logger.info(
-            "水印定位%s：%s，裁剪框=%s，放大后送读", where, spot, box
+            "水印定位%s：%s，裁剪框=%s，放大后送读%s",
+            where,
+            spot,
+            box,
+            "（附一张增强版）" if extra else "",
         )
-        return await read(source, f"{label or '原图'}-{spot}", data_url=crop_url)
+        return await read(
+            source, f"{label or '原图'}-{spot}", data_url=crop_url, extra=extra
+        )
 
     async def _reread_one(
         self,
@@ -6079,6 +6211,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
         data_url: str,
         label: str,
         verify: bytes | None = None,
+        extra_data_url: str = "",
     ) -> bool:
         """读一次（整图或某一块），读到没见过的号就核它自己的带图帖。
 
@@ -6088,7 +6221,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
         """
         where = f"[{label}]" if label else ""
         try:
-            info = await self._read_watermark(source, data_url=data_url, label=label)
+            info = await self._read_watermark(
+                source, data_url=data_url, label=label, extra_data_url=extra_data_url
+            )
         except Exception as error:  # noqa: BLE001 - 重读只是加分项
             self.ctx.logger.warning("重读水印失败%s：%s", where, error)
             return False
@@ -6146,6 +6281,69 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 self._vlog("重读水印%s：@%s 没对上，接着试同一条水印里的下一个写法", where, handle)
         return landed
 
+    async def _watermark_stats(self, handle: str) -> fxtwitter.Stats:
+        """看一眼号的画像：粉丝数、是不是私人号、哪年注册。
+
+        老版 ``/<号>`` 端点才给这些；``/2/profile`` 只有 id 和昵称。所以只在水印
+        号需要判断「像不像图上那个人」时才补这一次请求。
+        """
+        url = fxtwitter.build_stats_url(handle)
+        if not url:
+            return fxtwitter.Stats()
+
+        def fetch() -> fxtwitter.Stats:
+            session = make_session(self._proxy())
+            try:
+                response = session.get(url, timeout=15, headers={"Accept": "application/json"})
+                if response.status_code != 200:
+                    return fxtwitter.Stats()
+                try:
+                    return fxtwitter.parse_stats(response.json())
+                except Exception:  # noqa: BLE001 - 不是 JSON 就当作没查成
+                    return fxtwitter.Stats()
+            finally:
+                session.close()
+
+        try:
+            return await asyncio.wait_for(asyncio.to_thread(fetch), timeout=20)
+        except Exception:  # noqa: BLE001 - 查不了就不拿画像下判断
+            return fxtwitter.Stats()
+
+    async def _watermark_weak_reason(
+        self, reading: dict[str, Any], handle: str
+    ) -> str:
+        """读到的字没明写账号、这个号又不像图上的人时，返回一句理由。
+
+        832b 那单：地毯上一串白色连笔签名被读成 ``Stellach``，X 上真有这个号——
+        2010 年注册、71 个粉丝、韩文简介的私人号。它是读歪了，却带着主页链接摆在
+        首屏，还顺着名字去搜了 Instagram 和 B 站。所以这种号只写读到的字：
+        不给主页，也不拿它的名字当线索。
+
+        图上明写着 ``@abc``／``x.com/abc`` 的不走这道——那种读法出错概率低，
+        号再小也可能是真的（新号、小号），不能一刀切掉。
+        """
+        raw = str(reading.get("raw") or "")
+        if watermark.explicit_account(raw, handle):
+            return ""
+        stats = await self._watermark_stats(handle)
+        if not stats.ok:
+            return ""
+        reason = watermark.implausible(
+            followers=stats.followers,
+            protected=stats.protected,
+            joined=stats.joined,
+        )
+        if not reason:
+            return ""
+        self._vlog(
+            "水印号画像：@%s 粉丝=%s 私人=%s 注册=%s → 不像图上的人",
+            handle,
+            stats.followers,
+            int(stats.protected),
+            watermark.joined_year(stats.joined) or "-",
+        )
+        return reason
+
     async def _verify_watermark_reading(
         self,
         reading: dict[str, Any],
@@ -6165,6 +6363,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
             "post": "",
             "distance": None,
             "note": "",
+            "weak": "",
             "fixed": "",
             "from": "",
         }
@@ -6190,6 +6389,13 @@ class ImageSearcherPlugin(MaiBotPlugin):
             info["post"] = str(holder.get("watermark_post") or "")
             if holder.get("watermark_distance") is not None:
                 info["distance"] = int(holder["watermark_distance"])
+            if not info["post"]:
+                # 没翻到这张图时才多看一眼画像：号存在不代表读得准。
+                weak = await self._watermark_weak_reason(reading, handle)
+                if weak:
+                    info["weak"] = weak
+                    info["url"] = ""
+                    info["note"] = f"X 上的同名号{weak}，不像图上的人"
             self._vlog(
                 "水印号核对：@%s（%s）状态=%s id=%s 命中=%s",
                 handle,
@@ -7637,6 +7843,136 @@ class ImageSearcherPlugin(MaiBotPlugin):
         )
         return author, handle, name
 
+    @staticmethod
+    def _help_page_of(ordered: list[Candidate], best: Candidate | None) -> Candidate | None:
+        """挑出该去读正文的求助帖：距离够近（或就是最佳候选）才算。"""
+        pages: list[Candidate] = []
+        for item in [best, *ordered]:
+            if item is None or item in pages:
+                continue
+            if not is_help_page(item.url or "", item.platform or ""):
+                continue
+            if item.distance is None or item.distance > 8:
+                continue
+            pages.append(item)
+        return pages[0] if pages else None
+
+    async def _hunt_help_post(
+        self, ordered: list[Candidate], best: Candidate | None, upload: bytes | None
+    ) -> dict[str, Any] | None:
+        """落点是「求图 / 问答」帖时，读正文与回复里写的出处，再拿它来核对。
+
+        826c 那单只有 whos.tv 的求助帖（距离 0、视觉判定同图），最佳答案直接写着
+        「原图在这儿 https://x.com/Ahab_Channel/status/…」，插件却把它降级成
+        「不是作者主页」就收工了。这类站公开可读（不像 NGA 要登录），抓下来就能
+        把答案读出来；帖子里给的 X 帖还能取图比指纹。
+        """
+        if not upload:
+            return None
+        page = self._help_page_of(ordered, best)
+        if page is None:
+            return None
+        host = (page.url or "").split("://", 1)[-1].split("/", 1)[0].removeprefix("www.")
+        started = time.time()
+        html = await self._fetch_page_html(page.url or "")
+        if not html:
+            self._vlog("求助帖读不到正文：%s", page.url)
+            return {"status": "unreadable", "page": page.url, "host": host}
+        links = social_links_from_html(html, page.url or "")
+        if not links:
+            self._vlog("求助帖正文里没有可核对的出处：%s", page.url)
+            return {"status": "none", "page": page.url, "host": host}
+        self._vlog(
+            "求助帖里读到 %s 条出处：%s",
+            len(links),
+            "、".join(str(item.get("url") or "") for item in links),
+        )
+        mine = dhash(upload)
+        threshold = self.config.plugin.hash_threshold
+        clue: dict[str, Any] | None = None
+        for link in links:
+            if link.get("kind") != "x_post":
+                continue
+            # 整条腿限 18 秒：求助页只是线索来源，不能让一张图把它拖成一分钟。
+            if time.time() - started > 18:
+                break
+            tweet = await self._fetch_tweet(str(link.get("url") or ""))
+            if not tweet.ok:
+                continue
+            handle = str(tweet.handle or link.get("handle") or "").strip().lstrip("@")
+            if not handle:
+                continue
+            distance: int | None = None
+            if mine is not None:
+                for image in tweet.media[:3]:
+                    raw = await self._download(image)
+                    if not raw:
+                        continue
+                    other = dhash(raw)
+                    if other is None:
+                        continue
+                    gap = hamming(mine, other)
+                    if distance is None or gap < distance:
+                        distance = gap
+                    if gap <= threshold:
+                        break
+            info: dict[str, Any] = {
+                "status": "clue",
+                "page": page.url,
+                "host": host,
+                "links": links,
+                "handle": handle,
+                "name": tweet.name,
+                "post": tweet.url or str(link.get("url") or ""),
+                "distance": distance,
+            }
+            if distance is not None and distance <= threshold:
+                info["status"] = "hit"
+                self._vlog(
+                    "求助帖给出的出处核上了：@%s %s（距离 %s，%ss）",
+                    handle,
+                    info["post"],
+                    distance,
+                    int(time.time() - started),
+                )
+                return info
+            if clue is None:
+                try:
+                    profile = await self._profile(handle)
+                except Exception:  # noqa: BLE001 - 主页查不到不影响这条线索
+                    profile = None
+                info["name"] = str((profile or {}).get("name") or info.get("name") or "")
+                info["followers"] = int((profile or {}).get("followers") or 0)
+                clue = info
+        if clue:
+            self._vlog(
+                "求助帖给出的出处没能比指纹：@%s %s（距离 %s）",
+                clue.get("handle"),
+                clue.get("post"),
+                clue.get("distance"),
+            )
+            return clue
+        return {"status": "none", "page": page.url, "host": host, "links": links}
+
+    def _promote_help_post(self, best: Candidate | None, info: dict[str, Any]) -> Candidate | None:
+        """求助帖里给的出处与这张图指纹对上了：那条帖子才是结论。"""
+        post = str(info.get("post") or "")
+        handle = str(info.get("handle") or "").strip().lstrip("@")
+        if not post or not handle:
+            return best
+        distance = int(info.get("distance") or 0)
+        self._vlog("求助帖反查命中：@%s %s（距离 %s）", handle, post, distance)
+        return Candidate(
+            engine="help_post",
+            url=post,
+            platform="X (Twitter)",
+            handle="@" + handle,
+            name=str(info.get("name") or ""),
+            distance=distance,
+            status="match",
+            note=f"求助帖的回复里给出的出处：@{handle} 的这条帖子（距离 {distance}）",
+        )
+
     async def _hunt_repost_author(
         self, ordered: list[Candidate], best: Candidate | None, upload: bytes | None
     ) -> dict[str, Any] | None:
@@ -7824,6 +8160,25 @@ class ImageSearcherPlugin(MaiBotPlugin):
     # 时才问：那类站点的标题是搬运工自己写的，固定分隔符切不准是常态。
     _TITLE_NAMES_ROWS = 8
     _TITLE_NAMES_TIMEOUT = 8
+    # 名字来源的距离余量：只有「差不多就是这张图」的候选，标题里的名字才值得拿去
+    # 各平台搜。图集站的标题里总挂着个人名，可距离 20 开外时那根本是另一张图、
+    # 另一个人——fbd6 的 4khd 页面（d=21，那是「摇摇乐yoyo」2024 年的套图）与
+    # cf7d 的 x.com/tsuki_kakushi（d=31）都被当成了作者，微博、X、B 站三条腿
+    # 全去查了不相干的人。阈值取指纹阈值 + 这点余量：裁剪、重压、翻拍都还进得来。
+    _NAME_SOURCE_SLACK = 4
+
+    def _name_distance_limit(self) -> int:
+        """名字来源允许的最大指纹距离。"""
+        threshold = getattr(getattr(self.config, "plugin", None), "hash_threshold", 8)
+        return int(threshold or 8) + self._NAME_SOURCE_SLACK
+
+    def _name_source_page(self, item: Candidate) -> bool:
+        """这条候选配不配贡献「图里的人叫什么」。"""
+        if item.distance is None:
+            # 量不出距离的只有视觉挑中过的才算：SauceNAO 那些「相似度 44%」的
+            # 插画页跟这张图没关系，19ab 就从那儿抽出过 deviantart 的 girlmachine。
+            return item.status in {"match", "vision"}
+        return int(item.distance) <= self._name_distance_limit()
 
     @staticmethod
     def _name_key(text: str) -> str:
@@ -7849,7 +8204,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
         rows = [
             item
             for item in ordered[: self._TITLE_NAMES_ROWS]
-            if str(item.title or "").strip()
+            if str(item.title or "").strip() and self._name_source_page(item)
         ]
         if not rows:
             return []
@@ -7862,7 +8217,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
         # 只在命中页本身就是图集站/搬运站时问：正经帖子、X 原帖的标题不需要模型。
         if not any(
             is_repost_site(str(item.url or ""), str(item.platform or ""))
-            for item in ordered[:3]
+            for item in rows[:3]
         ):
             return []
         lines = [
@@ -7972,6 +8327,39 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 names.append(item)
         return names
 
+    def _with_watermark_names(
+        self, names: list[str], vision: dict[str, Any] | None
+    ) -> list[str]:
+        """把图上水印读出的名字并进「按名字找号」的名单，排在最前面。
+
+        水印是图上自己印的东西，比标题里那个作者名更接近「她自称什么」。可这条
+        以前只喂给微博（微博那条腿按昵称搜人），X 与其它平台完全看不到——
+        cf7d 的水印「咲鱼咔咔」微博认到了主页，X 那条腿却拿着标题里的
+        「Tsuki_月隐」去搜，同一个人两条线各查一半。
+
+        贴吧板块名（``@cosplay吧``）和站名不是人，不进名单：拆出来的「cosplay」
+        在 X 上真有个同名老号，拿去搜只会搜回不相干的人。
+        """
+        result = list(names or [])
+        if str((vision or {}).get("watermark_weak") or "").strip():
+            # 水印读歪了、撞上一个明显不像的号：那个名字不是她自称的东西，拿去
+            # 各平台搜只会搜回不相关的人（832b 顺着读错的 Stellach 搜出
+            # Instagram 上一个 giovanna_cosplay）。
+            return result
+        seen = {str(item or "").strip().lower() for item in result}
+        for raw in (
+            str((vision or {}).get("watermark_name") or ""),
+            str((vision or {}).get("watermark") or ""),
+        ):
+            extra = raw.strip().lstrip("@＠").strip()
+            if not extra or len(extra) < 2 or extra.lower() in seen:
+                continue
+            if handles.is_board_name(extra) or handles.is_stop_word(extra):
+                continue
+            result.insert(0, extra)
+            seen.add(extra.lower())
+        return result
+
     def _title_name_candidates(
         self,
         ordered: list[Candidate],
@@ -8021,7 +8409,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
             实测 `s-20261123-0034-19ab`（跟 c077 同一套图）：「小仓千代w」就在标题
             里，结果一个名字都没抽出来，微博那条腿白跑。
             """
-            text = str(value or "").strip()
+            text = x_title_name(str(value or "")).strip()
             text = re.split(r"[：:]", text, maxsplit=1)[0].strip()
             text = re.sub(
                 r"^(?:coser|model|photographer)\s*@?\s*", "", text, flags=re.I
@@ -8084,7 +8472,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
             # 没关系，它们只有标题、没有距离：19ab 那单就从一条 deviantart 候选里
             # 抽出「girlmachine」，白花一次检索额度，还翻了一个不相干的号 19 条帖
             # （同一条口径见 `_hunt_x_handle`：没量过距离的标题不算数）。
-            if item.distance is None and item.status not in {"match", "vision"}:
+            if not self._name_source_page(item):
                 continue
             # pixiv 作品页的标题是作品名，不是人名（作者写在页面里、由出处那行给出）。
             # 9b22 就是从这里把「永恒的新生(1)」当成人名拿去各平台搜的。
@@ -8893,6 +9281,10 @@ class ImageSearcherPlugin(MaiBotPlugin):
         for item in (vision_info or {}).get("watermark_readings") or []:
             if not isinstance(item, dict):
                 continue
+            if str(item.get("weak") or "").strip():
+                # 读歪撞上的同名号（号是私人号、粉丝个位数那种）：它的名字拿去纠
+                # 署名写法只会把错的名字钉死。
+                continue
             handle = str(item.get("handle") or "").strip().lstrip("@")
             if not handle or handle.lower() in seen:
                 continue
@@ -9336,6 +9728,8 @@ class ImageSearcherPlugin(MaiBotPlugin):
         if not (2 <= len(text) <= 24):
             return False
         if is_site_name(text, urls):
+            return False
+        if _SITE_BOILERPLATE_NAME_RE.match(text):
             return False
         if handles.has_cjk(text):
             return True
@@ -9897,7 +10291,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
         upload: bytes | None = None,
         trace: list[dict] | None = None,
     ) -> tuple[dict[str, Any] | None, Candidate | None]:
-        """从搬运站的图床文件名里读 pixiv 作品号，回流 pixiv 核对，能比指纹就比。
+        """从搬运站的图床文件名或作品页地址里读 pixiv 作品号，回流 pixiv 核对，能比指纹就比。
 
         `cdfa` 那单：用户把 pixiv 上的图存下来又发进群，图片地址是
         `cdn.honkaihaven.com/art/…/沒有名字-by-lol-…-152342429.webp`——文件名里
@@ -9916,34 +10310,43 @@ class ImageSearcherPlugin(MaiBotPlugin):
         if not candidates:
             return None, None
         seen: list[str] = []
-        hints: list[tuple[str, str]] = []
+        hints: list[tuple[str, str, str, str]] = []
         for item in candidates:
-            for url in (item.image_url, item.fallback_image, item.url):
-                illust_id, filename = pixiv_filename_hint(str(url or ""))
+            title = str(item.title or "")
+            for url in (item.url, item.image_url, item.fallback_image):
+                text = str(url or "")
+                illust_id, filename = pixiv_filename_hint(text)
+                if not illust_id:
+                    # 作品页地址里的号：镜像站（kurocore 这类）把 pixiv 作品按
+                    # `/illust/<id>` 原样重发，b08b 那单就是从这里读到的。
+                    illust_id = pixiv_url_hint(text)
                 if not illust_id or illust_id in seen:
                     continue
                 seen.append(illust_id)
-                hints.append((illust_id, filename))
+                hints.append((illust_id, filename, title, text))
             if len(hints) >= 3:
                 break
         if not hints:
-            self._trace(trace, "pixiv 出处", "skip", "候选图地址里没有 pixiv 作品号")
+            self._trace(trace, "pixiv 出处", "skip", "候选图地址与作品页里都没有 pixiv 作品号")
             return None, None
-        for illust_id, filename in hints:
+        for illust_id, filename, title, source_url in hints:
             body = await self._pixiv_illust(illust_id)
             if not body:
-                self._vlog("pixiv 作品号 %s 查不到（文件名 %s）", illust_id, filename[:60])
+                self._vlog("pixiv 作品号 %s 查不到（来源 %s）", illust_id, (filename or source_url)[:60])
                 continue
             user_name = str(body.get("userName") or "").strip()
-            flat_name = handles.fold(filename).lower()
+            # 作者名比对的两处依据：图床文件名，或候选自己的标题。镜像站的标题
+            # 通常写成「作品名 | 作者名」（kurocore 的「エルフ | Yuukiyuki（優希ユキ）」），
+            # 文件名里没有作者时靠它。
+            flat_name = handles.fold("\n".join(part for part in (filename, title) if part)).lower()
             flat_user = handles.fold(user_name).lower()
             matched = bool(flat_user) and len(flat_user) >= 2 and flat_user in flat_name
             if not matched:
                 self._vlog(
-                    "pixiv %s 的作者是「%s」，文件名里没有这个名字，不采信：%s",
+                    "pixiv %s 的作者是「%s」，文件名与标题里都没有这个名字，不采信：%s",
                     illust_id,
                     user_name,
-                    filename[:60],
+                    (filename or title)[:60],
                 )
                 continue
             artwork_id = str(body.get("illustId") or illust_id)
@@ -9956,22 +10359,23 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 "create_date": str(body.get("createDate") or ""),
                 "page_count": int(body.get("pageCount") or 0),
                 "url": pixiv_artwork_url(artwork_id),
-                "read_from": filename,
+                "read_from": filename or source_url.split("://")[-1].split("/")[0],
                 "author_matched": True,
             }
             hit = await self._pixiv_mirror_match(artwork_id, upload, info)
             self._vlog(
-                "从文件名读到 pixiv 作品：%s《%s》by %s（指纹距离 %s）",
+                "读到 pixiv 作品：%s《%s》by %s（来源 %s，指纹距离 %s）",
                 artwork_id,
                 info["title"][:40],
                 user_name,
+                info["read_from"],
                 info.get("distance"),
             )
             self._trace(
                 trace,
                 "pixiv 出处",
                 "hit",
-                "文件名里的作品号对上了 pixiv：%s《%s》by %s，指纹距离 %s"
+                "候选里的作品号对上了 pixiv：%s《%s》by %s，指纹距离 %s"
                 % (artwork_id, info["title"][:30], user_name, info.get("distance") if info.get("distance") is not None else "没比成"),
             )
             return info, hit
@@ -10848,6 +11252,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 items,
                 command=COMMAND,
                 nickname=section.nickname,
+                header_name=section.nickname or COMMAND,
                 ttl_minutes=section.task_ttl_minutes,
                 user_id=self._self_id or "0",
                 part=(index, total),
@@ -10925,6 +11330,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
                     show_reference=section.show_reference,
                     limit=limit,
                     nickname=section.nickname,
+                    header_name=section.nickname or COMMAND,
                     ttl_minutes=section.task_ttl_minutes,
                     replay=replay,
                     user_id=self._self_id or "0",
@@ -10940,6 +11346,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 show_reference=section.show_reference,
                 limit=limit,
                 nickname=section.nickname,
+                header_name=section.nickname or COMMAND,
                 ttl_minutes=section.task_ttl_minutes,
                 replay=replay,
                 user_id=self._self_id or "0",
@@ -11006,18 +11413,19 @@ class ImageSearcherPlugin(MaiBotPlugin):
             if not _send_ok(fallback):
                 self.ctx.logger.warning("转发退路也失败：task=%s 文本长度=%s", task.task_id, len(text))
 
-    async def _send_first_reply(self, task: SearchTask, where: str) -> None:
-        """首次结果：一条普通图文消息，文字结论在前，最多跟三张关键图。
+    async def _send_first_reply(self, task: SearchTask, where: str, *, reason: str = "首次") -> None:
+        """一条普通图文消息：文字结论在前，最多跟三张关键图。
 
-        只在 `plain_first_reply` 打开时走这里。合并转发卡片偶发拿不到新的 real_seq
-        （QQ 把它挂到上一条消息上），客户端按 seq 去重就整条不画，而插件这边只能拿到
-        一个 bool，既预知不了也补救不了。普通消息不受这个影响，代价是群里多占一行；
-        全部候选仍在「更多」里。
+        两个调用点：`plain_first_reply` 打开时的首次结果，和用户发「直发」时的重发。
+        合并转发卡片偶发拿不到新的 real_seq（QQ 把它挂到上一条消息上），客户端按 seq
+        去重就整条不画，而插件这边只能拿到一个 bool，既预知不了也补救不了。普通消息
+        不受这个影响，代价是群里多占一行；全部候选仍在「更多」里。
         """
         section = self.config.plugin
         text, images = formatting.build_first_reply(
             task,
             command=COMMAND,
+            header_name=section.nickname or COMMAND,
             ttl_minutes=section.task_ttl_minutes,
             max_images=self._MAX_FIRST_IMAGES,
         )
@@ -11028,13 +11436,14 @@ class ImageSearcherPlugin(MaiBotPlugin):
             try:
                 sent = await self.ctx.send.hybrid(segments, where)
             except Exception as error:  # noqa: BLE001 - 图文失败就退回纯文字
-                self.ctx.logger.warning("首次结果图文发送失败，改用纯文字：%s", error)
+                self.ctx.logger.warning("单条图文发送失败，改用纯文字：%s", error)
                 sent = None
         if not _send_ok(sent):
             sent = await self.ctx.send.text(text, where)
         self._vlog(
-            "首次结果已发送：task=%s 发往=%s 图=%s 文字=%s字 返回类型=%s 成功=%s",
+            "单条图文已发送：task=%s 场景=%s 发往=%s 图=%s 文字=%s字 返回类型=%s 成功=%s",
             task.task_id,
+            reason,
             where,
             len(images),
             len(text),
@@ -11042,7 +11451,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
             _send_ok(sent),
         )
         if not _send_ok(sent):
-            self.ctx.logger.warning("首次结果发送失败：task=%s", task.task_id)
+            self.ctx.logger.warning("单条图文发送失败：task=%s", task.task_id)
 
     # -- 等图 -------------------------------------------------------------
 
@@ -11320,6 +11729,21 @@ class ImageSearcherPlugin(MaiBotPlugin):
             parts = arg.split(maxsplit=1)
             wanted = parts[1].strip() if len(parts) > 1 else ""
             return await self._replay_task(current, user_id, wanted)
+
+        if head.lower() in {"帮助", "help", "?", "？"}:
+            # 纯文字，写完就发；这一支必须排在取图之前，否则没带图会掉进等待补图。
+            await self.ctx.send.text(
+                formatting.build_help(COMMAND, ttl_minutes=self.config.plugin.task_ttl_minutes),
+                current,
+            )
+            return True, "帮助已发送", 2
+
+        if head in {"直发", "单条", "文字"}:
+            # 卡片偶发不渲染时的手动退路：把这次结果换成一条普通图文消息重发。
+            # 跟「更多」一样支持带任务编号，群里同时有好几单时靠编号定位。
+            parts = arg.split(maxsplit=1)
+            wanted = parts[1].strip() if len(parts) > 1 else ""
+            return await self._plain_task(current, user_id, wanted)
 
         if arg in {"状态", "status"}:
             if self._tasks is not None:

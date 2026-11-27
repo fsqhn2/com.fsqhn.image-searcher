@@ -107,6 +107,12 @@ class SearchOutcome:
     # seen 只说明这些账号写在候选里，没核到这张图，一律只当线索。
     # TikTok / Instagram 没有可用的公开封面，只能当账号线索。
     other_accounts: dict | None = None
+    # 候选落在「求图 / 问答」帖上时对页面正文与回复的读取：
+    # {"status": "hit"/"clue"/"none"/"unreadable", "page": "…", "host": "whos.tv",
+    #  "links": [{kind, url, handle, id}], "handle": "Ahab_Channel",
+    #  "name": "亚哈Ahab", "post": "https://x.com/…/status/…", "distance": 0}。
+    # hit 时结论已经换成帖子；clue 只说明「帖子里给的出处是这条」，仍要自己核对。
+    help_post: dict | None = None
     # 这次「怎么找的」：每一步的触发与结果，只在「更多」里展示。
     # 形如 [{"step": "读水印", "state": "ran"|"skip"|"hit", "note": "…"}]。
     # 用户 2026-11-20 的要求：十几距离那批不额外开反查，但得让人看得出这次读了
@@ -148,6 +154,7 @@ class SearchOutcome:
             "gallery_sources": self.gallery_sources or [],
             "search_page": self.search_page,
             "other_accounts": self.other_accounts,
+            "help_post": self.help_post,
             "trace": self.trace or [],
         }
 
@@ -184,6 +191,7 @@ class SearchOutcome:
             gallery_sources=summary.get("gallery_sources") or [],
             search_page=summary.get("search_page"),
             other_accounts=summary.get("other_accounts"),
+            help_post=summary.get("help_post"),
             trace=summary.get("trace") or [],
         )
 

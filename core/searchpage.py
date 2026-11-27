@@ -23,6 +23,8 @@ import re
 from typing import Any, Iterable
 from urllib.parse import parse_qs, unquote, urlparse
 
+from .hosts import is_host
+
 # 平台搜索页：域名 → 允许的路径。只认「搜索结果列表」这一种，别的页面不算。
 # 加平台时在这里加一条，并且只在 `core/` 里补对应的检索层，不要动主干。
 _SEARCH_PAGES: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
@@ -92,7 +94,7 @@ def search_page_query(url: str = "", title: str = "") -> tuple[str, str] | None:
     path = (parsed.path or "/").rstrip("/").lower()
     query = parse_qs(parsed.query or "")
     for platform, hosts, paths in _SEARCH_PAGES:
-        if not any(host == item or host.endswith("." + item) for item in hosts):
+        if not is_host(host, hosts):
             continue
         if path not in paths:
             return None

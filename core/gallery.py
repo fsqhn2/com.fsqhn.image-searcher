@@ -15,6 +15,8 @@ from __future__ import annotations
 import re
 from urllib.parse import urljoin, urlparse
 
+from .hosts import host_of, is_host, matched_token
+
 # 实测见过的图集 / 搬运站。只收确认过的：误标一个正经站点比漏标更糟。
 GALLERY_HOSTS = (
     "4play.to",
@@ -182,6 +184,8 @@ MIN_HITS = 3
 # 这类站点抓不到内容时，能给的最有用的一句是「去翻回复」——b62e／ecaa 两单就是
 # 用户自己在 NGA 的回帖里找到 pixiv 原图的，而 NGA 对未登录访客直接返回
 # 「访客不能直接访问」（read.php 403，app_api 要 access_token），插件读不了。
+# 这份是「答案常写在回复里」的站；`extract._FORUM_HOSTS` 是另一回事（标题不能当
+# 人名），别合并。
 FORUM_HOSTS = (
     "bbs.nga.cn",
     "ngabbs.com",
@@ -193,78 +197,146 @@ FORUM_HOSTS = (
 )
 
 
-def is_forum_site(url: str = "", platform: str = "") -> bool:
-    """这个落点是不是论坛讨论帖（答案常在回复里，页面抓不到就得点开看）。"""
-    hosts: list[str] = []
-    host = (url or "").split("://", 1)[-1].split("/", 1)[0].rsplit("@", 1)[-1].split(":")[0]
-    if host:
-        hosts.append(host.strip().lower())
-    if platform:
-        hosts.append(str(platform).strip().lower())
-    for item in hosts:
-        item = item.removeprefix("www.")
-        if item and any(item == token or item.endswith("." + token) for token in FORUM_HOSTS):
+def _hits(url: str = "", platform: str = "", tokens: tuple[str, ...] = ()) -> bool:
+    """链接或平台名有没有落在名单里。
+
+    五个 ``is_*_site()`` 原来是同一段「取域名、补平台字段、剥 www、逐项比」各抄
+    一遍；合并成一处，名单仍留在各自函数上面。
+    """
+    for value in (host_of(url), str(platform or "")):
+        if is_host(value, tokens):
             return True
     return False
+
+
+def is_forum_site(url: str = "", platform: str = "") -> bool:
+    """这个落点是不是论坛讨论帖（答案常在回复里，页面抓不到就得点开看）。"""
+    return _hits(url, platform, FORUM_HOSTS)
+
+
+
+# 求图 / 问答站：页面本身是一问一答，最佳答案里常常直接贴出处。跟 NGA 那种
+# 未登录 403 的不一样，这类站公开可读——826c 那单的 whos.tv 求助帖，最佳答案
+# 写着「原图在这儿 https://x.com/Ahab_Channel/status/…」，我们却只把它当成
+# 「不是作者主页」降级收工。抓下来就能把答案读出来。
+HELP_HOSTS = ("whos.tv",)
+_HELP_PATH_RE = re.compile(r"/(?:helps?|asks?|questions?)/[A-Za-z0-9_-]{2,}", re.I)
+
+
+def is_help_page(url: str = "", platform: str = "") -> bool:
+    """这个落点是不是「求图 / 问答」帖；正文与回复里可能写着出处。"""
+    urls = [url or ""]
+    if platform and "://" not in platform:
+        urls.append("https://" + platform)
+    for item in urls:
+        if is_host(item, HELP_HOSTS):
+            return True
+    return bool(_HELP_PATH_RE.search(url or ""))
+
+
+# 能从页面里读到的「出处」只有两种是硬证据：X 的帖子（能取图比指纹）与
+# pixiv 作品（能回核标题与作者）。页面上的 X 账号链接不认——求助站自己的官号
+# 也长那样，把它当作者等于凭空造一条线索。
+_SOURCE_LINK_RES = (
+    (
+        "x_post",
+        re.compile(
+            r"^https?://(?:www\.|mobile\.)?(?:x|twitter)\.com/"
+            r"(?P<handle>[A-Za-z0-9_]{2,20})/status(?:es)?/(?P<id>\d{5,25})",
+            re.I,
+        ),
+    ),
+    (
+        "pixiv_artwork",
+        re.compile(
+            r"^https?://(?:www\.)?pixiv\.net/(?:en/)?(?:artworks/(?P<id1>\d{5,12})"
+            r"|member_illust\.php\?(?:[^#]*&)?illust_id=(?P<id2>\d{5,12}))",
+            re.I,
+        ),
+    ),
+    ("pixiv_reverse", re.compile(r"^https?://pixiv\.re/(?P<id>\d{5,12})", re.I)),
+)
+# 页面里的分享/引用按钮也会长成 x.com 链接，但不是答案。
+_SOURCE_LINK_DENY = ("/intent/", "/share", "/home", "/hashtag/", "/search", "/i/web")
+
+
+def source_link(url: str = "") -> dict[str, str] | None:
+    """把页面里的一条链接认成可核对的出处；不是出处返回 None。"""
+    text = (url or "").strip().rstrip(".,;:)]}>）】」'\"")
+    if not text or any(token in text.lower() for token in _SOURCE_LINK_DENY):
+        return None
+    for kind, pattern in _SOURCE_LINK_RES:
+        found = pattern.match(text)
+        if not found:
+            continue
+        if kind == "x_post":
+            return {
+                "kind": "x_post",
+                "url": f"https://x.com/{found.group('handle')}/status/{found.group('id')}",
+                "handle": found.group("handle"),
+                "id": found.group("id"),
+            }
+        if kind == "pixiv_artwork":
+            artwork = found.group("id1") or found.group("id2") or ""
+            return {
+                "kind": "pixiv_artwork",
+                "url": f"https://www.pixiv.net/artworks/{artwork}",
+                "id": artwork,
+            }
+        artwork = found.group("id") or ""
+        return {
+            "kind": "pixiv_artwork",
+            "url": f"https://www.pixiv.net/artworks/{artwork}",
+            "id": artwork,
+        }
+    return None
+
+
+def social_links_from_html(html: str = "", page_url: str = "") -> list[dict[str, str]]:
+    """从求助帖/讨论页里抽出「能拿去核对」的出处链接，按出现顺序去重。
+
+    只认 X 帖子与 pixiv 作品：这两种能取图比指纹。页面上那堆账号链接（含站点
+    自己的官号、分享按钮）一律不收，免得把求助站的运营号当成作者。
+    """
+    text = html or ""
+    found: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"https?://[^\s\"'<>\\]+", text):
+        item = source_link(match.group(0))
+        if not item or item["url"] in seen:
+            continue
+        seen.add(item["url"])
+        found.append(item)
+        if len(found) >= 4:
+            break
+    return found
 
 
 def is_gallery_site(url: str = "", platform: str = "") -> bool:
     """这个落点是不是图集 / 搬运站。按域名后缀精确匹配。"""
-    hosts: list[str] = []
-    host = (url or "").split("://", 1)[-1].split("/", 1)[0].rsplit("@", 1)[-1].split(":")[0]
-    if host:
-        hosts.append(host.strip().lower())
-    if platform:
-        hosts.append(str(platform).strip().lower())
-    for item in hosts:
-        item = item.removeprefix("www.")
-        if item and any(item == token or item.endswith("." + token) for token in GALLERY_HOSTS):
-            return True
-    return False
+    return _hits(url, platform, GALLERY_HOSTS)
 
 
 def is_repost_site(url: str = "", platform: str = "") -> bool:
     """这个落点是不是搬运 / 社区站：图集站也算，它们同样不是作者主页。"""
     if is_gallery_site(url, platform):
         return True
-    hosts: list[str] = []
-    host = (url or "").split("://", 1)[-1].split("/", 1)[0].rsplit("@", 1)[-1].split(":")[0]
-    if host:
-        hosts.append(host.strip().lower())
-    if platform:
-        hosts.append(str(platform).strip().lower())
-    for item in hosts:
-        item = item.removeprefix("www.")
-        if item and any(item == token or item.endswith("." + token) for token in REPOST_HOSTS):
-            return True
-    return False
+    return _hits(url, platform, REPOST_HOSTS)
 
 
 def is_content_site(url: str = "", platform: str = "") -> bool:
     """这个落点是不是百度动态 / 百家号这类内容号落地页。"""
-    hosts: list[str] = []
-    host = (url or "").split("://", 1)[-1].split("/", 1)[0].rsplit("@", 1)[-1].split(":")[0]
-    if host:
-        hosts.append(host.strip().lower())
-    if platform:
-        hosts.append(str(platform).strip().lower())
-    for item in hosts:
-        item = item.removeprefix("www.")
-        if item and any(item == token or item.endswith("." + token) for token in CONTENT_HOSTS):
-            return True
-    return False
+    return _hits(url, platform, CONTENT_HOSTS)
 
 
 def is_shop_site(url: str = "", platform: str = "") -> bool:
     """这条候选是不是电商／商品页（同款商品，不是作者发的图）。"""
     raw = str(url or "").strip()
-    host = raw.split("://", 1)[-1].split("/", 1)[0].rsplit("@", 1)[-1].split(":")[0]
-    hosts = [item for item in (host.strip().lower().removeprefix("www."), str(platform or "").strip().lower()) if item]
-    for item in hosts:
-        if any(item == token or item.endswith("." + token) for token in SHOP_HOSTS):
-            return True
+    names = [item for item in (host_of(raw), str(platform or "").strip().lower()) if item]
+    if _hits(raw, platform, SHOP_HOSTS):
+        return True
     # 模板路径只在域名也像商店时才认：`/products/` 是电商模板，但单看路径会误伤。
-    if raw and _SHOP_PATH.search(raw) and any(_SHOP_HOSTWORD.search(item) for item in hosts):
+    if raw and _SHOP_PATH.search(raw) and any(_SHOP_HOSTWORD.search(item) for item in names):
         return True
     return False
 
@@ -325,21 +397,7 @@ AUTHOR_PAGE_HOSTS = (
 
 def is_author_page_site(url: str = "", platform: str = "") -> bool:
     """这个落点值不值得再往「页面 → 发布者主页」翻一层。"""
-    for value in (_host_part(url), str(platform or "")):
-        item = value.strip().lower().removeprefix("www.")
-        if item and any(item == token or item.endswith("." + token) for token in AUTHOR_PAGE_HOSTS):
-            return True
-    return False
-
-
-def _host_part(url: str) -> str:
-    """从 URL 取域名，没 scheme 的字符串当域名处理。"""
-    value = str(url or "").strip()
-    if "://" in value:
-        host = value.split("://", 1)[-1].split("/", 1)[0]
-    else:
-        host = value.split("/", 1)[0]
-    return host.rsplit("@", 1)[-1].split(":")[0]
+    return _hits(url, platform, AUTHOR_PAGE_HOSTS)
 
 
 def author_page_url(html: str = "", page_url: str = "") -> str:

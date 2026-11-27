@@ -765,6 +765,185 @@ class PlainFirstReplySwitchTest(unittest.TestCase):
         self.assertEqual(calls[0][0], "forward")
 
 
+class HelpCommandTest(unittest.TestCase):
+    """「帮助」：纯文字回一段用法，不取图、不建任务。"""
+
+    def test_help_sends_plain_text(self) -> None:
+        import asyncio
+
+        module = import_plugin()
+        plugin = object.__new__(module.ImageSearcherPlugin)
+        sent: list[str] = []
+
+        class Sender:
+            async def text(self, text, where, **kwargs):
+                sent.append(text)
+                return True
+
+        plugin._ctx = types.SimpleNamespace(logger=logging.getLogger("test"), send=Sender())
+        config = mock.Mock()
+        config.plugin.task_ttl_minutes = 1440
+
+        async def boom(self, kwargs):
+            raise AssertionError("帮助不该走到取图")
+
+        kwargs = {
+            "message": {"session_id": "g1", "message_info": {"user_info": {"user_id": "u1"}}},
+            "matched_groups": {"arg": "帮助"},
+        }
+        with (
+            mock.patch.object(module.ImageSearcherPlugin, "_vlog", lambda *a, **k: None),
+            mock.patch.object(module.ImageSearcherPlugin, "_resolve_image", boom),
+            mock.patch.object(
+                module.ImageSearcherPlugin,
+                "config",
+                new_callable=mock.PropertyMock,
+                return_value=config,
+            ),
+        ):
+            result = asyncio.run(plugin._handle_command("g1", kwargs))
+
+        self.assertTrue(result[0])
+        self.assertEqual(len(sent), 1)
+        self.assertIn("怎么用", sent[0])
+        self.assertIn("直发", sent[0])
+        self.assertIn("1 天", sent[0])
+
+
+class PlainResendCommandTest(unittest.TestCase):
+    """「直发」指令：卡片没被客户端画出来时，把同一份结果换成一条普通图文消息重发。
+
+    用户 11-27 定的方案：首次结果维持纯卡片，另外给一条手动退路。所以这条指令
+    不能走合并转发，也不能因为指令里没带图就掉进「等待补图」。
+    """
+
+    def _plugin(self, tasks_map: dict, latest=None):
+        module = import_plugin()
+        plugin = object.__new__(module.ImageSearcherPlugin)
+        plugin._self_id = ""
+        plugin._tasks = tasks_map
+        calls: list[tuple[str, str]] = []
+
+        class Sender:
+            async def hybrid(self, segments, where):
+                calls.append(("hybrid", where))
+                return True
+
+            async def text(self, text, where, **kwargs):
+                calls.append(("text", where))
+                return True
+
+            async def forward(self, nodes, where):
+                calls.append(("forward", where))
+                return True
+
+        plugin._ctx = types.SimpleNamespace(logger=logging.getLogger("test"), send=Sender())
+        plugin._latest_task = lambda stream_id, user_id: latest
+        config = mock.Mock()
+        config.plugin.task_ttl_minutes = 15
+        config.plugin.nickname = "麦麦寻人"
+        config.plugin.show_reference = True
+        config.plugin.deep_scan = False
+        config.plugin.more_limit = 5
+        config.plugin.deep_more_limit = 8
+        return module, plugin, config, calls
+
+    def _task(self):
+        from core.tasks import SearchOutcome, SearchTask
+
+        return SearchTask(
+            task_id="s-test",
+            stream_id="g1",
+            user_id="u1",
+            status="done",
+            outcome=SearchOutcome(status="ok", image_b64="IMG"),
+        )
+
+    def _run(self, plugin, module, config, wanted: str, stream_id: str = "g1", user_id: str = "u1"):
+        import asyncio
+
+        async def noop_image(self, task) -> None:
+            return None
+
+        async def noop_engine_images(self, task, *, limit, whole) -> None:
+            return None
+
+        with (
+            mock.patch.object(module.ImageSearcherPlugin, "_vlog", lambda *a, **k: None),
+            mock.patch.object(module.ImageSearcherPlugin, "_ensure_image", noop_image),
+            mock.patch.object(module.ImageSearcherPlugin, "_ensure_engine_images", noop_engine_images),
+            mock.patch.object(
+                module.ImageSearcherPlugin,
+                "config",
+                new_callable=mock.PropertyMock,
+                return_value=config,
+            ),
+        ):
+            return asyncio.run(plugin._plain_task(stream_id, user_id, wanted))
+
+    def test_resends_as_single_hybrid(self) -> None:
+        task = self._task()
+        module, plugin, config, calls = self._plugin({"s-test": task})
+        ok, _note, code = self._run(plugin, module, config, "s-test")
+        self.assertTrue(ok)
+        self.assertEqual(code, 2)
+        self.assertEqual(calls, [("hybrid", "g1")])
+
+    def test_falls_back_to_latest_without_id(self) -> None:
+        task = self._task()
+        module, plugin, config, calls = self._plugin({}, latest=task)
+        ok, _note, _code = self._run(plugin, module, config, "")
+        self.assertTrue(ok)
+        self.assertEqual(calls, [("hybrid", "g1")])
+
+    def test_silent_when_nothing_to_resend(self) -> None:
+        """裸「直发」没搜过就静静返回，跟「更多」一个脾气，别在群里蹦提示。"""
+        module, plugin, config, calls = self._plugin({}, latest=None)
+        ok, note, code = self._run(plugin, module, config, "")
+        self.assertFalse(ok)
+        self.assertEqual((note, code), ("", 0))
+        self.assertEqual(calls, [])
+
+    def test_expired_id_tells_user(self) -> None:
+        module, plugin, config, calls = self._plugin({})
+        ok, _note, _code = self._run(plugin, module, config, "s-gone")
+        self.assertTrue(ok)
+        self.assertEqual(calls[0][0], "text")
+
+    def test_command_head_routes_to_plain_resend(self) -> None:
+        """「直发」要在取图之前被拦住，不能掉进等待补图。"""
+        import asyncio
+
+        module, plugin, config, calls = self._plugin({})
+        seen: list[tuple[str, str, str]] = []
+
+        async def fake_plain(self, current, user_id, wanted):
+            seen.append((current, user_id, wanted))
+            return True, "已直发结果", 2
+
+        async def boom(self, kwargs):
+            raise AssertionError("不该走到取图")
+
+        kwargs = {
+            "message": {"session_id": "g1", "message_info": {"user_info": {"user_id": "u1"}}},
+            "matched_groups": {"arg": "直发 s-test"},
+        }
+        with (
+            mock.patch.object(module.ImageSearcherPlugin, "_vlog", lambda *a, **k: None),
+            mock.patch.object(module.ImageSearcherPlugin, "_plain_task", fake_plain),
+            mock.patch.object(module.ImageSearcherPlugin, "_resolve_image", boom),
+            mock.patch.object(
+                module.ImageSearcherPlugin,
+                "config",
+                new_callable=mock.PropertyMock,
+                return_value=config,
+            ),
+        ):
+            result = asyncio.run(plugin._handle_command("g1", kwargs))
+        self.assertTrue(result[0])
+        self.assertEqual(seen, [("g1", "u1", "s-test")])
+
+
 class WeiboLowFansHuntTest(unittest.TestCase):
     """微博昵称搜到的是小号（粉丝低于门槛）时，也得翻她的带图帖比指纹。
 

@@ -915,5 +915,58 @@ class WatermarkLocateTest(unittest.TestCase):
             vision.crop_data_url(b"not an image", (0.1, 0.1, 0.2, 0.2))
 
 
+def _faint_sample() -> bytes:
+    """白字压在奶白底上：整块只有十几个灰度级，正是 832b 那种「很花」的水印。"""
+    image = Image.new("RGB", (900, 900), (247, 243, 238))
+    draw = ImageDraw.Draw(image)
+    for index in range(90):
+        # 绒毛的慢变纹理：比字还淡，却遍布整块。
+        draw.line((0, index * 10, 900, index * 10 + 4), fill=(244, 240, 235))
+    draw.text((120, 700), "Stellach", fill=(252, 250, 248))
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+class FaintCropTest(unittest.TestCase):
+    """淡字的那张增强版：同一处文字、同一个框，只是把笔画从背景里拉出来。"""
+
+    def test_enhanced_crop_keeps_geometry(self) -> None:
+        raw = _faint_sample()
+        box = (0.0, 0.6, 1.0, 0.35)
+        url, pixels = vision.enhanced_crop_data_url(raw, box)
+        self.assertTrue(url.startswith("data:image/jpeg;base64,"))
+        plain, plain_pixels = vision.crop_data_url(raw, box)
+        # 增强只改灰度关系，不改几何：同一个像素框，两张图指的是同一处。
+        self.assertEqual(pixels, plain_pixels)
+
+    def test_enhanced_crop_lifts_contrast(self) -> None:
+        """白字压奶白底：原样裁出来几乎一片，增强版才有明显起伏。"""
+
+        def spread(url: str) -> int:
+            image = Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1])))
+            small = image.convert("L")
+            small.thumbnail((320, 320), Image.BOX)
+            low, high = small.getextrema()
+            return int(high) - int(low)
+
+        raw = _faint_sample()
+        box = (0.0, 0.6, 1.0, 0.35)
+        self.assertGreater(
+            spread(vision.enhanced_crop_data_url(raw, box)[0]),
+            spread(vision.crop_data_url(raw, box)[0]),
+        )
+
+    def test_prompt_says_which_one_is_enhanced(self) -> None:
+        plain = vision.build_watermark_prompt()
+        enhanced = vision.build_watermark_prompt(enhanced=True)
+        self.assertNotIn("增强版", plain)
+        self.assertIn("增强版", enhanced)
+
+    def test_enhanced_crop_rejects_bad_bytes(self) -> None:
+        with self.assertRaises(ValueError):
+            vision.enhanced_crop_data_url(b"not an image", (0.1, 0.1, 0.2, 0.2))
+
+
 if __name__ == "__main__":
     unittest.main()

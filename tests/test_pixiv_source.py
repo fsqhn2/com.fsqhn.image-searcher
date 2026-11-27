@@ -74,7 +74,7 @@ class PixivFilenameHintTest(unittest.TestCase):
 class TrackPixivSourceTest(unittest.TestCase):
     """`_track_pixiv_source`：作品号回 pixiv 核对，作者名对不上就不采信。"""
 
-    def _run(self, illust_body, urls=None, upload=None):
+    def _run(self, illust_body, urls=None, upload=None, pages=None):
         module, plugin = _plugin()
         trace: list[dict] = []
 
@@ -90,8 +90,12 @@ class TrackPixivSourceTest(unittest.TestCase):
         mirror.calls = []
 
         candidates = []
-        for url in urls if urls is not None else [IMAGE_URL]:
-            candidates.append(module.Candidate(engine="lens", url="https://honkaihaven.com/gallery/1129766/", image_url=url))
+        if pages is not None:
+            for page_url, image_url, title in pages:
+                candidates.append(module.Candidate(engine="lens", url=page_url, image_url=image_url, title=title))
+        else:
+            for url in urls if urls is not None else [IMAGE_URL]:
+                candidates.append(module.Candidate(engine="lens", url="https://honkaihaven.com/gallery/1129766/", image_url=url))
         with mock.patch.object(module.ImageSearcherPlugin, "_vlog", lambda *a, **k: None), mock.patch.object(
             module.ImageSearcherPlugin, "_pixiv_illust", illust
         ), mock.patch.object(module.ImageSearcherPlugin, "_pixiv_mirror_match", mirror):
@@ -142,6 +146,52 @@ class TrackPixivSourceTest(unittest.TestCase):
         urls = ["https://a.example/a-%d.webp" % number for number in (152342401, 152342402, 152342403, 152342404)]
         _info, _pick, _trace, calls = self._run({}, urls=urls)
         self.assertEqual(len(calls), 3)
+
+    def test_artwork_page_url_is_read_when_filename_has_no_id(self) -> None:
+        """b08b：kurocore 的 `/illust/<id>` 就是 pixiv 作品号，作者名只在候选标题里。
+
+        镜像站把 pixiv 作品原样重发，标题写成「作品名 | 作者名」；图床文件名是它
+        自己起的（`cover.jpg`），里面没有号也没有作者，只能靠作品页地址 + 标题。
+        """
+        body = {
+            "illustId": "145241123",
+            "illustTitle": "エルフ",
+            "userId": "118493430",
+            "userName": "Yuukiyuki（優希ユキ）",
+            "xRestrict": 1,
+            "createDate": "2025-05-03T00:00:00+00:00",
+            "pageCount": 6,
+        }
+        pages = [
+            (
+                "https://kurocore.com/illust/145241123",
+                "https://kurocore.com/img/cover.jpg",
+                "エルフ | Yuukiyuki（優希ユキ）",
+            )
+        ]
+        info, _pick, trace, calls = self._run(body, pages=pages)
+        self.assertEqual(calls, ["145241123"])
+        self.assertIsNotNone(info)
+        self.assertEqual(info["title"], "エルフ")
+        self.assertEqual(info["user_name"], "Yuukiyuki（優希ユキ）")
+        self.assertEqual(info["url"], "https://www.pixiv.net/artworks/145241123")
+        self.assertEqual(info["read_from"], "kurocore.com")
+        self.assertTrue(info["author_matched"])
+        self.assertEqual(trace[-1]["state"], "hit")
+
+    def test_artwork_page_with_other_author_is_rejected(self) -> None:
+        """作品页地址里的号撞上别人的作品（镜像站编错了号）→ 标题里没这个名字就不采信。"""
+        body = {"illustId": "145241123", "illustTitle": "无关作品", "userName": "someone_else", "userId": "1"}
+        pages = [
+            (
+                "https://kurocore.com/illust/145241123",
+                "https://kurocore.com/img/cover.jpg",
+                "エルフ | Yuukiyuki（優希ユキ）",
+            )
+        ]
+        info, _pick, trace, _calls = self._run(body, pages=pages)
+        self.assertIsNone(info)
+        self.assertEqual(trace[-1]["state"], "none")
 
 
 class PixivMirrorMatchTest(unittest.TestCase):

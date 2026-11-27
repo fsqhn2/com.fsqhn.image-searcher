@@ -199,6 +199,53 @@ def build_profile_url(handle: str) -> str:
     return f"{API_BASE}/2/profile/{user}"
 
 
+def build_stats_url(handle: str) -> str:
+    """老版 ``/<号>`` 端点：能一次带回粉丝数、是否私人号、注册时间。
+
+    ``/2/profile`` 只给 id/昵称/状态，判断「这个号像不像图上那个人」需要画像，
+    所以只在水印号需要多核一道时才补这一次请求。
+    """
+    user = (handle or "").strip().lstrip("@")
+    if not user or not _HANDLE.match(user):
+        return ""
+    return f"{API_BASE}/{user}"
+
+
+@dataclass
+class Stats:
+    """账号画像：只取判断「像不像这个人」用得上的几项。"""
+
+    ok: bool = False
+    handle: str = ""
+    name: str = ""
+    followers: int = -1
+    protected: bool = False
+    joined: str = ""
+    description: str = ""
+
+
+def parse_stats(payload: dict | None) -> Stats:
+    """解析老版端点返回的 ``user``。拿不到就返回 ``ok=False``，调用方不据此下判断。"""
+    if not isinstance(payload, dict):
+        return Stats()
+    user = payload.get("user")
+    if not isinstance(user, dict):
+        return Stats()
+    handle = str(user.get("screen_name") or "")
+    if not handle:
+        return Stats()
+    followers = user.get("followers")
+    return Stats(
+        ok=True,
+        handle=handle,
+        name=str(user.get("name") or ""),
+        followers=int(followers) if isinstance(followers, (int, float)) else -1,
+        protected=bool(user.get("protected")),
+        joined=str(user.get("joined") or ""),
+        description=str(user.get("description") or ""),
+    )
+
+
 def parse_profile(payload: dict | None) -> str:
     """把 ``/2/profile/<号>`` 的返回归成四种状态。
 

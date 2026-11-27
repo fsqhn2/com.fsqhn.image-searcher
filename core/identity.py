@@ -722,11 +722,17 @@ def profiles_from_search(payload: Any, limit: int = 6) -> list[dict[str, str]]:
                 if handle.lower().endswith(".php"):
                     continue
                 seen.add(key)
+                url = link or f"https://{platform.lower()}.com/{handle}"
+                if platform == "X":
+                    # 检索结果的 link 可能是引用它的别的页面：b08b 那条 danbooru
+                    # 画师页的摘要里带着 x.com/xxx，被当成了「X 主页」。X 的主页
+                    # 只能按 handle 拼，别把引用页挂在 X 名下。
+                    url = f"https://x.com/{handle}"
                 found.append(
                     {
                         "platform": platform,
                         "handle": handle,
-                        "url": link or f"https://{platform.lower()}.com/{handle}",
+                        "url": url,
                     }
                 )
                 if len(found) >= max(1, limit):

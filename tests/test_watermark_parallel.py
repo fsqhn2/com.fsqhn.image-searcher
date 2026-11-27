@@ -69,7 +69,17 @@ def _reading(label: str, post: str = "") -> dict:
 def _install_reads(plugin, behavior, calls=None):
     """把 `_reread_one` 换成一个不碰网络的假读：behavior(label) 决定读到了什么。"""
 
-    async def fake(info, readings, known, source, *, data_url="", label="", verify=None):
+    async def fake(
+        info,
+        readings,
+        known,
+        source,
+        *,
+        data_url="",
+        label="",
+        verify=None,
+        extra_data_url="",
+    ):
         if calls is not None:
             calls.append(label)
         await asyncio.sleep(0)
@@ -113,7 +123,17 @@ class WatermarkParallelTest(unittest.TestCase):
         peak = 0
         all_started = asyncio.Event()
 
-        async def fake(info, readings, known, source, *, data_url="", label="", verify=None):
+        async def fake(
+            info,
+            readings,
+            known,
+            source,
+            *,
+            data_url="",
+            label="",
+            verify=None,
+            extra_data_url="",
+        ):
             nonlocal started, peak
             started += 1
             peak = max(peak, started)

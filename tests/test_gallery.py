@@ -102,6 +102,44 @@ class GallerySiteTest(unittest.TestCase):
         self.assertFalse(gallery.is_forum_site("https://x.com/someone/status/1"))
         self.assertFalse(gallery.is_forum_site("https://honkaihaven.com/gallery/1/"))
 
+    def test_help_pages_are_recognized(self) -> None:
+        """whos.tv 这类求图站公开可读，正文里直接写着出处（826c）。"""
+        self.assertTrue(gallery.is_help_page("https://whos.tv/en/helps/18619"))
+        self.assertTrue(gallery.is_help_page("https://example.com/questions/123"))
+        self.assertFalse(gallery.is_help_page("https://x.com/someone/status/1"))
+        self.assertFalse(gallery.is_help_page("https://honkaihaven.com/gallery/1/"))
+
+    def test_source_link_keeps_only_verifiable_links(self) -> None:
+        """只有 X 帖和 pixiv 作品能拿去核对，分享按钮与账号页都不收。"""
+        post = gallery.source_link("https://x.com/Ahab_Channel/status/1766582341927891150?s=20")
+        self.assertEqual(post["kind"], "x_post")
+        self.assertEqual(post["handle"], "Ahab_Channel")
+        self.assertEqual(post["id"], "1766582341927891150")
+        artwork = gallery.source_link("https://www.pixiv.net/artworks/152342429")
+        self.assertEqual(artwork["kind"], "pixiv_artwork")
+        self.assertEqual(artwork["id"], "152342429")
+        self.assertEqual(
+            gallery.source_link("https://www.pixiv.net/member_illust.php?mode=medium&illust_id=106409163")["id"],
+            "106409163",
+        )
+        # 分享按钮、站点官号、普通账号页都不是答案
+        self.assertIsNone(gallery.source_link("https://x.com/intent/tweet?url=http%3A%2F%2Fwhos.tv"))
+        self.assertIsNone(gallery.source_link("https://x.com/whos__tv"))
+        self.assertIsNone(gallery.source_link("https://x.com/i/web/status/1766582341927891150"))
+
+    def test_social_links_from_html(self) -> None:
+        """页面里同一条链接出现两遍只留一条，按出现顺序，最多四条。"""
+        html = (
+            '<a href="https://x.com/intent/tweet?url=x">share</a>'
+            '<p>原图在这儿 https://x.com/Ahab_Channel/status/1766582341927891150。</p>'
+            '<a href="https://x.com/Ahab_Channel/status/1766582341927891150">again</a>'
+            '<p>https://www.pixiv.net/artworks/152342429</p>'
+            '<p>https://x.com/whos__tv</p>'
+        )
+        links = gallery.social_links_from_html(html, "https://whos.tv/en/helps/18619")
+        self.assertEqual([item["kind"] for item in links], ["x_post", "pixiv_artwork"])
+        self.assertEqual(links[0]["url"], "https://x.com/Ahab_Channel/status/1766582341927891150")
+
     def test_suffix_lookalikes_do_not_match(self):
         """域名得按后缀精确匹配，否则仿站会被当成已知站点。"""
         self.assertFalse(gallery.is_gallery_site("https://not4play.to/x"))

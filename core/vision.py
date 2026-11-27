@@ -17,7 +17,7 @@ import re
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 from .extract import is_repost_page, is_social_platform
 
@@ -121,15 +121,24 @@ TILE_OVERLAP = 0.12
 TILE_MAX_SIDE = 1500
 TILE_MAX_UPSCALE = 2.5
 
+# 送第二张「增强版」时补一句。白字压在同色背景上（832b 的白色连笔字压奶白地毯），
+# 原样那张字和背景只差十几个灰度级，模型抄不出来；背景差分后的那张笔画会浮出来，
+# 代价是背景绒毛的纹理会变粗，所以让模型以「读得清的那张」为准。
+ENHANCED_NOTE = """第二张是同一处文字做了背景差分的增强版：淡字会浮出来，但背景纹理会变粗。
+两张指的是同一处，以你读得清的那张为准；都认不全就留空，不要猜。"""
+
 _ROW_NAMES = ("上", "中", "下")
 _COL_NAMES = ("左", "右")
 
 
-def build_watermark_prompt(*, label: str = "") -> str:
+def build_watermark_prompt(*, label: str = "", enhanced: bool = False) -> str:
     """读水印的 prompt。``label`` 非空表示这是分块读的某一块。"""
-    if not label:
-        return WATERMARK_PROMPT
-    return WATERMARK_PROMPT + "\n" + TILE_PROMPT_NOTE.format(label=label)
+    text = WATERMARK_PROMPT
+    if label:
+        text += "\n" + TILE_PROMPT_NOTE.format(label=label)
+    if enhanced:
+        text += "\n" + ENHANCED_NOTE
+    return text
 
 
 def tile_boxes(
@@ -297,19 +306,13 @@ def parse_locate_reply(text: str = "") -> dict[str, object] | None:
     }
 
 
-def crop_data_url(
+def _crop_region(
     raw: bytes,
     box: tuple[float, float, float, float],
     *,
     pad: float = 0.08,
-    max_side: int = 1600,
-    max_upscale: float = 3.0,
-) -> tuple[str, tuple[int, int, int, int]]:
-    """按归一化框从**原图**上裁一块，放大到能看清字，返回 (data_url, 像素框)。
-
-    这里绝不能用缩过的整图：水印本来就是小字，缩一次就没了。四周留一圈余量，
-    是因为模型给的框常常差半个字，切在字上等于白读。
-    """
+) -> tuple[Image.Image, tuple[int, int, int, int]]:
+    """按归一化框从原图上裁一块，返回 (裁块, 像素框)。"""
     image = _decode(raw)
     if image is None:
         raise ValueError("图片解码失败")
@@ -327,16 +330,66 @@ def crop_data_url(
     y1 = min(height, y1 + pad_y)
     if x1 - x0 < 24 or y1 - y0 < 24:
         raise ValueError("裁剪区域太小")
-    crop = image.crop((x0, y0, x1, y1))
-    crop_w, crop_h = crop.size
-    scale = float(max_side) / max(1, max(crop_w, crop_h))
-    scale = min(scale, max_upscale)
-    if abs(scale - 1.0) > 0.02:
-        crop = crop.resize((max(1, int(crop_w * scale)), max(1, int(crop_h * scale))))
+    return image.crop((x0, y0, x1, y1)), (x0, y0, x1, y1)
+
+
+def _encode_jpeg(image: Image.Image) -> str:
     buffer = io.BytesIO()
-    crop.convert("RGB").save(buffer, format="JPEG", quality=JPEG_QUALITY, optimize=True)
-    url = "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
-    return url, (x0, y0, x1, y1)
+    image.convert("RGB").save(buffer, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+    return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _resize_to(image: Image.Image, max_side: int, max_upscale: float) -> Image.Image:
+    width, height = image.size
+    scale = float(max_side) / max(1, max(width, height))
+    scale = min(scale, max_upscale)
+    if abs(scale - 1.0) <= 0.02:
+        return image
+    return image.resize((max(1, int(width * scale)), max(1, int(height * scale))))
+
+
+def crop_data_url(
+    raw: bytes,
+    box: tuple[float, float, float, float],
+    *,
+    pad: float = 0.08,
+    max_side: int = 1600,
+    max_upscale: float = 3.0,
+) -> tuple[str, tuple[int, int, int, int]]:
+    """按归一化框从**原图**上裁一块，放大到能看清字，返回 (data_url, 像素框)。
+
+    这里绝不能用缩过的整图：水印本来就是小字，缩一次就没了。四周留一圈余量，
+    是因为模型给的框常常差半个字，切在字上等于白读。
+    """
+    crop, pixels = _crop_region(raw, box, pad=pad)
+    return _encode_jpeg(_resize_to(crop, max_side, max_upscale)), pixels
+
+
+def enhanced_crop_data_url(
+    raw: bytes,
+    box: tuple[float, float, float, float],
+    *,
+    pad: float = 0.08,
+    max_side: int = 1600,
+    max_upscale: float = 4.0,
+    gain: int = 5,
+) -> tuple[str, tuple[int, int, int, int]]:
+    """淡字那块做背景差分 + 拉伸后的 data_url。
+
+    浅色小字压在浅色背景上时，直接裁出来送模型，字和背景只差几个灰度级：人眼
+    放大能看到，模型抄不出来（832b 的白字压奶白地毯，整块跨度十几个灰度级）。
+    这里减掉一张大半径模糊的背景、把残差放大 ``gain`` 倍，慢变的绒毛影子被压平，
+    笔画反而浮出来——832b 的连笔字在增强版上肉眼能看出轮廓了。
+    """
+    crop, pixels = _crop_region(raw, box, pad=pad)
+    gray = crop.convert("L")
+    radius = max(3, min(gray.size) // 10)
+    background = gray.filter(ImageFilter.GaussianBlur(radius=radius))
+    delta = ImageChops.difference(gray, background)
+    delta = delta.point(lambda value: min(255, int(value) * gain))
+    delta = _resize_to(delta, max_side, max_upscale)
+    delta = ImageOps.autocontrast(delta)
+    return _encode_jpeg(delta), pixels
 
 
 def parse_watermark_reply(text: str) -> dict[str, str]:

@@ -8,6 +8,8 @@ from __future__ import annotations
 import re
 from urllib.parse import unquote, urljoin, urlparse
 
+from .hosts import host_of, is_host, matched_token
+
 MIRROR_URL_RE = re.compile(
     r"^https?://(?:[A-Za-z0-9-]+\.)*(?:sotwe\.com|twstalker\.com|twstalker\.org)/([A-Za-z0-9_]+)",
     re.I,
@@ -16,6 +18,9 @@ MIRROR_URL_RE = re.compile(
 # HTML，不是图片。Instagram 可以换成 /p/<短码>/media/ 直链，Facebook、Threads
 # 没有免登录的等价接口。
 CRAWLER_PLACEHOLDER_HOSTS = ("lookaside.instagram.com", "lookaside.fbsbx.com")
+# X 的域名只有这两个。x_page_kind / x_page_handle / platform_of 原来各抄一遍，
+# 加第三个域名（比如某个镜像）时会漏掉其中一处，收到这里。
+_X_HOSTS = ("x.com", "twitter.com")
 IG_SHORTCODE_RE = re.compile(r"instagram\.com/(?:p|reel|tv)/([A-Za-z0-9_-]{5,20})")
 
 X_STATUS_RE = re.compile(r"^https?://(?:www\.)?(?:x|twitter)\.com/([A-Za-z0-9_]{2,20})(?:/status/|/?)", re.I)
@@ -23,7 +28,23 @@ HANDLE_RE = re.compile(r"@([A-Za-z0-9_]{2,20})")
 SOTWE_TITLE_SUFFIX_RE = re.compile(r"\s*[-–—]\s*(?:Twitter|X).*$", re.I)
 # X 帖子的搜索结果标题长这样：`□카🕯 on X: "그러니까 …"`。后面那半截是正文，
 # 不是名字；整条当名字发出去，用户看到的就是一长串句子。
-X_ON_TITLE_RE = re.compile(r"^(?P<name>.+?)\s+on\s+(?:X|Twitter):\s*", re.I)
+# `on` 两边不一定有空格：中文名紧贴着写（`关先生on X: "…"`），老规则的 `\s+`
+# 要求空格，匹配不上就退回整条标题。前面那个 lookbehind 是为了别把名字里的
+# `on` 当成连接词（`Nikon X: …` 不该切成 `Nik`）。
+X_ON_TITLE_RE = re.compile(
+    r"^(?P<name>.+?)(?<![A-Za-z0-9_])on\s*(?:X|Twitter)\s*[:：]\s*(?P<text>.*)$",
+    re.I | re.S,
+)
+# 没有正文的那种标题：`Tsuki_月隐on X / X`。这种多半是 X 的页面标题被搜索引擎
+# 截了，`on X` 后面没有冒号和正文，上面那条要求冒号的正则匹配不上，名字尾巴就
+# 带着 `on` 一路去各平台搜（cf7d 那单搜的是「Tsuki_月隐on」，白搜一轮）。
+# lookbehind 同上：`Nikon X` 这种名字自带 `on` 的不切。
+X_ON_TAIL_RE = re.compile(
+    r"^(?P<name>.+?)(?<![A-Za-z0-9_])on\s*(?:X|Twitter)(?:\s*/\s*(?:X|Twitter))?\s*$",
+    re.I,
+)
+# 正文外面那圈引号：中英文、单双引号、书名号都有，剥掉再展示。
+_TITLE_QUOTE_CHARS = "\"'“”‘’「」『』"
 # x.com 页面标题的尾巴：「名字 (@handle) / X」。账号先被抽走，这条再收后缀。
 _X_PAGE_SUFFIX_RE = re.compile(r"\s*/\s*(?:X|Twitter)\s*$", re.I)
 BILIBILI_SPACE_RE = re.compile(r"space\.bilibili\.com/(\d+)")
@@ -147,6 +168,33 @@ def pixiv_artwork_url(illust_id: str) -> str:
     return f"https://www.pixiv.net/artworks/{value}" if value else ""
 
 
+# pixiv 作品页地址里的号：新版是 `/artworks/<id>`，镜像站（kurocore 这类）用
+# `/illust/<id>`，老版是 `?illust_id=<id>`。镜像站把 pixiv 作品原样重发，路径里的
+# 号就是 pixiv 作品号——b08b 那单的 kurocore 就是这样。
+_PIXIV_PATH_ID_RE = re.compile(r"/(?:artworks|illust|i)/(\d{5,12})(?:[/?#]|$)", re.I)
+_PIXIV_QUERY_ID_RE = re.compile(r"(?:^|[?&])illust_id=(\d{5,12})", re.I)
+# 只认 pixiv 自己与已知镜像站：别的站 `/illust/123` 是自家编号，拿来当 pixiv 作品
+# 号会撞上不相干的作品（真正把关的仍是回 pixiv 核对 + 作者名比对）。
+_PIXIV_ARTWORK_HOSTS = ("pixiv.net", "pixiv.re", "kurocore.com")
+
+
+def is_pixiv_artwork_host(url: str = "") -> bool:
+    return is_host(url, _PIXIV_ARTWORK_HOSTS)
+
+
+def pixiv_url_hint(url: str = "") -> str:
+    """作品页地址里的 pixiv 作品号；读不到返回空串。"""
+    text = url or ""
+    if not is_pixiv_artwork_host(text):
+        return ""
+    parsed = urlparse(text)
+    found = _PIXIV_PATH_ID_RE.search(parsed.path or "")
+    if found:
+        return found.group(1)
+    found = _PIXIV_QUERY_ID_RE.search("?" + (parsed.query or ""))
+    return found.group(1) if found else ""
+
+
 _SOCIAL_HOSTS = (
     "x.com",
     "twitter.com",
@@ -188,8 +236,7 @@ def is_social_platform(url: str = "", source: str = "") -> bool:
     if source:
         hosts.append(str(source).strip().lower())
     for item in hosts:
-        item = item.rsplit("@", 1)[-1].split(":")[0]
-        if item and any(item == token or item.endswith("." + token) for token in _SOCIAL_HOSTS):
+        if is_host(item, _SOCIAL_HOSTS):
             return True
     return False
 
@@ -231,7 +278,7 @@ def x_page_kind(url: str = "") -> str:
     host = (parsed.netloc or "").strip().lower()
     if host == "sotwe.com" or host.endswith(".sotwe.com"):
         return "profile"
-    if not any(host == token or host.endswith("." + token) for token in ("x.com", "twitter.com")):
+    if not is_host(host, _X_HOSTS):
         return ""
     parts = [part.lower() for part in (parsed.path or "").split("/") if part]
     if not parts:
@@ -261,7 +308,7 @@ def x_page_handle(url: str = "") -> str:
     """
     parsed = urlparse(url)
     host = (parsed.netloc or "").strip().lower()
-    if not any(host == token or host.endswith("." + token) for token in ("x.com", "twitter.com")):
+    if not is_host(host, _X_HOSTS):
         return ""
     parts = [part for part in (parsed.path or "").split("/") if part]
     if not parts:
@@ -272,33 +319,34 @@ def x_page_handle(url: str = "") -> str:
     return head
 
 
+# 平台 → 域名。顺序就是原来的判断顺序，别随便调：X 放最前面，因为 sotwe 这类
+# 镜像页面的正文也是 X 的。
+_PLATFORM_HOSTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("X (Twitter)", ("sotwe.com",) + _X_HOSTS),
+    ("B站", ("bilibili.com", "b23.tv")),
+    ("抖音", ("douyin.com", "iesdouyin.com")),
+    ("微博", ("weibo.com", "weibo.cn")),
+    ("小红书", ("xiaohongshu.com", "xhslink.com")),
+    ("Instagram", ("instagram.com",)),
+    ("TikTok", ("tiktok.com",)),
+    ("Telegram", ("telegra.ph",)),
+    ("Pixiv FANBOX", ("fanbox.cc",)),
+    ("Patreon", ("patreon.com",)),
+)
+# Pinterest 是一堆国别域名（pinterest.de、pinterest.co.uk…），按品牌认，不逐个列。
+_PINTEREST_HOST_RE = re.compile(r"(?:^|\.)pinterest\.", re.I)
+
+
 def platform_of(url: str = "", source: str = "", title: str = "") -> str:
     """判断结果所在平台。"""
     host = (urlparse(url).netloc or source or "").lower()
     # 必须按域名后缀精确匹配：`"x.com" in "de.hentai-cosplay-xxx.com"` 会命中，
     # 把带 xxx 的资源站当成 X。is_social_platform() 用的是同一套规则。
-    if any(host == token or host.endswith("." + token) for token in ("sotwe.com", "twitter.com", "x.com")):
-        return "X (Twitter)"
-    if "bilibili.com" in host or "b23.tv" in host:
-        return "B站"
-    if "douyin.com" in host or "iesdouyin.com" in host:
-        return "抖音"
-    if "weibo.com" in host or "weibo.cn" in host:
-        return "微博"
-    if "xiaohongshu.com" in host or "xhslink.com" in host:
-        return "小红书"
-    if "instagram.com" in host:
-        return "Instagram"
-    if "tiktok.com" in host:
-        return "TikTok"
-    if "pinterest." in host:
+    for name, tokens in _PLATFORM_HOSTS:
+        if is_host(host, tokens):
+            return name
+    if _PINTEREST_HOST_RE.search(host):
         return "Pinterest"
-    if "telegra.ph" in host:
-        return "Telegram"
-    if "fanbox.cc" in host:
-        return "Pixiv FANBOX"
-    if "patreon.com" in host:
-        return "Patreon"
     if host:
         return host.removeprefix("www.")
     if title:
@@ -308,6 +356,8 @@ def platform_of(url: str = "", source: str = "", title: str = "") -> str:
 
 # 论坛 / 社区站的页面标题是帖子标题，不是人名。把它当「名字」发出去，用户看到的
 # 就是一串串韩文、日文或「xxx - 某某版」的垃圾（实测 inven.co.kr 那单）。
+# 别和 gallery.FORUM_HOSTS 合并：那份是「答案常写在回复里、值得点开翻」的站
+# （NGA／贴吧／reddit…），这份是「标题不能当人名」的站，两边有重叠但不是一回事。
 _FORUM_HOSTS = (
     "inven.co.kr",
     "dcinside.com",
@@ -332,13 +382,11 @@ DEAD_HOSTS = {
 def dead_site(url: str = "", source: str = "") -> str:
     """这个落点是不是已经关站的站点；是的话返回站点名。"""
     host = (urlparse(url).netloc or source or "").strip().lower()
-    host = host.rsplit("@", 1)[-1].split(":")[0]
+    host = host_of(host)
     if not host:
         return ""
-    for token, name in DEAD_HOSTS.items():
-        if host == token or host.endswith("." + token):
-            return name
-    return ""
+    token = matched_token(host, DEAD_HOSTS)
+    return DEAD_HOSTS.get(token, "") if token else ""
 
 
 # 「求出处」类帖子：发帖人自己也在找这张图。页面标题就是一句问句，真正的答案
@@ -369,7 +417,7 @@ def is_forum_page(url: str = "", source: str = "") -> bool:
     host = host.rsplit("@", 1)[-1].split(":")[0]
     if not host:
         return False
-    return any(host == token or host.endswith("." + token) for token in _FORUM_HOSTS)
+    return is_host(host, _FORUM_HOSTS)
 
 
 # 站点的「列表页」：标签、分类、归档、分页、站内搜索。这类页面本身不是一篇帖子，
@@ -554,11 +602,28 @@ def x_title_name(title: str = "") -> str:
     """X 帖子标题里只有 ``on X:`` 前面那截是名字，后面跟的是正文。
 
     ``kiko on X: "Happy Halloween!"`` 整条拿去抽名字，就会把 Halloween 当成
-    人名，一路推出 @halloween 和 leakgallery.com/Halloween。
+    人名，一路推出 @halloween 和 leakgallery.com/Halloween。中文名常直接把
+    ``on`` 贴在后面（``关先生on X: "…"``），所以 ``on`` 前的空白不是必须的。
     """
     text = (title or "").strip()
     found = X_ON_TITLE_RE.match(text)
-    return found.group("name").strip() if found else text
+    if found:
+        return found.group("name").strip()
+    tail = X_ON_TAIL_RE.match(text)
+    return tail.group("name").strip() if tail else text
+
+
+def x_title_text(title: str = "") -> str:
+    """X 帖子标题里 ``on X:`` 后面那段正文，去掉包裹的引号。
+
+    名字和正文是两样东西：名字进「👤 名字」那一行，正文最多当帖子标题展示。
+    拆不出来（不是 X 帖标题）时返回空串，调用方就别自己猜了。
+    """
+    text = (title or "").strip()
+    found = X_ON_TITLE_RE.match(text)
+    if not found:
+        return ""
+    return (found.group("text") or "").strip().strip(_TITLE_QUOTE_CHARS).strip()
 
 
 _MODEL_PREFIX_RE = re.compile(r"^\s*(?:the\s+)?(?:model|cosplayer|coser|cosplay\s+model)\s*[:：]?\s+", re.I)
@@ -644,6 +709,8 @@ def extract_identity(url: str, title: str = "") -> tuple[str, str]:
     账号优先从链接里取：只在链接是账号页形态时才认，帖子页/搜索页不硬猜。
     """
     clean_title = SOTWE_TITLE_SUFFIX_RE.sub("", title or "").strip()
+    # X 帖标题后面跟着正文，正文里 @ 到的是别人，不是这条的作者。只留 on X:
+    # 前面那截：名字从这里取，账号也只从这截里找。
     clean_title = x_title_name(clean_title)
     handle = ""
 
@@ -741,9 +808,8 @@ def is_crawler_placeholder(url: str) -> bool:
     if not raw:
         return False
     host = urlparse(raw).netloc.lower()
-    for placeholder in CRAWLER_PLACEHOLDER_HOSTS:
-        if host == placeholder or host.endswith("." + placeholder):
-            return True
+    if is_host(host, CRAWLER_PLACEHOLDER_HOSTS):
+        return True
     return "/seo/google_widget/crawler" in raw or "/lookaside/crawler" in raw
 
 

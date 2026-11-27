@@ -11,6 +11,7 @@ from core.formatting import (
     build_engine_forward_nodes,
     build_first_reply,
     build_forward_nodes,
+    build_help,
     build_result_forwards,
     build_text_summary,
     count_forward_images,
@@ -38,6 +39,72 @@ def _images(nodes: list[dict]) -> list[tuple[int, str]]:
             if part.get("type") == "image":
                 found.append((index, part.get("content") or ""))
     return found
+
+
+class HelpPostLineTest(unittest.TestCase):
+    """求助帖正文里给出的出处要露在首屏（826c 那单 whos.tv 的最佳答案）。"""
+
+    def _text(self, nodes) -> str:
+        return "\n".join(
+            part.get("content", "")
+            for node in nodes
+            for part in node.get("content") or []
+            if part.get("type") == "text"
+        )
+
+    def test_clue_names_the_handle_and_gap(self) -> None:
+        outcome = SearchOutcome(
+            status="not_found",
+            best=None,
+            candidates=[],
+            help_post={
+                "status": "clue",
+                "host": "whos.tv",
+                "page": "https://whos.tv/en/helps/18619",
+                "handle": "Ahab_Channel",
+                "post": "https://x.com/Ahab_Channel/status/1766582341927891150",
+                "distance": 15,
+            },
+        )
+        blocks = build_result_forwards(_task(outcome), command="盆地找鸡")
+        text = self._text([node for block in blocks for node in block])
+        self.assertIn("@Ahab_Channel", text)
+        self.assertIn("whos.tv", text)
+        self.assertIn("指纹距离 15", text)
+        self.assertIn("1766582341927891150", text)
+
+    def test_hit_says_where_it_came_from(self) -> None:
+        outcome = SearchOutcome(
+            status="ok",
+            best=Candidate(engine="help_post", url="https://x.com/Ahab_Channel/status/1766582341927891150", platform="X (Twitter)", handle="@Ahab_Channel", status="match", distance=0),
+            candidates=[],
+            help_post={
+                "status": "hit",
+                "host": "whos.tv",
+                "page": "https://whos.tv/en/helps/18619",
+                "handle": "Ahab_Channel",
+                "post": "https://x.com/Ahab_Channel/status/1766582341927891150",
+                "distance": 0,
+            },
+        )
+        text = self._text(build_forward_nodes(_task(outcome), command="盆地找鸡"))
+        self.assertIn("出处来自求助帖的回复", text)
+        self.assertIn("whos.tv", text)
+
+    def test_unreadable_says_page_cannot_be_read(self) -> None:
+        outcome = SearchOutcome(
+            status="not_found",
+            best=None,
+            candidates=[],
+            help_post={"status": "unreadable", "host": "whos.tv", "page": "https://whos.tv/en/helps/1"},
+        )
+        text = self._text(build_forward_nodes(_task(outcome), command="盆地找鸡"))
+        self.assertIn("抓不到正文", text)
+
+    def test_nothing_written_when_no_help_post(self) -> None:
+        outcome = SearchOutcome(status="not_found", best=None, candidates=[])
+        text = self._text(build_forward_nodes(_task(outcome), command="盆地找鸡"))
+        self.assertNotIn("求助帖", text)
 
 
 class ForwardNodesTest(unittest.TestCase):
@@ -342,7 +409,39 @@ class ForwardNodesTest(unittest.TestCase):
         # 标题并进结论节点，别单独占一个只有一行字的节点
         self.assertIn("未找到可靠出处", header)
 
-    def test_nodes_carry_sender_uin(self) -> None:
+    def test_header_uses_nickname_but_footer_keeps_command(self) -> None:
+        """页眉显示转发昵称，页脚的「回复「xx 更多」」必须还是真指令。
+
+        生产里指令是「盆地找鸡」、昵称是「盆地寻人」：页眉跟着昵称变，但用户照
+        页脚抄的那句必须能触发，不能换成昵称（s-20261124-1648-f5a9）。
+        """
+        nodes = build_forward_nodes(
+            _task(self._grouped_outcome()),
+            command="盆地找鸡",
+            header_name="盆地寻人",
+        )
+        first_line = nodes[0]["content"][0]["content"].split("\n", 1)[0]
+        self.assertEqual(first_line, "🔍 盆地寻人结果")
+        text = "\n".join(
+            part.get("content", "")
+            for node in nodes
+            for part in node.get("content") or []
+            if part.get("type") == "text"
+        )
+        self.assertIn("「盆地找鸡 更多 s-test」", text)
+        self.assertIn("「盆地找鸡 重搜」", text)
+
+    def test_first_reply_header_follows_nickname(self) -> None:
+        """首次回复走普通图文时，页眉同样用昵称。"""
+        text, _images = build_first_reply(
+            _task(self._grouped_outcome()),
+            command="盆地找鸡",
+            header_name="盆地寻人",
+        )
+        self.assertTrue(text.startswith("🔍 盆地寻人结果"))
+        self.assertIn("「盆地找鸡 更多", text)
+
+
         """uin 为空时 QQ 端会提示消息异常，所以每个节点都要带 user_id。"""
         outcome = SearchOutcome(status="not_found", best=None, candidates=[], image_b64="", image_source="")
         nodes = build_forward_nodes(_task(outcome), command="麦麦寻人", user_id="2377510578")
@@ -1835,6 +1934,48 @@ class WatermarkProfileTest(unittest.TestCase):
         text = formatting._best_block(outcome)
         self.assertNotIn("https://x.com/Miharu", text)
 
+    def test_tieba_board_name_is_not_an_account(self) -> None:
+        """`@cosplay吧` 是贴吧板块名，不是账号：b55a 那单附了个被封的 @cosplay。"""
+        outcome = SearchOutcome()
+        outcome.vision = {
+            "watermark": "@cosplay吧",
+            "watermark_handle": "cosplay",
+            "watermark_url": "https://x.com/cosplay",
+            "watermark_state": "suspended",
+        }
+        text = formatting._best_block(outcome)
+        self.assertIn("板块名", text)
+        self.assertNotIn("https://x.com/cosplay", text)
+
+    def test_suspended_account_keeps_no_link(self) -> None:
+        """同名号已被封禁时不附主页：点开是空白页，看着像「人找到了」。"""
+        outcome = SearchOutcome()
+        outcome.vision = {
+            "watermark": "@someone",
+            "watermark_handle": "someone",
+            "watermark_url": "https://x.com/someone",
+            "watermark_state": "suspended",
+        }
+        text = formatting._best_block(outcome)
+        self.assertIn("封禁", text)
+        self.assertNotIn("https://x.com/someone", text)
+
+    def test_weak_read_shows_no_profile_link(self) -> None:
+        """读歪撞上的同名号：写清「读不准」，但不给主页（832b 的 Stellach）。"""
+        outcome = SearchOutcome()
+        outcome.vision = {
+            "watermark": "Stellach",
+            "watermark_weak": "是私人号、只有 71 个粉丝（2010 年注册）",
+            "watermark_state": "ok",
+            "watermark_note": "X 上的同名号是私人号、只有 71 个粉丝，不像图上的人",
+        }
+        text = formatting._best_block(outcome)
+        self.assertIn("读不准", text)
+        self.assertIn("Stellach", text)
+        self.assertIn("私人号", text)
+        self.assertNotIn("x.com/STELLACH", text)
+        self.assertNotIn("已核实这个号存在", text)
+
     def test_misread_handle_explains_the_fix(self) -> None:
         """号名读偏、靠近似拼写才找回来时，必须写清楚「读的是啥、核到的是谁」。"""
         outcome = SearchOutcome()
@@ -2863,3 +3004,31 @@ class OtherAccountsLinesTest(unittest.TestCase):
             },
         )
         self.assertIn("TikTok @starrychibun", formatting._best_block(outcome))
+
+
+class HelpTextTest(unittest.TestCase):
+    """帮助文案：纯文字、照着抄能触发，且不再提昵称。"""
+
+    def test_lists_every_command(self) -> None:
+        text = build_help("盆地找鸡", ttl_minutes=1440)
+        for word in ("重搜", "更多", "直发", "xid"):
+            self.assertIn(word, text)
+        self.assertIn("盆地找鸡 直发", text)
+
+    def test_uses_real_command_not_nickname(self) -> None:
+        """例子里必须是真指令：昵称只是显示名，抄了触发不了。"""
+        text = build_help("盆地找鸡", ttl_minutes=60)
+        self.assertNotIn("盆地寻人", text)
+        self.assertIn("结果默认保留 1 小时", text)
+
+    def test_is_plain_text_without_markdown_emphasis(self) -> None:
+        text = build_help("盆地找鸡")
+        self.assertNotIn("**", text)
+        self.assertNotIn("```", text)
+        self.assertLess(len(text), 600)
+
+    def test_says_merged_forward_not_card(self) -> None:
+        """用户 11-27 定的口径：别叫「卡片」，就写搜索结果的合并转发。"""
+        text = build_help("盆地找鸡")
+        self.assertNotIn("卡片", text)
+        self.assertIn("合并转发", text)

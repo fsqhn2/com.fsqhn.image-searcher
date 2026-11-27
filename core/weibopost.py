@@ -15,9 +15,12 @@ from __future__ import annotations
 import re
 from html import unescape
 
+from .hosts import is_host
+
 # 只会往微博上抓的转载 / 新闻站。**只收确认过的**：误标一个正经站点，会让每单都
 # 多抓一次页面、多搜一次微博，白花钱还容易被风控。要加新站先自己验一单。
-REPOST_HOSTS = (
+# 名字别写成 REPOST_HOSTS：`gallery` 里那个是图集 / 搬运站，两回事。
+_SINA_HOSTS = (
     "sina.cn",
     "sina.com.cn",
 )
@@ -70,7 +73,7 @@ def is_weibo_repost_page(url: str = "", platform: str = "") -> bool:
     for item in (host_of(url), str(platform or "").strip().lower().removeprefix("www.")):
         if not item:
             continue
-        if any(item == token or item.endswith("." + token) for token in REPOST_HOSTS):
+        if is_host(item, _SINA_HOSTS):
             return True
     return False
 

@@ -9,6 +9,7 @@ from .engines import Candidate, downgrade_kind, is_avatar_hit
 from .extract import dead_site, is_avatar_image, is_forum_page, split_repost_title
 from .tasks import SearchOutcome, SearchTask
 from . import gallery, handles, paywall
+from .hosts import matched_token
 
 AI_FLAG_THRESHOLD = 0.75
 
@@ -65,9 +66,9 @@ def _paid_pack_host(url: str, platform: str = "") -> str:
     host = host.strip().lower().removeprefix("www.")
     if not host:
         return ""
-    for token in PAID_PACK_HOSTS:
-        if host == token or host.endswith("." + token):
-            return token
+    token = matched_token(host, PAID_PACK_HOSTS)
+    if token:
+        return token
     return host if gallery.is_gallery_site(url, platform) else ""
 
 
@@ -88,6 +89,46 @@ def _forum_thread_line(outcome: SearchOutcome) -> str:
     hosts = list(dict.fromkeys((_host_of(item.url) or item.platform or "").strip() for item in threads))
     shown = "、".join([host for host in hosts if host][:2])
     return f"💬 有候选落在 {shown} 这类论坛讨论帖上：答案常写在回复里，点开翻一眼比换引擎快。"
+
+
+def _help_post_lines(outcome: SearchOutcome) -> list[str]:
+    """候选落在求图 / 问答帖上时，把帖子里写的出处说出来。
+
+    826c 那单只有 whos.tv 的求助帖（距离 0、视觉同图），最佳答案已经写着
+    「原图在这儿 https://x.com/Ahab_Channel/status/…」，插件却把它降级成
+    「不是作者主页」就收工。现在会去读正文：核上了就点名，没核上就写清还得
+    自己点开核对。
+    """
+    info = outcome.help_post or {}
+    status = str(info.get("status") or "")
+    host = str(info.get("host") or "").strip()
+    page = str(info.get("page") or "").strip()
+    handle = str(info.get("handle") or "").strip().lstrip("@")
+    post = str(info.get("post") or "").strip()
+    distance = info.get("distance")
+    if status == "hit" and handle:
+        where = f"（{host}）" if host else ""
+        return [f"💬 出处来自求助帖的回复：X @{handle} 那条帖子，指纹一致{where}。"]
+    if status == "clue" and handle:
+        if isinstance(distance, int):
+            gap = (
+                f"指纹距离 {distance}，跟原图不是同一张，可能是同一套的另一张"
+            )
+        else:
+            gap = "没取到配图，没比指纹"
+        who = str(info.get("name") or "").strip()
+        followers = info.get("followers")
+        if isinstance(followers, int) and followers > 0:
+            who = f"{who}，{_fans_text(followers)}" if who else _fans_text(followers)
+        head = f"X @{handle}（{who}）" if who else f"X @{handle}"
+        where = f"{host} 的求助帖里" if host else "一个求助帖里"
+        lines = [f"💬 {where}，回复给的出处是 {head}"]
+        lines.append(f"   {post}（{gap}，点开核对{('；页：' + page) if page else ''}）")
+        return lines
+    if status == "unreadable":
+        where = f"{host} 的求助帖" if host else "一个求助帖"
+        return [f"💬 有候选落在{where}上，这页抓不到正文，只能点开翻回复。"]
+    return []
 
 
 def _paid_pack_line(outcome: SearchOutcome) -> str:
@@ -569,8 +610,10 @@ def _name_hunt_lines(outcome: SearchOutcome) -> list[str]:
                 extra.append(url)
             parts.append(f"微博 {label}（{' · '.join(extra)}）" if extra else f"微博 {label}")
         elif platform == "X":
-            label = f"X @{handle.lstrip('@')}"
-            if verified_handle and handle.lstrip("@").lower() == verified_handle:
+            name_only = handle.lstrip("@")
+            label = f"X @{name_only}"
+            verified = bool(verified_handle) and name_only.lower() == verified_handle
+            if verified:
                 # 显示名对得上的那个号才有粉丝数：只是列表里的同名号没核过。
                 detail = []
                 if verified_fans:
@@ -579,8 +622,11 @@ def _name_hunt_lines(outcome: SearchOutcome) -> list[str]:
                     detail.append(f"显示名「{verified_name}」对得上")
                 if detail:
                     label += f"（{'，'.join(detail)}）"
-            # 微博那条一直带链接，X 这边只写 @号，看着像线索而不是一个能点的主页。
-            label += f" https://x.com/{handle.lstrip('@')}"
+                # 核实过的号才给主页链接。只从检索结果里捞到的号可能根本不存在
+                # （b08b 的 @yuukiyuki1334 打开就是 404），摆一个假主页比不摆更糟。
+                label += f" https://x.com/{name_only}"
+            else:
+                label += "（没核实这个号是否存在）"
             parts.append(label)
         else:
             parts.append(f"{platform} {handle}".strip())
@@ -962,6 +1008,7 @@ def _best_block(outcome: SearchOutcome, *, skip_grok: bool = False, detail: bool
     extra.extend(_weibo_lines(outcome))
     extra.extend(_name_hunt_lines(outcome))
     extra.extend(_other_accounts_lines(outcome))
+    extra.extend(_help_post_lines(outcome))
     extra.extend(_role_hint_lines(outcome))
     extra.extend(_paid_lines(outcome))
     extra.extend(_trace_lines(outcome, detail=detail))
@@ -1029,6 +1076,7 @@ def _vision_watermark_line(outcome: SearchOutcome) -> str:
         return ""
     state = str(vision.get("watermark_state") or "").strip()
     user_id = str(vision.get("watermark_user_id") or "").strip()
+    weak = str(vision.get("watermark_weak") or "").strip()
     mark_name = _squash_name(vision.get("watermark_name"))
     post_name = _squash_name(outcome.best.name if outcome.best is not None else grok.get("name"))
     same_person = bool(mark_name) and mark_name == post_name
@@ -1044,6 +1092,13 @@ def _vision_watermark_line(outcome: SearchOutcome) -> str:
         if post:
             # 水印号自己的带图帖里翻到了这张：这是核对过的结论，直接把帖子给出来。
             lines.append(f"🔎 图上水印核对上了：{text}（{note}）：{post}")
+        elif weak:
+            # 号是读歪撞上的：只写读到的字，不给主页。832b 那单把地毯上的连笔签名
+            # 读成 Stellach，X 上那个号是 71 粉的私人韩文号，点开只会浪费时间。
+            lines.append(
+                f"🔎 图上水印读不准：读出「{text}」，但 X 上的同名号{weak}，"
+                "不像这张图的人（花体、浅色小字容易读成别的词）"
+            )
         elif same_person and state == "ok":
             # 78c8 那单：水印 @Asagiriairi001、结论 @asagiriairi002，两边都叫
             # 「朝霧愛理」——这是她自己的另一个号，不是「模型读错了」，也不是
@@ -1069,6 +1124,16 @@ def _vision_watermark_line(outcome: SearchOutcome) -> str:
             # 两个模型读得不一样，连是哪个号都没定：这时候再附主页，用户点进去
             # 只会看到一个无关账号，白白浪费时间。
             lines.append(f"🔎 图上水印：{text}（视觉模型识别，可能读错，先别去认这个号）")
+        elif _is_board_name(text):
+            # 贴吧水印：那块板不是人，别附主页（点开往往是同名的老号）。
+            lines.append(
+                f"🔎 图上水印：{text}（视觉模型识别，可能读错；这是贴吧的板块名，不是账号）"
+            )
+        elif state == "suspended":
+            # 同名号已被封禁：附主页只会让人以为「人找到了」，点开却是空白页。
+            lines.append(
+                f"🔎 图上水印：{text}（视觉模型识别，可能读错；同名号已被 X 封禁，别当线索）"
+            )
         elif url:
             lines.append(f"🔎 图上水印：{text}（视觉模型识别，可能读错，可点开核对）：{url}")
         elif note:
@@ -1157,6 +1222,11 @@ def _handle_key(text: str) -> str:
     议员），所以这个比较只用来解释水印读法，不拿来改结论。
     """
     return re.sub(r"[^0-9a-z]+", "", str(text or "").strip().lstrip("@").lower())
+
+
+def _is_board_name(text: str) -> bool:
+    """``@cosplay吧`` 这种是百度贴吧的板块名，不是账号。"""
+    return handles.is_board_name(text)
 
 
 def _conclusion_handle(outcome: SearchOutcome) -> str:
@@ -1600,16 +1670,19 @@ def candidate_image(outcome: SearchOutcome, item: Candidate) -> str:
     return (outcome.images or {}).get(item.image_url, "")
 
 
-def _header_text(outcome: SearchOutcome, command: str, replay: bool) -> str:
-    header = f"🔍 {command}结果"
+def _header_text(outcome: SearchOutcome, command: str, replay: bool, header_name: str = "") -> str:
+    # 页眉上那个名字用「转发昵称」配置项，不是触发指令：生产里指令是「盆地找鸡」，
+    # 昵称才是「盆地寻人」。页脚里的「回复「xx 更多」」仍旧必须用真指令，照抄才能触发。
+    label = (header_name or "").strip() or command
+    header = f"🔍 {label}结果"
     if outcome.status == "error":
-        header = f"🔍 {command} · 搜索失败"
+        header = f"🔍 {label} · 搜索失败"
     if replay:
-        header = f"🔍 {command}结果 · 全部候选"
+        header = f"🔍 {label}结果 · 全部候选"
     if outcome.ai and outcome.ai.get("ok"):
         try:
             if float(outcome.ai.get("score") or 0) >= AI_FLAG_THRESHOLD:
-                header = f"🔍 {command} · 疑似 AI 生成"
+                header = f"🔍 {label} · 疑似 AI 生成"
         except (TypeError, ValueError):
             pass
     if outcome.cached:
@@ -1793,6 +1866,7 @@ def build_forward_nodes(
     show_reference: bool = True,
     limit: int = 8,
     nickname: str = "麦麦寻人",
+    header_name: str = "",
     ttl_minutes: int = 15,
     replay: bool = False,
     user_id: str = "",
@@ -1803,6 +1877,7 @@ def build_forward_nodes(
     （键为候选图地址），首次回复只放每个引擎最接近的那张，回「更多」时放全部。
     user_id 会写进转发节点的 uin。QQ 端要求 uin 非空，留空会出现
     「消息异常」或只剩一个 [聊天记录] 占位，所以调用方要把机器人账号传进来。
+    header_name 是页眉上显示的名字（传转发昵称）；留空时退回 command。
     """
     outcome = task.outcome or SearchOutcome(status="error")
     nodes: list[dict] = []
@@ -1818,7 +1893,7 @@ def build_forward_nodes(
             [
                 {
                     "type": "text",
-                    "content": f"{_header_text(outcome, command, replay)}\n{_best_block(outcome, detail=replay)}",
+                    "content": f"{_header_text(outcome, command, replay, header_name)}\n{_best_block(outcome, detail=replay)}",
                 }
             ]
         )
@@ -2184,6 +2259,9 @@ def build_miss_nodes(
     # 用户要求：没搜到的单子也把「AI 生成概率」直接摆在结论里，别让人回「更多」才看得到。
     # 只多这一行——匹配路线、耗时这些仍然只留在「更多」。检测没跑或失败时不写。
     first: list[dict] = [{"type": "text", "content": headline}]
+    # 求助帖里读到的出处要摆在最前面：这是「再搜一次也搜不到」时最有用的东西。
+    for line in _help_post_lines(outcome):
+        first.append({"type": "text", "content": line})
     ai_probability = _ai_probability_line(outcome.ai)
     if ai_probability:
         first.append({"type": "text", "content": ai_probability})
@@ -2282,6 +2360,7 @@ def build_result_forwards(
     show_reference: bool = True,
     limit: int = 8,
     nickname: str = "麦麦寻人",
+    header_name: str = "",
     ttl_minutes: int = 15,
     replay: bool = False,
     user_id: str = "",
@@ -2328,6 +2407,7 @@ def build_result_forwards(
                 show_reference=show_reference,
                 limit=limit,
                 nickname=nickname,
+                header_name=header_name,
                 ttl_minutes=ttl_minutes,
                 replay=replay,
                 user_id=user_id,
@@ -2358,6 +2438,7 @@ def build_engine_forward_nodes(
     *,
     command: str,
     nickname: str = "麦麦寻人",
+    header_name: str = "",
     ttl_minutes: int = 15,
     user_id: str = "",
     part: tuple[int, int] | None = None,
@@ -2381,7 +2462,7 @@ def build_engine_forward_nodes(
     label = f"▍{_engine_name(engine)}（{len(items)} 条）"
     if part:
         label += f" · {part[0]}/{part[1]}"
-    header = f"{_header_text(outcome, command, True)} · {label}"
+    header = f"{_header_text(outcome, command, True, header_name)} · {label}"
     nodes.append(node([{"type": "text", "content": header}]))
 
     if with_best:
@@ -2484,10 +2565,35 @@ def _first_reply_images(outcome: SearchOutcome, limit: int = FIRST_REPLY_IMAGES)
     return picked
 
 
+def build_help(command: str, *, ttl_minutes: int = 15) -> str:
+    """帮助文案：纯文字，照着抄就能用。
+
+    例子里一律写真指令（`command`），不换成昵称——跟页脚同一套口径：用户要拿它去
+    触发，昵称只是显示名。每条只讲干什么，不解释实现。
+    """
+    keep = ttl_text(ttl_minutes)
+    name = command or "寻人"
+    return "\n".join(
+        [
+            f"🔍 {name} 怎么用",
+            "",
+            "· 发图直接搜：发一张图，约 1 分钟出结果（搜索结果以合并转发发出）",
+            f"· 强制重搜：发图时带上「{name} 重搜」，跳过缓存重来一遍",
+            f"· 看全部候选：{name} 更多",
+            f"· 搜索结果没显示出来：{name} 直发，同样内容改发一条普通消息",
+            f"· 指定某一次：上面三个指令后面加任务编号，如 {name} 更多 s-20261127-1450-66af",
+            f"· 核对推文：{name} xid 推文链接（要同时带图）",
+            "",
+            f"结果默认保留 {keep}：「{name} 更多」和「{name} 直发」在这段时间内都能用。",
+        ]
+    )
+
+
 def build_first_reply(
     task: SearchTask,
     *,
     command: str,
+    header_name: str = "",
     ttl_minutes: int = 15,
     max_images: int = FIRST_REPLY_IMAGES,
 ) -> tuple[str, list[str]]:
@@ -2498,7 +2604,7 @@ def build_first_reply(
     看得见，代价是群里多占一行。匹配路线、AI 检测、全部候选仍然留在「更多」里。
     """
     outcome = task.outcome or SearchOutcome(status="error")
-    lines = [f"{_header_text(outcome, command, False)}\n{_best_block(outcome)}"]
+    lines = [f"{_header_text(outcome, command, False, header_name)}\n{_best_block(outcome)}"]
     lines.append("")
     lines.extend(_footer_lines(outcome, command, ttl_minutes, False, task.task_id))
     return "\n".join(lines), _first_reply_images(outcome, max_images)

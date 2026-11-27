@@ -18,6 +18,8 @@ from urllib.parse import urlparse
 import requests
 from requests.exceptions import ConnectionError, ReadTimeout, SSLError
 
+from .hosts import is_host
+
 ProxySpec = str | Sequence[str]
 
 USER_AGENT = (
@@ -173,7 +175,7 @@ def make_session(
 def download_routes(url: str, proxy: ProxySpec = "") -> list[str]:
     """按主机决定先走哪条线路，返回要去重尝试的顺序（"" 表示直连）。"""
     host = (urlparse(url).hostname or "").lower()
-    direct_first = any(host == suffix or host.endswith("." + suffix) for suffix in _DIRECT_FIRST_SUFFIXES)
+    direct_first = is_host(host, _DIRECT_FIRST_SUFFIXES)
     configured = proxy_routes(proxy)
     routes = ([""] + configured) if direct_first else (configured + [""])
     ordered: list[str] = []

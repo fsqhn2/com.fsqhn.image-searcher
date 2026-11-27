@@ -530,6 +530,20 @@ class TitleHandleTest(unittest.TestCase):
         self.assertEqual(handles.title_handle("精选 (@cosplay) 套图"), ("", ""))
 
 
+class BoardNameTest(unittest.TestCase):
+    """贴吧水印 ``@cosplay吧`` 是板块名，不是账号。"""
+
+    def test_tieba_board_is_not_an_account(self):
+        self.assertTrue(handles.is_board_name("@cosplay吧"))
+        self.assertTrue(handles.is_board_name("崩坏星穹铁道吧"))
+
+    def test_real_names_are_not_boards(self):
+        self.assertFalse(handles.is_board_name("咲鱼咔咔"))
+        self.assertFalse(handles.is_board_name("@kuru_xox"))
+        # 名字里带「吧」但不是在结尾，照旧当人名
+        self.assertFalse(handles.is_board_name("吧花小美"))
+
+
 class LlmAuthorReplyTest(unittest.TestCase):
     """把「抽作者名」这一步交给模型时，模型那句话怎么解析。
 

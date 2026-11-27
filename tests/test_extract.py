@@ -18,6 +18,7 @@ from core.extract import (  # noqa: E402
     is_avatar_image,
     is_pixiv_platform,
     is_social_platform,
+    pixiv_url_hint,
     is_x_platform,
     match_account,
     platform_of,
@@ -75,6 +76,40 @@ class ExtractIdentityTest(unittest.TestCase):
         )
         self.assertEqual(extract.x_title_name("普通标题"), "普通标题")
 
+    def test_x_post_title_name_without_space(self) -> None:
+        """中文名常把 on 贴在后面：``关先生on X: "…"``，不能整条当名字。"""
+        self.assertEqual(
+            extract.x_title_name('关先生on X: "转发的一条帖子正文"'),
+            "关先生",
+        )
+        # 全角冒号、Twitter 老写法、空格随意都要认。
+        self.assertEqual(extract.x_title_name("小明on Twitter：正文"), "小明")
+        self.assertEqual(extract.x_title_name("小明  on   X : 正文"), "小明")
+
+    def test_x_post_title_name_without_body(self) -> None:
+        """截断的 X 标题 `Tsuki_月隐on X / X` 也要拆开。
+
+        cf7d 那单：标题里 `on X` 后面没有冒号和正文，要求冒号的老规则匹配不上，
+        名字尾巴带着 `on`（「Tsuki_月隐on」）去各平台搜了一轮，白花额度。
+        """
+        self.assertEqual(extract.x_title_name("Tsuki_月隐on X / X"), "Tsuki_月隐")
+        self.assertEqual(extract.x_title_name("Tsuki_月隐on X"), "Tsuki_月隐")
+        self.assertEqual(extract.x_title_name("Mio Kuuko on X / X"), "Mio Kuuko")
+        # 名字自带 on 的英文词照旧不切
+        self.assertEqual(extract.x_title_name("Canon X"), "Canon X")
+
+    def test_x_post_title_name_keeps_word_ending_in_on(self) -> None:
+        """名字里自带 on 的词不能被切开：``Nikon X: …`` 没有连接词，不算 X 帖标题。"""
+        self.assertEqual(extract.x_title_name("Nikon X: 一台相机"), "Nikon X: 一台相机")
+
+    def test_x_title_text_strips_quotes(self) -> None:
+        """正文单独取：名字那截不进正文，外面那圈引号也不该留给用户。"""
+        self.assertEqual(
+            extract.x_title_text('关先生on X: "转发的一条帖子正文"'),
+            "转发的一条帖子正文",
+        )
+        self.assertEqual(extract.x_title_text("普通标题"), "")
+
     def test_no_identity(self) -> None:
         name, handle = extract_identity("https://example.com/gallery/9", "一张相册图")
         self.assertEqual(handle, "")
@@ -88,6 +123,16 @@ class ExtractIdentityTest(unittest.TestCase):
         )
         self.assertEqual(name, "□카🕯")
         self.assertEqual(handle, "@YuMIkAnime")
+
+    def test_x_post_identity_splits_body_from_name(self) -> None:
+        """名字和正文挤在一串里要拆开（s-20261124-1648-f5a9）。"""
+        name, handle = extract_identity(
+            "https://x.com/someone/status/1981041372112310319",
+            '关先生on X: "正文里 @了别人，但这不是作者"',
+        )
+        self.assertEqual(name, "关先生")
+        # 正文里 @ 到的是别人，不能拿来当这条的作者号
+        self.assertEqual(handle, "@someone")
 
 
 class DeadSiteTest(unittest.TestCase):
@@ -209,6 +254,21 @@ class PlatformTest(unittest.TestCase):
         self.assertEqual(platform_of("https://mobile.x.com/a/status/1"), "X (Twitter)")
         self.assertEqual(platform_of("https://twitter.com/a/status/1"), "X (Twitter)")
         self.assertEqual(platform_of("https://sotwe.com/a"), "X (Twitter)")
+
+    def test_lookalike_domains_are_not_those_platforms(self) -> None:
+        """其余平台原来是子串判断，`notbilibili.com`、`fakeinstagram.com` 都会认错。"""
+        for url, expected in (
+            ("https://notbilibili.com/video/BV1", "notbilibili.com"),
+            ("https://fakeinstagram.com/p/1", "fakeinstagram.com"),
+            ("https://fakepinterest.com/pin/1", "fakepinterest.com"),
+        ):
+            with self.subTest(url=url):
+                self.assertEqual(platform_of(url), expected)
+
+    def test_pinterest_country_domains_still_work(self) -> None:
+        # Pinterest 的国别域名不逐个列，按品牌前缀认
+        self.assertEqual(platform_of("https://pinterest.de/pin/1"), "Pinterest")
+        self.assertEqual(platform_of("https://media.pinterest.com/pin/1"), "Pinterest")
 
     def test_relevance_rank(self) -> None:
         self.assertEqual(relevance_rank("https://x.com/a"), 0)
@@ -415,6 +475,35 @@ class PixivPlatformTest(unittest.TestCase):
         for platform, url in (("Pixiv FANBOX", "https://xxx.fanbox.cc/posts/1"), ("Twitter", "https://x.com/a")):
             with self.subTest(platform=platform):
                 self.assertFalse(is_pixiv_platform(platform, url))
+
+
+class PixivUrlHintTest(unittest.TestCase):
+    """作品页地址里的作品号：镜像站路径、老式疑问参数都要读得出来，别的站不许认。"""
+
+    def test_artwork_page(self) -> None:
+        self.assertEqual(pixiv_url_hint("https://www.pixiv.net/artworks/152342429"), "152342429")
+        self.assertEqual(pixiv_url_hint("https://pixiv.net/artworks/152342429?lang=zh"), "152342429")
+
+    def test_mirror_uses_illust_path(self) -> None:
+        # b08b：kurocore 把 pixiv 作品按 /illust/<id> 原样重发
+        self.assertEqual(pixiv_url_hint("https://kurocore.com/illust/145241123"), "145241123")
+        self.assertEqual(pixiv_url_hint("https://www.pixiv.re/illust/145241123"), "145241123")
+
+    def test_old_query_form(self) -> None:
+        self.assertEqual(
+            pixiv_url_hint("https://www.pixiv.net/member_illust.php?mode=medium&illust_id=145241123"),
+            "145241123",
+        )
+
+    def test_other_hosts_are_not_pixiv_ids(self) -> None:
+        # 别的站自家 /illust/123 是站内编号，拿来当 pixiv 作品号会撞上不相干的作品
+        self.assertEqual(pixiv_url_hint("https://example.com/illust/145241123"), "")
+        self.assertEqual(pixiv_url_hint("https://x.com/illust/145241123"), "")
+        self.assertEqual(pixiv_url_hint("https://pixiv.net.evil.example/illust/145241123"), "")
+        self.assertEqual(pixiv_url_hint(""), "")
+
+    def test_needs_a_long_enough_number(self) -> None:
+        self.assertEqual(pixiv_url_hint("https://kurocore.com/illust/123"), "")
 
 
 class SocialPlatformTest(unittest.TestCase):

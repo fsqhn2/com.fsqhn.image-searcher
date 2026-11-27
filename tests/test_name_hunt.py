@@ -904,6 +904,20 @@ class NameHuntGuardTest(unittest.TestCase):
             decide(enabled=True, has_upload=True, names=["ran"], best_status="")
         )
 
+    def test_skips_site_boilerplate_titles(self) -> None:
+        """求助站的页面标题不是人：whos.tv 那页叫「求出处或资源」（826c）。"""
+        module = import_plugin()
+        decide = module.ImageSearcherPlugin._should_search_name
+        for name in ("求出处或资源", "求出处", "求资源", "Help post", "untitled"):
+            self.assertFalse(
+                decide(enabled=True, has_upload=True, names=[name], best_status=""),
+                name,
+            )
+        # 真名里带「求助」不算模板：整串匹配才挡
+        self.assertTrue(
+            decide(enabled=True, has_upload=True, names=["求助的小仓"], best_status="")
+        )
+
     def test_skips_when_switch_off_or_already_searched(self) -> None:
         module = import_plugin()
         decide = module.ImageSearcherPlugin._should_search_name
@@ -1152,6 +1166,37 @@ class NameHuntSummaryTest(unittest.TestCase):
         self.assertEqual(restored.name_hunt["status"], "seen")
 
 
+class WatermarkNameCandidatesTest(unittest.TestCase):
+    """水印名要进「按名字找号」的名单，不然 X 那条腿永远不知道她叫什么。"""
+
+    def _plugin(self):
+        module = import_plugin()
+        return module, object.__new__(module.ImageSearcherPlugin)
+
+    def test_watermark_name_goes_first(self) -> None:
+        _module, plugin = self._plugin()
+        names = plugin._with_watermark_names(["Tsuki_月隐"], {"watermark": "@咲鱼咔咔"})
+        self.assertEqual(names[0], "咲鱼咔咔")
+        self.assertIn("Tsuki_月隐", names)
+
+    def test_display_name_from_profile_is_used(self) -> None:
+        _module, plugin = self._plugin()
+        names = plugin._with_watermark_names([], {"watermark_name": "咲鱼咔咔"})
+        self.assertEqual(names, ["咲鱼咔咔"])
+
+    def test_tieba_board_and_site_names_are_dropped(self) -> None:
+        """贴吧板块名不是人：b55a 的「cosplay吧」拿去搜只会搜回一个被封的老号。"""
+        _module, plugin = self._plugin()
+        self.assertEqual(plugin._with_watermark_names([], {"watermark": "@cosplay吧"}), [])
+        self.assertEqual(plugin._with_watermark_names([], {"watermark": "@cosplay"}), [])
+
+    def test_no_duplicate_and_empty_input(self) -> None:
+        _module, plugin = self._plugin()
+        self.assertEqual(plugin._with_watermark_names([], None), [])
+        names = plugin._with_watermark_names(["咲鱼咔咔"], {"watermark": "@咲鱼咔咔"})
+        self.assertEqual(names, ["咲鱼咔咔"])
+
+
 class NameHuntDisplayTest(unittest.TestCase):
     """展示：只找到主页时列出来，并注明名字是从标题／模型读出来的。"""
 
@@ -1224,7 +1269,10 @@ class NameHuntDisplayTest(unittest.TestCase):
         text = "\n".join(module.formatting._name_hunt_lines(outcome))
         self.assertIn("@Kuukow002（150.8 万粉，显示名", text)
         self.assertIn("对得上", text)
-        self.assertNotIn("@mio_kuuko_fan（", text)
+        # 同名的路人号不许蹭粉丝数，也不给一个没核实的主页链接（b08b 那个 404 号）
+        self.assertNotIn("@mio_kuuko_fan（150", text)
+        self.assertNotIn("https://x.com/mio_kuuko_fan", text)
+        self.assertIn("@mio_kuuko_fan（没核实", text)
 
     def test_x_line_has_a_url_like_the_weibo_one(self) -> None:
         """X 号也要给链接：只写 @号时，用户会当成一句线索而不是一个能点的主页。"""
@@ -1486,6 +1534,89 @@ class ContentPageAuthorTest(unittest.TestCase):
         self.assertEqual(result["status"], "none")
         self.assertEqual(result["name"], "诗诗爱生活")
         self.assertEqual(result["variants"], [])
+
+
+class NameSourceDistanceTest(unittest.TestCase):
+    """名字只从「差不多就是这张图」的候选里读，远距离页面的作者名不算。
+
+    起因是 `s-20261125-1414-fbd6` 与 `s-20261125-1255-cf7d`：两单都没搜到，但都
+    把别人的名字当成作者拿去查了微博、X、B 站。fbd6 的「摇摇乐yoyo」来自 4khd 一条
+    距离 21 的图集页（那是另一个 coser 2024 年的套图），cf7d 的「Tsuki_月隐」来自
+    `x.com/tsuki_kakushi` 一条距离 31 的帖子。两个名字都是「另一张图、另一个人」，
+    查回来的主页全是不相干的号，比不查更糟。
+    """
+
+    def _page(self, module, title, *, distance, status="suspect", url=None):
+        url = url or "https://www.4khd.com/content/20/yoyo-murasame-senren-banka.html/8"
+        return module.Candidate(
+            engine="lens",
+            url=url,
+            title=title,
+            platform=url.split("//")[1].split("/")[0],
+            distance=distance,
+            status=status,
+        )
+
+    def test_far_gallery_page_contributes_no_name(self) -> None:
+        module, plugin, _ = _plugin()
+        page = self._page(
+            module, "摇摇乐yoyo - Murasame (Senren Banka)[101MB-153photos] - Page ...", distance=21
+        )
+        self.assertEqual(plugin._title_name_candidates([page]), [])
+
+    def test_far_x_post_contributes_no_author_name(self) -> None:
+        module, plugin, _ = _plugin()
+        page = self._page(
+            module,
+            "Tsuki_月隐on X / X",
+            distance=31,
+            url="https://x.com/tsuki_kakushi/status/2109660774285324309/photo/1",
+        )
+        self.assertEqual(plugin._title_name_candidates([page]), [])
+
+    def test_close_page_still_contributes(self) -> None:
+        """阈值 + 余量以内的照旧算数：裁剪、重压、翻拍都在这个范围里。"""
+        module, plugin, _ = _plugin()
+        page = self._page(
+            module,
+            "Coser@小仓千代w: W泳装(21 photos) – MissKon.com",
+            distance=9,
+            status="suspect",
+            url="https://misskon.com/coser-xiao-cang-qian-dai-w-w-yong-zhuang-21-photos/",
+        )
+        self.assertEqual(plugin._title_name_candidates([page]), ["小仓千代w"])
+
+    def test_vision_pick_without_distance_still_counts(self) -> None:
+        """视觉挑中过但没量出距离的页面照样能贡献名字（b08b 那种落点）。"""
+        module, plugin, _ = _plugin()
+        page = self._page(
+            module,
+            "Coser@小仓千代w: W泳装(21 photos) – MissKon.com",
+            distance=None,
+            status="vision",
+            url="https://misskon.com/coser-xiao-cang-qian-dai-w-w-yong-zhuang-21-photos/",
+        )
+        self.assertEqual(plugin._title_name_candidates([page]), ["小仓千代w"])
+
+    def test_llm_rows_are_filtered_by_the_same_rule(self) -> None:
+        """模型也只看这个池子：远距离页面的标题根本不该送进去。"""
+        module, plugin, _ = _plugin()
+
+        async def boom(*args, **kwargs):  # noqa: ANN002, ANN003
+            raise AssertionError("远距离页面不该问模型")
+
+        plugin._ctx.call_capability = boom
+        page = self._page(
+            module, "摇摇乐yoyo - Murasame (Senren Banka)[101MB-153photos]", distance=21
+        )
+        self.assertEqual(asyncio.run(plugin._llm_title_names([page])), [])
+
+    def test_limit_follows_the_hash_threshold(self) -> None:
+        """阈值调宽，名字来源也跟着放宽，不是写死的 12。"""
+        module, plugin, config = _plugin()
+        config.plugin.hash_threshold = 20
+        page = self._page(module, "摇摇乐yoyo - Murasame (Senren Banka)[101MB-153photos]", distance=21)
+        self.assertEqual(plugin._title_name_candidates([page]), ["摇摇乐yoyo"])
 
 
 if __name__ == "__main__":
